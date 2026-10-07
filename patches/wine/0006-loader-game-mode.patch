@@ -1,0 +1,23 @@
+--- a/loader/wine_info.plist.in
++++ b/loader/wine_info.plist.in
+@@ -26,5 +26,9 @@
+     <string>WineApplication</string>
+     <key>LSUIElement</key>
+     <string>1</string>
++    <key>LSApplicationCategoryType</key>
++    <string>public.app-category.games</string>
++    <key>LSSupportsGameMode</key>
++    <true/>
+ </dict>
+ </plist>
+--- a/loader/main.c
++++ b/loader/main.c
+@@ -153,6 +153,8 @@
+ 
+     if ((p = remove_tail( dir, "/loader" )))
+         path = build_path( p, "dlls/ntdll/ntdll.so" );
++    else if ((p = remove_tail( dir, "/Neutron.app/Contents/MacOS" )))
++        path = build_path( p, "ntdll.so" );  /* neutron: loader inside the app bundle */
+     else
+         path = build_path( dir, "ntdll.so" );
+ 

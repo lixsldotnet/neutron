@@ -1,0 +1,245 @@
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -117,14 +117,25 @@
+ extern bool retina_on;       /* Whether Retina mode is currently active (enabled and display is in default mode). */
+ extern bool enable_app_nap;
+ 
++/* neutron: Windows pixels per Mac point. Retina mode doubles it, NEUTRON_RENDER_SCALE
++ * (e.g. 0.85) lets Windows see a smaller screen: games render fewer pixels and DXMT
++ * upscales to the real size with MetalFX. */
++extern double neutron_scale;
++
++static inline double macdrv_win_scale(void)
++{
++    return (retina_on ? 2.0 : 1.0) * neutron_scale;
++}
++
+ static inline CGRect cgrect_mac_from_win(CGRect rect)
+ {
+-    if (retina_on)
++    double s = macdrv_win_scale();
++    if (s != 1.0)
+     {
+-        rect.origin.x /= 2;
+-        rect.origin.y /= 2;
+-        rect.size.width /= 2;
+-        rect.size.height /= 2;
++        rect.origin.x /= s;
++        rect.origin.y /= s;
++        rect.size.width /= s;
++        rect.size.height /= s;
+     }
+ 
+     return rect;
+@@ -132,12 +143,13 @@
+ 
+ static inline CGRect cgrect_win_from_mac(CGRect rect)
+ {
+-    if (retina_on)
++    double s = macdrv_win_scale();
++    if (s != 1.0)
+     {
+-        rect.origin.x *= 2;
+-        rect.origin.y *= 2;
+-        rect.size.width *= 2;
+-        rect.size.height *= 2;
++        rect.origin.x *= s;
++        rect.origin.y *= s;
++        rect.size.width *= s;
++        rect.size.height *= s;
+     }
+ 
+     return rect;
+@@ -145,10 +157,11 @@
+ 
+ static inline CGSize cgsize_mac_from_win(CGSize size)
+ {
+-    if (retina_on)
++    double s = macdrv_win_scale();
++    if (s != 1.0)
+     {
+-        size.width /= 2;
+-        size.height /= 2;
++        size.width /= s;
++        size.height /= s;
+     }
+ 
+     return size;
+@@ -156,10 +169,11 @@
+ 
+ static inline CGSize cgsize_win_from_mac(CGSize size)
+ {
+-    if (retina_on)
++    double s = macdrv_win_scale();
++    if (s != 1.0)
+     {
+-        size.width *= 2;
+-        size.height *= 2;
++        size.width *= s;
++        size.height *= s;
+     }
+ 
+     return size;
+@@ -167,10 +181,11 @@
+ 
+ static inline CGPoint cgpoint_mac_from_win(CGPoint point)
+ {
+-    if (retina_on)
++    double s = macdrv_win_scale();
++    if (s != 1.0)
+     {
+-        point.x /= 2;
+-        point.y /= 2;
++        point.x /= s;
++        point.y /= s;
+     }
+ 
+     return point;
+@@ -178,10 +193,11 @@
+ 
+ static inline CGPoint cgpoint_win_from_mac(CGPoint point)
+ {
+-    if (retina_on)
++    double s = macdrv_win_scale();
++    if (s != 1.0)
+     {
+-        point.x *= 2;
+-        point.y *= 2;
++        point.x *= s;
++        point.y *= s;
+     }
+ 
+     return point;
+--- a/dlls/winemac.drv/macdrv_main.c
++++ b/dlls/winemac.drv/macdrv_main.c
+@@ -44,6 +44,7 @@
+ bool left_option_is_alt = false;
+ bool right_option_is_alt = false;
+ bool left_command_is_ctrl = false;
++double neutron_scale = 1.0;
+ bool right_command_is_ctrl = false;
+ bool allow_software_rendering = false;
+ bool allow_immovable_windows = true;
+@@ -367,6 +368,13 @@
+         retina_enabled = IS_OPTION_TRUE(buffer[0]);
+ 
+     retina_on = retina_enabled;
++
++    /* neutron: render scale for all Windows coordinates, see macdrv_win_scale() */
++    {
++        const char *env = getenv("NEUTRON_RENDER_SCALE");
++        double value = env ? strtod(env, NULL) : 1.0;
++        if (value >= 0.5 && value <= 1.0) neutron_scale = value;
++    }
+ 
+     if (appkey) NtClose(appkey);
+     if (hkey) NtClose(hkey);
+--- a/dlls/winemac.drv/gdi.c
++++ b/dlls/winemac.drv/gdi.c
+@@ -217,8 +217,8 @@
+         pthread_mutex_unlock(&device_data_mutex);
+         dev = GET_NEXT_PHYSDEV( dev, pGetDeviceCaps );
+         ret = dev->funcs->pGetDeviceCaps( dev, cap );
+-        if ((cap == HORZRES || cap == VERTRES) && retina_on)
+-            ret *= 2;
++        if ((cap == HORZRES || cap == VERTRES) && macdrv_win_scale() != 1.0)
++            ret = (int)(ret * macdrv_win_scale() + 0.5);
+         return ret;
+     }
+ 
+--- a/dlls/winemac.drv/display.c
++++ b/dlls/winemac.drv/display.c
+@@ -333,7 +333,14 @@
+     NtClose(hkey);
+     return ret;
+ }
++
+ 
++/* neutron: Windows pixels per pixel of the original (desktop) mode: Retina doubles it,
++ * NEUTRON_RENDER_SCALE shrinks it */
++static double original_mode_scale(void)
++{
++    return (retina_enabled ? 2.0 : 1.0) * neutron_scale;
++}
+ 
+ static BOOL display_mode_matches_descriptor(CGDisplayModeRef mode, const struct display_mode_descriptor* desc)
+ {
+@@ -410,10 +417,10 @@
+     CFStringRef pixel_encoding = CGDisplayModeCopyPixelEncoding(display_mode);
+     CFNumberRef cf_io_flags, cf_width, cf_height, cf_refresh;
+ 
+-    if (retina_enabled && is_original)
++    if (is_original && original_mode_scale() != 1.0)
+     {
+-        width *= 2;
+-        height *= 2;
++        width = width * original_mode_scale() + 0.5;
++        height = height * original_mode_scale() + 0.5;
+     }
+ 
+     io_flags &= kDisplayModeInterlacedFlag | kDisplayModeStretchedFlag | kDisplayModeTelevisionFlag;
+@@ -701,10 +708,10 @@
+         if (!refresh_rate)
+             refresh_rate = 60;
+ 
+-        if (is_original && retina_enabled)
++        if (is_original && original_mode_scale() != 1.0)
+         {
+-            width *= 2;
+-            height *= 2;
++            width = width * original_mode_scale() + 0.5;
++            height = height * original_mode_scale() + 0.5;
+         }
+ 
+         if (bpp != mode_bpp)
+@@ -842,10 +849,10 @@
+ 
+         display_mode_to_devmode_fields(display_id, mode, devmodes + i);
+ 
+-        if (retina_enabled && display_mode_matches_descriptor(mode, desc))
++        if (original_mode_scale() != 1.0 && display_mode_matches_descriptor(mode, desc))
+         {
+-            devmodes[i].dmPelsWidth *= 2;
+-            devmodes[i].dmPelsHeight *= 2;
++            devmodes[i].dmPelsWidth = devmodes[i].dmPelsWidth * original_mode_scale() + 0.5;
++            devmodes[i].dmPelsHeight = devmodes[i].dmPelsHeight * original_mode_scale() + 0.5;
+         }
+     }
+     free_display_mode_descriptor(desc);
+@@ -886,13 +893,13 @@
+     devmode->dmFields |= DM_POSITION;
+ 
+     display_mode_to_devmode_fields(display_id, display_mode, devmode);
+-    if (retina_enabled)
++    if (original_mode_scale() != 1.0)
+     {
+         struct display_mode_descriptor *desc = create_original_display_mode_descriptor(display_id);
+         if (display_mode_matches_descriptor(display_mode, desc))
+         {
+-            devmode->dmPelsWidth *= 2;
+-            devmode->dmPelsHeight *= 2;
++            devmode->dmPelsWidth = devmode->dmPelsWidth * original_mode_scale() + 0.5;
++            devmode->dmPelsHeight = devmode->dmPelsHeight * original_mode_scale() + 0.5;
+         }
+         free_display_mode_descriptor(desc);
+     }
+--- a/dlls/winemac.drv/surface.c
++++ b/dlls/winemac.drv/surface.c
+@@ -88,7 +88,7 @@
+     colorspace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+     image = CGImageCreate(color_info->bmiHeader.biWidth, abs(color_info->bmiHeader.biHeight), 8, 32,
+                           color_info->bmiHeader.biSizeImage / abs(color_info->bmiHeader.biHeight), colorspace,
+-                          alpha_info | kCGBitmapByteOrder32Little, surface->provider, NULL, retina_on, kCGRenderingIntentDefault);
++                          alpha_info | kCGBitmapByteOrder32Little, surface->provider, NULL, macdrv_win_scale() != 1.0, kCGRenderingIntentDefault);
+     CGColorSpaceRelease(colorspace);
+ 
+     macdrv_window_set_color_image(surface->window, image, cgrect_from_rect(*rect), cgrect_from_rect(*dirty));
+@@ -111,7 +111,7 @@
+ 
+             image = CGImageMaskCreate(shape_info->bmiHeader.biWidth, abs(shape_info->bmiHeader.biHeight), 1, 1,
+                                       shape_info->bmiHeader.biSizeImage / abs(shape_info->bmiHeader.biHeight),
+-                                      provider, NULL, retina_on);
++                                      provider, NULL, macdrv_win_scale() != 1.0);
+             CGDataProviderRelease(provider);
+ 
+             macdrv_window_set_shape_image(surface->window, image);

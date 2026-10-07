@@ -1,0 +1,101 @@
+--- a/FEXCore/include/FEXCore/Utils/TypeDefines.h
++++ b/FEXCore/include/FEXCore/Utils/TypeDefines.h
+@@ -7,6 +7,9 @@
+ // To work around build systems that build on a 16k/64k page size, define our page size here
+ // Don't use the system provided PAGE_SIZE define because of this.
+ constexpr size_t FEX_PAGE_SIZE = 4096;
++// neutron: guard pages cover a whole host page. Wine on a 16K page host (macOS) merges the protection of 4K pages
++// that share a host page, so a 4K guard next to writable memory never faults.
++constexpr size_t FEX_GUARD_PAGE_SIZE = 0x4000;
+ constexpr size_t FEX_PAGE_SHIFT = 12;
+ constexpr size_t FEX_PAGE_MASK = ~(FEX_PAGE_SIZE - 1);
+ } // namespace FEXCore::Utils
+--- a/FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h
++++ b/FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h
+@@ -420,8 +420,8 @@
+ private:
+   void* Alloc(size_t Size) override {
+     auto Ptr = FEXCore::Allocator::VirtualAlloc(Size);
+-    uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, FEXCore::Utils::FEX_PAGE_SIZE);
+-    if (!FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(LastPageAddr), FEXCore::Utils::FEX_PAGE_SIZE,
++    uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, FEXCore::Utils::FEX_GUARD_PAGE_SIZE);
++    if (!FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(LastPageAddr), FEXCore::Utils::FEX_GUARD_PAGE_SIZE,
+                                             FEXCore::Allocator::ProtectOptions::None)) {
+       LogMan::Msg::EFmt("Failed to mprotect last page of code buffer.");
+     }
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -923,13 +923,14 @@
+ 
+   // Fairly excessive buffer range to make sure we don't overflow
+   // One page baseline, plus SSANodeMultipler bytes, plus another page for guard page.
+-  const uint32_t DesiredBufferRange = AlignUp(FEXCore::Utils::FEX_PAGE_SIZE * 2 + SSACount * SSANodeMultiplier, FEXCore::Utils::FEX_PAGE_SIZE);
++  const uint32_t DesiredBufferRange =
++    AlignUp(FEXCore::Utils::FEX_PAGE_SIZE + FEXCore::Utils::FEX_GUARD_PAGE_SIZE + SSACount * SSANodeMultiplier, FEXCore::Utils::FEX_GUARD_PAGE_SIZE);
+ 
+   // JIT output is first written to a temporary buffer and later relocated to the CodeBuffer.
+   // This minimizes lock contention of CodeBufferWriteMutex.
+   auto TempCodeBufferInfo = TempCodeBufferAllocator.ReownOrClaimBufferWithSize(DesiredBufferRange);
+   auto TempCodeBuffer = TempCodeBufferInfo.Ptr;
+-  const uint32_t UsableBufferRange = TempCodeBufferInfo.Size - FEXCore::Utils::FEX_PAGE_SIZE;
++  const uint32_t UsableBufferRange = TempCodeBufferInfo.Size - FEXCore::Utils::FEX_GUARD_PAGE_SIZE;
+ 
+   SetBuffer(TempCodeBuffer, UsableBufferRange);
+ 
+--- a/Source/Windows/Common/JITGuardPage.h
++++ b/Source/Windows/Common/JITGuardPage.h
+@@ -5,13 +5,13 @@
+ 
+ namespace FEX::Windows::JITGuardPage {
+ static constexpr bool IsAddressInJITGuardPage(uintptr_t GuardPage, uintptr_t Address) {
+-  return GuardPage != 0 && Address >= GuardPage && Address < GuardPage + FEXCore::Utils::FEX_PAGE_SIZE;
++  return GuardPage != 0 && Address >= GuardPage && Address < GuardPage + FEXCore::Utils::FEX_GUARD_PAGE_SIZE;
+ }
+ 
+ static_assert(!IsAddressInJITGuardPage(0, 0));
+ static_assert(IsAddressInJITGuardPage(0x1000, 0x1000));
+ static_assert(IsAddressInJITGuardPage(0x1000, 0x1fff));
+-static_assert(!IsAddressInJITGuardPage(0x1000, 0x2000));
++static_assert(!IsAddressInJITGuardPage(0x1000, 0x1000 + FEXCore::Utils::FEX_GUARD_PAGE_SIZE));
+ 
+ static inline bool HandleJITGuardPage(FEXCore::Core::InternalThreadState* Thread, void* Address, uint64_t* GPRs, __uint128_t* FPRs, uint64_t* PC) {
+   if (IsAddressInJITGuardPage(Thread->JITGuardPage, reinterpret_cast<uintptr_t>(Address))) {
+--- a/Source/Windows/Common/CallRetStack.h
++++ b/Source/Windows/Common/CallRetStack.h
+@@ -7,6 +7,9 @@
+ #include <FEXCore/Debug/InternalThreadState.h>
+ 
+ namespace FEX::Windows::CallRetStack {
++// neutron: an underflow past a 4K guard on a 16K page host faults in the next mapping, where it is not handled.
++static constexpr uint64_t GuardSize = FEXCore::Utils::FEX_GUARD_PAGE_SIZE;
++
+ struct CallRetStackInfo {
+   uint64_t AllocationBase;
+   uint64_t AllocationEnd;
+@@ -16,21 +19,21 @@
+ CallRetStackInfo GetInfoThread(FEXCore::Core::InternalThreadState* Thread) {
+   uint64_t Base = reinterpret_cast<uint64_t>(Thread->CallRetStackBase);
+   // Leave some room from the base for the default location to allow for underflows without constant exceptions
+-  return {Base - FEXCore::Utils::FEX_PAGE_SIZE, Base + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + FEXCore::Utils::FEX_PAGE_SIZE,
++  return {Base - GuardSize, Base + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + GuardSize,
+           Base + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE / 4};
+ }
+ 
+ void InitializeThread(FEXCore::Core::InternalThreadState* Thread) {
+   // Allocate the call-ret stack with guard pages on both sides
+-  const void* CallRetStackAlloc = ::VirtualAlloc(nullptr, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * FEXCore::Utils::FEX_PAGE_SIZE,
++  const void* CallRetStackAlloc = ::VirtualAlloc(nullptr, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * GuardSize,
+                                                  MEM_RESERVE | MEM_TOP_DOWN, PAGE_NOACCESS);
+ 
+   FEXCore::Allocator::VirtualName("FEXMem_CallRetStacks", CallRetStackAlloc,
+-                                  FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * FEXCore::Utils::FEX_PAGE_SIZE);
+-  FEXCore::Allocator::VirtualTHPControl(CallRetStackAlloc, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * FEXCore::Utils::FEX_PAGE_SIZE,
++                                  FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * GuardSize);
++  FEXCore::Allocator::VirtualTHPControl(CallRetStackAlloc, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * GuardSize,
+                                         FEXCore::Allocator::THPControl::Disable);
+ 
+-  Thread->CallRetStackBase = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(CallRetStackAlloc) + FEXCore::Utils::FEX_PAGE_SIZE);
++  Thread->CallRetStackBase = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(CallRetStackAlloc) + GuardSize);
+   ::VirtualAlloc(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE, MEM_COMMIT, PAGE_READWRITE);
+ 
+   Thread->CurrentFrame->State.callret_sp = GetInfoThread(Thread).DefaultLocation;

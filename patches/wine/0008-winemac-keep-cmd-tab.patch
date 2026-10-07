@@ -1,0 +1,18 @@
+--- a/dlls/winemac.drv/cocoa_event.m
++++ b/dlls/winemac.drv/cocoa_event.m
+@@ -454,7 +454,15 @@
+ 
+         winIDPair = @[@(vkey), @(modFlags)];
+         if (hotKeysByWinID[winIDPair])
++            return MACDRV_HOTKEY_ALREADY_REGISTERED;
++
++        /* neutron: Command is Windows Alt. A game reserving Alt+Tab (or Alt+`) would take
++         * Cmd+Tab away from macOS; Windows does not let programs reserve Alt+Tab either. */
++        if ((modifiers & cmdKey) && (keyCode == kVK_Tab || keyCode == kVK_ANSI_Grave))
++        {
++            WARN("not registering Cmd+%s hot key (macOS app switching)\n", keyCode == kVK_Tab ? "Tab" : "`");
+             return MACDRV_HOTKEY_ALREADY_REGISTERED;
++        }
+ 
+         hotKeyID.signature  = WineHotKeySignature;
+         hotKeyID.id         = hotKeyNumber++;

@@ -1,0 +1,289 @@
+#!/bin/bash
+#
+# neutron: Steam compat tool entry point for macOS (the counterpart of Proton's
+# `proton` script). Steam calls it as `neutron <verb> <args...>` with the
+# STEAM_COMPAT_* environment set.
+#
+# Verbs: run, waitforexitandrun, runinprefix, getcompatpath, getnativepath,
+#        destroyprefix
+#
+# Env (optional): NEUTRON_LOG=1 enables Wine debug output in the log.
+#                 NEUTRON_FILES=<dir> uses another Wine build than ./files (dev).
+#                 NEUTRON_HUD=1 shows the Metal performance HUD (FPS, frame and GPU time),
+#                   NEUTRON_HUD=2 adds DXMT's per-frame statistics (encode, sync, passes).
+#                 NEUTRON_FPS_LOG=1 writes frame rate and slowest frame per second to the log.
+#                 NEUTRON_RENDER_SCALE=<0.5..1> (default 0.85) makes Windows see a
+#                   smaller display, so games render fewer pixels, and MetalFX (DXMT)
+#                   scales the picture back up to the real size. 1 turns it off.
+#                 NEUTRON_METALFX=<factor> upscales the game's output with MetalFX (DXMT) by
+#                   this factor. Set automatically from NEUTRON_RENDER_SCALE.
+#                 NEUTRON_FEX_TSO=strict gives FEX the full x86 memory ordering (much slower,
+#                   for games with threading bugs under the default fast mode; set per
+#                   game with APP_TSO_<appid> below).
+# Mac Steam does not support "VAR=x %command%" launch options, so env settings
+# can also go into neutron.env next to this script (KEY=value lines).
+#
+set -uo pipefail
+
+TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$TOOL_DIR/neutron.env" ]; then
+  set -a
+  # shellcheck source=/dev/null
+  . "$TOOL_DIR/neutron.env"
+  set +a
+fi
+FILES="${NEUTRON_FILES:-$TOOL_DIR/files}"
+WINE="$FILES/bin/wine"
+WINESERVER="$FILES/bin/wineserver"
+
+# Mac Steam may only pass STEAM_COMPAT_APP_ID; steam.exe needs SteamGameId to
+# set up the Steam environment for the game.
+if [ -n "${STEAM_COMPAT_APP_ID:-}" ]; then
+  export SteamAppId="${SteamAppId:-$STEAM_COMPAT_APP_ID}"
+  export SteamGameId="${SteamGameId:-$STEAM_COMPAT_APP_ID}"
+fi
+APP_ID="${SteamAppId:-${SteamGameId:-0}}"
+LOG_DIR="$HOME/Library/Logs/neutron"
+LOG="$LOG_DIR/neutron-$APP_ID.log"
+mkdir -p "$LOG_DIR"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
+die() { log "error: $*"; exit 1; }
+
+#-------------------------------------------------------------------------------
+#  environment
+#-------------------------------------------------------------------------------
+
+[ -n "${STEAM_COMPAT_DATA_PATH:-}" ] || die "no STEAM_COMPAT_DATA_PATH"
+[ -x "$WINE" ] || die "wine not found at $WINE"
+
+# arm64 Wine with ARM64EC system DLLs, the game's x86_64 code runs in FEX.
+[ -d "$FILES/lib/wine/aarch64-windows" ] || die "not a neutron runtime: $FILES"
+export WINEPREFIX="$STEAM_COMPAT_DATA_PATH/pfx"
+# FEX memory ordering: fast by default (Unity game 58 to 98 FPS against strict),
+# strict for games with threading races under fast (APP_TSO_<appid>, below).
+APP_TSO_427410=strict   # Abiotic Factor: GameThread vs SlateLoadingThread deadlock
+tso_var="APP_TSO_$APP_ID"
+NEUTRON_FEX_TSO="${NEUTRON_FEX_TSO:-${!tso_var:-fast}}"
+# Borderless fullscreen games go into macOS native fullscreen (direct scanout, Game Mode).
+export NEUTRON_NATIVE_FULLSCREEN="${NEUTRON_NATIVE_FULLSCREEN:-1}"
+# Wine dlopens FreeType and GnuTLS by soname: bundled copies first, then Homebrew.
+export DYLD_FALLBACK_LIBRARY_PATH="$FILES/lib:/opt/homebrew/lib:/usr/local/lib:/usr/lib"
+# Light upscaling: Wine reports the display at this scale, MetalFX brings it back.
+NEUTRON_RENDER_SCALE="${NEUTRON_RENDER_SCALE:-0.85}"
+if awk -v s="$NEUTRON_RENDER_SCALE" 'BEGIN { exit !(s >= 0.5 && s < 1) }'; then
+  export NEUTRON_RENDER_SCALE
+  NEUTRON_METALFX="${NEUTRON_METALFX:-$(awk -v s="$NEUTRON_RENDER_SCALE" 'BEGIN { printf "%.4f", 1 / s }')}"
+else
+  unset NEUTRON_RENDER_SCALE
+fi
+if [ "${NEUTRON_LOG:-0}" = "1" ]; then
+  export WINEDEBUG="${WINEDEBUG:-err+all,warn+steamclient,trace+steamclient}"
+else
+  export WINEDEBUG="${WINEDEBUG:--all}"
+fi
+
+if [ "${NEUTRON_HUD:-0}" = "1" ] || [ "${NEUTRON_HUD:-0}" = "2" ]; then
+  export MTL_HUD_ENABLED=1
+  export MTL_HUD_SCALE="${MTL_HUD_SCALE:-0.12}"
+fi
+
+if [ -n "${NEUTRON_METALFX:-}" ]; then
+  export DXMT_METALFX_SPATIAL_SWAPCHAIN=1
+  export DXMT_CONFIG="d3d11.metalSpatialUpscaleFactor = $NEUTRON_METALFX${DXMT_CONFIG:+; $DXMT_CONFIG}"
+fi
+if [ "${NEUTRON_FEX_TSO:-}" = "strict" ]; then
+  export FEX_VECTORTSOENABLED=1 FEX_MEMCPYSETTSOENABLED=1 FEX_HALFBARRIERTSOENABLED=0
+fi
+
+# Game name for the macOS menu bar and Dock (instead of "Wine"), from Steam's app manifest.
+if [ -z "${NEUTRON_APP_NAME:-}" ] && [ "$APP_ID" != 0 ]; then
+  manifest="${STEAM_COMPAT_DATA_PATH%/compatdata/*}/appmanifest_$APP_ID.acf"
+  NEUTRON_APP_NAME="$(sed -n 's/^[[:space:]]*"name"[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$manifest" 2>/dev/null | head -1)"
+fi
+export NEUTRON_APP_NAME
+
+# Shown by DXMT under its version line in the Metal HUD.
+# One line per ';', the HUD right-aligns the last word of each line.
+NEUTRON_HUD_INFO="neutron;Wine $("$WINE" --version 2>/dev/null | sed 's/^wine-//')"
+NEUTRON_HUD_INFO="$NEUTRON_HUD_INFO;FEX TSO $NEUTRON_FEX_TSO"
+[ -n "${NEUTRON_RENDER_SCALE:-}" ] &&
+  NEUTRON_HUD_INFO="$NEUTRON_HUD_INFO;Render scale $(awk -v s="$NEUTRON_RENDER_SCALE" 'BEGIN { printf "%d%%", s * 100 + 0.5 }')"
+[ -n "${NEUTRON_METALFX:-}" ] &&
+  NEUTRON_HUD_INFO="$NEUTRON_HUD_INFO;MetalFX $(awk -v f="$NEUTRON_METALFX" 'BEGIN { printf "%.2fx", f }')"
+export NEUTRON_HUD_INFO
+
+STEAM_ROOT="${STEAM_COMPAT_CLIENT_INSTALL_PATH:-$HOME/Library/Application Support/Steam}"
+export STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT"
+
+# The Mac client keeps steamclient.dylib inside its app bundle; lsteamclient
+# reads the exact file from NEUTRON_STEAMCLIENT_DYLIB.
+find_steamclient() {
+  local candidate
+  for candidate in \
+    "$STEAM_ROOT/Steam.AppBundle/Steam/Contents/MacOS/steamclient.dylib" \
+    "$STEAM_ROOT/steamclient.dylib"; do
+    if [ -f "$candidate" ]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [ -z "${NEUTRON_STEAMCLIENT_DYLIB:-}" ]; then
+  NEUTRON_STEAMCLIENT_DYLIB="$(find_steamclient)" || die "steamclient.dylib not found under $STEAM_ROOT"
+fi
+export NEUTRON_STEAMCLIENT_DYLIB
+
+#-------------------------------------------------------------------------------
+#  prefix
+#-------------------------------------------------------------------------------
+
+# Copies src to dst only when the content differs (keeps mtimes stable).
+sync_file() {
+  local src="$1" dst="$2"
+  mkdir -p "$(dirname "$dst")"
+  cmp -s "$src" "$dst" 2>/dev/null || cp "$src" "$dst"
+}
+
+setup_prefix() {
+  if [ ! -f "$WINEPREFIX/system.reg" ]; then
+    log "creating prefix $WINEPREFIX"
+    mkdir -p "$WINEPREFIX"
+    # No Mono/Gecko install prompts: they block on a dialog nobody sees.
+    WINEDLLOVERRIDES="mscoree,mshtml=" "$WINE" wineboot -i >> "$LOG" 2>&1 \
+      || die "wineboot failed"
+    "$WINESERVER" -w
+  fi
+
+  # After a runtime update Wine would update the prefix on the next start and
+  # show the Mono/Gecko prompt; do the update here, without the prompt.
+  local stamp="$WINEPREFIX/neutron-runtime-stamp" now
+  now="$(stat -f '%m %z' "$FILES/share/wine/wine.inf" 2>/dev/null)"
+  if [ "$(cat "$stamp" 2>/dev/null)" != "$now" ]; then
+    log "updating prefix for the new runtime"
+    WINEDLLOVERRIDES="mscoree,mshtml=" "$WINE" wineboot -u >> "$LOG" 2>&1
+    "$WINESERVER" -w
+    printf '%s' "$now" > "$stamp"
+  fi
+
+  # Games load steamclient64.dll from the Steam folder; that is our bridge.
+  local steam_dir="$WINEPREFIX/drive_c/Program Files (x86)/Steam"
+  sync_file "$FILES/lib/wine/aarch64-windows/lsteamclient.dll" "$steam_dir/steamclient64.dll"
+
+  setup_steam_registry
+  setup_emulator_registry
+}
+
+# FEX translates the x86_64 game code (ARM64EC emulator DLL).
+setup_emulator_registry() {
+  local marker="$WINEPREFIX/neutron-fex-v1"
+  [ -f "$marker" ] && return 0
+  log "registering FEX as x64 emulator"
+  "$WINE" reg add 'HKLM\Software\Microsoft\Wow64\amd64' /ve /d libarm64ecfex.dll /f >> "$LOG" 2>&1 \
+    || die "emulator registry failed"
+  "$WINESERVER" -w
+  touch "$marker"
+}
+
+# steam_api finds steamclient64.dll through these keys. Proton ships them in
+# its wine.inf ([SteamClient64]); upstream Wine does not, so import them once.
+setup_steam_registry() {
+  local marker="$WINEPREFIX/neutron-registry-v1"
+  [ -f "$marker" ] && return 0
+
+  local reg="$STEAM_COMPAT_DATA_PATH/neutron-steam.reg"
+  local steam='C:\\Program Files (x86)\\Steam'
+  cat > "$reg" <<EOF
+Windows Registry Editor Version 5.00
+
+[HKEY_CURRENT_USER\\Software\\Valve\\Steam]
+"SteamPath"="$steam"
+"SteamExe"="$steam\\\\Steam.exe"
+
+[HKEY_CURRENT_USER\\Software\\Valve\\Steam\\ActiveProcess]
+"PID"=dword:0000fffe
+"SteamClientDll"="$steam\\\\steamclient.dll"
+"SteamClientDll64"="$steam\\\\steamclient64.dll"
+"SteamPath"="$steam"
+
+[HKEY_LOCAL_MACHINE\\Software\\Valve\\Steam]
+"InstallPath"="$steam"
+
+[HKEY_LOCAL_MACHINE\\Software\\Wow6432Node\\Valve\\Steam]
+"InstallPath"="$steam"
+EOF
+  log "importing Steam registry keys"
+  "$WINE" reg import "$reg" >> "$LOG" 2>&1 || die "registry import failed"
+  "$WINESERVER" -w
+  rm -f "$reg"
+  touch "$marker"
+}
+
+# Per-game fixes (like Proton's game fixes): extra arguments appended to the
+# game's command line unless the launch options already contain them.
+# Example: APP_ARGS_<appid>="-dx11"
+
+app_args() {
+  local var="APP_ARGS_$APP_ID" arg
+  for arg in ${!var:-}; do
+    case " $* " in *" $arg "*) ;; *) printf '%s\n' "$arg" ;; esac
+  done
+}
+
+# Starts the game through Proton's steam.exe, which sets up the Steam registry
+# keys and process state the game expects.
+run_game() {
+  local extra=()
+  while IFS= read -r arg; do [ -n "$arg" ] && extra+=("$arg"); done < <(app_args "$@")
+  set -- "$@" ${extra[@]+"${extra[@]}"}
+  log "run appid=$APP_ID args: $*"
+  # In the background plus wait, so Steam's Stop (SIGTERM to this script) is handled
+  # right away: end the whole Wine session of this prefix, the game included.
+  trap 'log "stop requested"; "$WINESERVER" -k; exit 143' TERM INT HUP
+  "$WINE" 'c:\windows\system32\steam.exe' "$@" >> "$LOG" 2>&1 &
+  wait $!
+  local rc=$?
+  trap - TERM INT HUP
+  log "exit $rc"
+  return $rc
+}
+
+#-------------------------------------------------------------------------------
+#  verbs
+#-------------------------------------------------------------------------------
+
+VERB="${1:-}"
+[ $# -gt 0 ] && shift
+log "verb=$VERB steamclient=$NEUTRON_STEAMCLIENT_DYLIB"
+
+case "$VERB" in
+  run)
+    setup_prefix
+    run_game "$@"
+    ;;
+  waitforexitandrun)
+    setup_prefix
+    "$WINESERVER" -w
+    run_game "$@"
+    ;;
+  runinprefix)
+    setup_prefix
+    "$WINE" "$@"
+    ;;
+  getcompatpath)
+    "$WINE" winepath -w "$1" 2>> "$LOG"
+    ;;
+  getnativepath)
+    "$WINE" winepath "$1" 2>> "$LOG"
+    ;;
+  destroyprefix)
+    log "destroying prefix $WINEPREFIX"
+    "$WINESERVER" -k 2>/dev/null
+    rm -rf "${WINEPREFIX:?}"
+    ;;
+  *)
+    die "unknown verb '$VERB'"
+    ;;
+esac

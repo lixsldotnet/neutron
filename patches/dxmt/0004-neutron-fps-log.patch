@@ -1,0 +1,41 @@
+diff --git a/src/dxmt/dxmt_presenter.cpp b/src/dxmt/dxmt_presenter.cpp
+index e5aec04..9daa8b9 100644
+--- a/src/dxmt/dxmt_presenter.cpp
++++ b/src/dxmt/dxmt_presenter.cpp
+@@ -1,5 +1,9 @@
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cstdlib>
++#include <format>
++#include "log/log.hpp"
+ #include "Metal.hpp"
+ #include "dxmt_format.hpp"
+ #include "dxmt_presenter.hpp"
+@@ -156,6 +160,26 @@ Presenter::encodeCommands(
+     std::function<void(WMT::RenderCommandEncoder)> &&wait_fences,
+     std::function<void(WMT::RenderCommandEncoder)> &&update_fences
+ ) {
++  /* neutron: NEUTRON_FPS_LOG=1 writes frame rate and the slowest frame once per second to the log */
++  static const bool fps_log = getenv("NEUTRON_FPS_LOG") && *getenv("NEUTRON_FPS_LOG") == '1';
++  if (unlikely(fps_log)) {
++    using clock = std::chrono::steady_clock;
++    static clock::time_point window_start = clock::now(), last = window_start;
++    static unsigned frames = 0;
++    static double worst_ms = 0;
++    auto now = clock::now();
++    worst_ms = std::max(worst_ms, std::chrono::duration<double, std::milli>(now - last).count());
++    last = now;
++    frames++;
++    double window = std::chrono::duration<double>(now - window_start).count();
++    if (window >= 1.0) {
++      Logger::info(std::format("neutron: fps {:.1f} worst {:.1f}ms", frames / window, worst_ms));
++      window_start = now;
++      frames = 0;
++      worst_ms = 0;
++    }
++  }
++
+   auto drawable = layer_.nextDrawable();
+ 
+   WMTRenderPassInfo info;

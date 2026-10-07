@@ -1,0 +1,13 @@
+--- a/tools/makedep.c
++++ b/tools/makedep.c
+@@ -3140,8 +3140,9 @@
+         return;
+     }
+ 
++    /* neutron: also for disabled archs, an arm64ec-only module links with the aarch64 list */
+     for (unsigned int arch = 0; arch < archs.count; arch++)
+-        if (!make->disabled[arch]) strarray_add( &make->res_files[arch], res_file );
++        strarray_add( &make->res_files[arch], res_file );
+ 
+     output( "%s: %s", obj_dir_path( make, res_file ), src_dir_path( make, "Makefile.in" ));
+     output_filename( wrc );

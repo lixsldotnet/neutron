@@ -1,0 +1,35 @@
+diff --git a/src/d3d12/d3d12_command_queue.cpp b/src/d3d12/d3d12_command_queue.cpp
+index 57b0332..65e4532 100644
+--- a/src/d3d12/d3d12_command_queue.cpp
++++ b/src/d3d12/d3d12_command_queue.cpp
+@@ -368,15 +368,26 @@ public:
+ 
+   HRESULT STDMETHODCALLTYPE
+   GetTimestampFrequency(UINT64 *pFrequency) {
+-    // FIXME: stub
+-    if (pFrequency)
+-      *pFrequency = 1;
++    // neutron: GPU timestamps are nanoseconds, same as the D3D11 disjoint query.
++    if (!pFrequency)
++      return E_INVALIDARG;
++    *pFrequency = 1'000'000'000;
+     return S_OK;
+   };
+ 
+   HRESULT STDMETHODCALLTYPE
+   GetClockCalibration(UINT64 *gpu_timestamp, UINT64 *cpu_timestamp) {
+-    return E_NOTIMPL;
++    // neutron: Unreal treats E_NOTIMPL as fatal. Report one CPU sample in QPC
++    // ticks and the same instant in GPU units (ns).
++    if (!gpu_timestamp || !cpu_timestamp)
++      return E_INVALIDARG;
++    LARGE_INTEGER counter, frequency;
++    QueryPerformanceCounter(&counter);
++    QueryPerformanceFrequency(&frequency);
++    UINT64 ticks = counter.QuadPart, freq = frequency.QuadPart;
++    *cpu_timestamp = ticks;
++    *gpu_timestamp = (ticks / freq) * 1'000'000'000ull + (ticks % freq) * 1'000'000'000ull / freq;
++    return S_OK;
+   };
+ 
+   D3D12_COMMAND_QUEUE_DESC *STDMETHODCALLTYPE

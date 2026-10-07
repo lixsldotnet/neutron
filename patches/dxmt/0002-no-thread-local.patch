@@ -1,0 +1,22 @@
+diff --git a/src/dxmt/dxmt_occlusion_query.hpp b/src/dxmt/dxmt_occlusion_query.hpp
+index 56e9e76..99c5899 100644
+--- a/src/dxmt/dxmt_occlusion_query.hpp
++++ b/src/dxmt/dxmt_occlusion_query.hpp
+@@ -280,9 +280,14 @@ public:
+     `thread_local` makes sense because this destructor is only called on 1. finishing thread 2. (abnormal) device
+     destruction
+     */
+-    thread_local uint64_t latest_ts_on_finish_thread = 0;
+-    latest_ts_on_finish_thread = std::max(cmdbuf_.gpuEndTime(), latest_ts_on_finish_thread);
+-    std::fill(results.begin(), results.end(), latest_ts_on_finish_thread);
++    /* neutron: no thread_local, compiler TLS goes through x18 which macOS zeroes */
++    static std::atomic<uint64_t> latest_ts_on_finish = 0;
++    uint64_t ts = cmdbuf_.gpuEndTime();
++    uint64_t prev = latest_ts_on_finish.load(std::memory_order_relaxed);
++    while (prev < ts && !latest_ts_on_finish.compare_exchange_weak(prev, ts, std::memory_order_relaxed))
++      ;
++    ts = std::max(ts, prev);
++    std::fill(results.begin(), results.end(), ts);
+     for (const auto &[query, sample_index] : queries_) {
+       query->issue(results[sample_index]);
+     }

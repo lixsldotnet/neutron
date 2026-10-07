@@ -1,0 +1,10 @@
+--- a/steam.c	2026-10-07 13:57:24
++++ b/steam.c	2026-10-07 13:57:24
+@@ -663,6 +663,7 @@
+     {
+         (char *)"steam-runtime-steam-remote",
+         (char *)"steam",
++        (char *)"/usr/bin/open", /* neutron: macOS hands steam:// URLs to the native client */
+         NULL,
+     };
+ 

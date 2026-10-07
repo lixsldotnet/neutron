@@ -1,0 +1,81 @@
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -2208,3 +2208,78 @@
+     pthread_mutex_init(&win_data_mutex, &attr);
+     pthread_mutexattr_destroy(&attr);
+ }
++
++
++/* neutron: DXMT's winemetal.so finds the Metal view helpers through dlsym("macdrv_functions").
++ * Its struct macdrv_win_data starts with hwnd, cocoa_window, cocoa_view, client_cocoa_view,
++ * so get_win_data hands out a small adapter in that layout. */
++struct neutron_dxmt_win_data
++{
++    HWND                     hwnd;
++    WineWindow              *cocoa_window;
++    WineContentView         *cocoa_view;
++    WineContentView         *client_cocoa_view;
++    struct macdrv_win_data  *data;
++};
++
++static struct neutron_dxmt_win_data *neutron_get_win_data( HWND hwnd )
++{
++    struct macdrv_win_data *data = get_win_data( hwnd );
++    struct neutron_dxmt_win_data *ret;
++
++    if (!data) return NULL;
++    if (!data->client_view)
++    {
++        /* Wine 11 creates the client view only for a client surface (GL/Vulkan do that);
++         * create one for DXMT, win32u then keeps it positioned on move and resize. */
++        release_win_data( data );
++        macdrv_CreateClientSurface( hwnd, 0, FALSE );
++        if (!(data = get_win_data( hwnd ))) return NULL;
++    }
++    if (!(ret = malloc( sizeof(*ret) )))
++    {
++        release_win_data( data );
++        return NULL;
++    }
++    ret->hwnd = data->hwnd;
++    ret->cocoa_window = data->cocoa_window;
++    ret->cocoa_view = data->client_view;
++    ret->client_cocoa_view = data->client_view;
++    ret->data = data;
++    return ret;
++}
++
++static void neutron_release_win_data( struct neutron_dxmt_win_data *ret )
++{
++    if (!ret) return;
++    release_win_data( ret->data );
++    free( ret );
++}
++
++struct neutron_macdrv_functions
++{
++    void *macdrv_init_display_devices;
++    struct neutron_dxmt_win_data *(*get_win_data)( HWND hwnd );
++    void (*release_win_data)( struct neutron_dxmt_win_data *data );
++    WineWindow *(*macdrv_get_cocoa_window)( HWND hwnd, bool require_on_screen );
++    MTLDevice_id (*macdrv_create_metal_device)(void);
++    void (*macdrv_release_metal_device)( MTLDevice_id device );
++    WineMetalView *(*macdrv_view_create_metal_view)( WineContentView *view, MTLDevice_id device );
++    CAMetalLayer *(*macdrv_view_get_metal_layer)( WineMetalView *view );
++    void (*macdrv_view_release_metal_view)( WineMetalView *view );
++    void *on_main_thread;
++};
++
++__attribute__((visibility("default"))) struct neutron_macdrv_functions macdrv_functions =
++{
++    NULL,
++    neutron_get_win_data,
++    neutron_release_win_data,
++    macdrv_get_cocoa_window,
++    macdrv_create_metal_device,
++    macdrv_release_metal_device,
++    macdrv_view_create_metal_view,
++    macdrv_view_get_metal_layer,
++    macdrv_view_release_metal_view,
++    NULL,
++};

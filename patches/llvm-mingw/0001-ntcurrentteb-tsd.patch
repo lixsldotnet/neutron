@@ -1,0 +1,19 @@
+--- a/generic-w64-mingw32/include/winnt.h
++++ b/generic-w64-mingw32/include/winnt.h
+@@ -10393,10 +10393,14 @@
+     PVOID GetFiberData(VOID);
+ 
+ #if defined (__aarch64__) || defined(__arm64ec__)
+-    register struct _TEB *__mingw_current_teb __asm__("x18");
++    /* neutron: macOS zeroes x18 on every kernel exit, so read the TEB from the pthread
++     * TSD slot via TPIDRRO_EL0. Wine publishes the slot offset in the page after
++     * KUSER_SHARED_DATA (0x7ffffdfe0000 + 0x10000), see layer/patches/native. */
+     FORCEINLINE struct _TEB *NtCurrentTeb(VOID)
+     {
+-        return __mingw_current_teb;
++        unsigned long long __tsd;
++        __asm__( "mrs %0, tpidrro_el0" : "=r" (__tsd) );
++        return *(struct _TEB **)((__tsd & ~7ull) + *(const volatile unsigned long long *)0x7ffffdff0000ull);
+     }
+     FORCEINLINE PVOID GetCurrentFiber(VOID)
+     {

@@ -1,0 +1,457 @@
+diff --git a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+index 3ebadb5..3c0e85a 100644
+--- a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
++++ b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+@@ -807,7 +807,7 @@ void Arm64Emitter::FillStaticRegs(FillStaticRegOptions Options) {
+ 
+ #ifdef ARCHITECTURE_arm64ec
+   // Load STATE in from the CPU area as x28 is not callee saved in the ARM64EC ABI.
+-  ldr(TmpReg.X(), ARMEmitter::Reg::r18, TEB_CPU_AREA_OFFSET);
++  LoadTEBField(TmpReg, TEB_CPU_AREA_OFFSET);
+   ldr(STATE, TmpReg, CPU_AREA_EMULATOR_DATA_OFFSET);
+ #endif
+ 
+diff --git a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
+index 5ad6e7b..35cddad 100644
+--- a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
++++ b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
+@@ -81,6 +81,11 @@ constexpr auto SVE_OPT_PRED = ARMEmitter::PReg::p2;
+ // These structures are not included in the standard Windows headers, define the offsets of members we care about for EC here.
+ constexpr size_t TEB_CPU_AREA_OFFSET = 0x1788;
+ constexpr size_t TEB_PEB_OFFSET = 0x60;
++#ifdef NEUTRON_TEB_IN_TSD
++// neutron: macOS zeroes x18, the TEB lives in a pthread TSD slot. Wine publishes the
++// slot offset at this address (page after KUSER_SHARED_DATA).
++constexpr uint64_t NEUTRON_TEB_TSD_OFFSET_VA = 0x7ffffdff0000ULL;
++#endif
+ constexpr size_t PEB_EC_CODE_BITMAP_OFFSET = 0x368;
+ constexpr size_t CPU_AREA_IN_SYSCALL_CALLBACK_OFFSET = 0x1;
+ constexpr size_t CPU_AREA_EMULATOR_STACK_BASE_OFFSET = 0x8;
+@@ -119,6 +124,19 @@ public:
+   };
+   void LoadConstant(ARMEmitter::Size s, ARMEmitter::Register Reg, uint64_t Constant, PadType Pad = PadType::NOPAD, int MaxBytes = 0);
+ 
++  // Loads a TEB field into Reg (ARM64EC). Uses x18 unless the TEB is kept in a TSD slot.
++  void LoadTEBField(ARMEmitter::Register Reg, size_t Offset) {
++#ifdef NEUTRON_TEB_IN_TSD
++    static const uint64_t TSDOffset = *reinterpret_cast<const volatile uint64_t*>(NEUTRON_TEB_TSD_OFFSET_VA);
++    mrs(Reg, ARMEmitter::SystemRegister::TPIDRRO_EL0);
++    and_(ARMEmitter::Size::i64Bit, Reg, Reg, ~7ULL);
++    ldr(Reg.X(), Reg, TSDOffset);
++    ldr(Reg.X(), Reg, Offset);
++#else
++    ldr(Reg.X(), ARMEmitter::Reg::r18, Offset);
++#endif
++  }
++
+ protected:
+   FEXCore::Context::ContextImpl* EmitterCTX;
+ 
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+index 2f4babd..36aeab1 100644
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -4,6 +4,7 @@
+ #include "Interface/Context/Context.h"
+ #include "Interface/Core/CPUBackend.h"
+ #include "Interface/Core/Dispatcher/Dispatcher.h"
++#include <FEXCore/Utils/JITWriteScope.h>
+ #include "Interface/Core/LookupCache.h"
+ #include "Utils/MemberFunctionToPointer.h"
+ 
+@@ -52,6 +53,7 @@ Dispatcher::~Dispatcher() {
+ }
+ 
+ void Dispatcher::EmitDispatcher() {
++  FEXCore::Utils::JITWriteScope WriteScope;
+   // Don't modify TMP3 since it contains our RIP once the block doesn't exist
+   auto RipReg = TMP3;
+ #ifdef VIXL_DISASSEMBLER
+@@ -150,7 +152,7 @@ void Dispatcher::EmitDispatcher() {
+   // Clobbers TMP1/2
+   // Check the EC code bitmap incase we need to exit the JIT to call into native code.
+   ARMEmitter::ForwardLabel l_NotECCode;
+-  ldr(TMP1, ARMEmitter::XReg::x18, TEB_PEB_OFFSET);
++  LoadTEBField(TMP1, TEB_PEB_OFFSET);
+   ldr(TMP1, TMP1, PEB_EC_CODE_BITMAP_OFFSET);
+ 
+   lsr(ARMEmitter::Size::i64Bit, TMP2, RipReg, 18);
+@@ -258,7 +260,7 @@ void Dispatcher::EmitDispatcher() {
+ #endif
+ 
+ #ifdef ARCHITECTURE_arm64ec
+-    ldr(TMP2, ARMEmitter::XReg::x18, TEB_CPU_AREA_OFFSET);
++    LoadTEBField(TMP2, TEB_CPU_AREA_OFFSET);
+     LoadConstant(ARMEmitter::Size::i32Bit, TMP1, 1);
+     strb(TMP1.W(), TMP2, CPU_AREA_IN_SYSCALL_CALLBACK_OFFSET);
+ #endif
+@@ -266,7 +268,7 @@ void Dispatcher::EmitDispatcher() {
+     Body();
+ 
+ #ifdef ARCHITECTURE_arm64ec
+-    ldr(TMP2, ARMEmitter::XReg::x18, TEB_CPU_AREA_OFFSET);
++    LoadTEBField(TMP2, TEB_CPU_AREA_OFFSET);
+     strb(ARMEmitter::WReg::zr, TMP2, CPU_AREA_IN_SYSCALL_CALLBACK_OFFSET);
+ #endif
+ 
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index ef7e332..6516ebb 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -17,6 +17,7 @@ $end_info$
+ #include "Interface/Core/Interpreter/InterpreterOps.h"
+ #include "Interface/Core/JIT/DebugData.h"
+ #include "Interface/Core/JIT/JITClass.h"
++#include <FEXCore/Utils/JITWriteScope.h>
+ #include "Interface/IR/Passes/RegisterAllocationPass.h"
+ 
+ #include "Utils/MemberFunctionToPointer.h"
+@@ -112,6 +113,10 @@ static void PrintVectorValue(uint64_t Value, uint64_t ValueUpper) {
+ }
+ } // namespace
+ 
++namespace FEXCore::Utils {
++JITWriteToggleFn JITWriteToggle {};
++} // namespace FEXCore::Utils
++
+ namespace FEXCore::CPU {
+ 
+ void Arm64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
+@@ -533,6 +538,7 @@ void Arm64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
+ }
+ 
+ static void DirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record, bool Call) {
++  FEXCore::Utils::JITWriteScope WriteScope;
+   uintptr_t JumpThunkStartAddress = reinterpret_cast<uintptr_t>(Record) - 0x10;
+   uintptr_t CallerAddress = JumpThunkStartAddress + Record->CallerOffset;
+   auto BranchOffset = JumpThunkStartAddress / 4 - CallerAddress / 4;
+@@ -551,6 +557,7 @@ static void DirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record,
+ }
+ 
+ static void IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record) {
++  FEXCore::Utils::JITWriteScope WriteScope;
+   uintptr_t JumpThunkStartAddress = reinterpret_cast<uintptr_t>(Record) - 0x10;
+   uint32_t BranchInst = 0;
+   ARMEmitter::Emitter BranchEmit(reinterpret_cast<uint8_t*>(&BranchInst), 4);
+@@ -564,6 +571,7 @@ static void IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record
+ }
+ 
+ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEXCore::Context::ExitFunctionLinkData* Record) {
++  FEXCore::Utils::JITWriteScope WriteScope;
+   auto Thread = Frame->Thread;
+   bool TFSet = Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC];
+   uintptr_t HostCode {};
+@@ -878,6 +886,7 @@ CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(s
+ 
+ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size, bool SingleInst, const FEXCore::IR::IRListView* IR,
+                                                    FEXCore::Core::DebugData* DebugData, bool CheckTF) {
++  FEXCore::Utils::JITWriteScope WriteScope;
+   FEXCORE_PROFILE_SCOPED("Arm64::CompileCode");
+ 
+   const auto PrevNumAllocations = Relocations.size();
+@@ -1200,6 +1209,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
+ }
+ 
+ CPUBackend::CompiledCode Arm64JITCore::LoadCachedCode(std::span<const uint8_t> HostBytes) {
++  FEXCore::Utils::JITWriteScope WriteScope;
+   // we stored it aligned, better still be?
+   LOGMAN_THROW_A_FMT(HostBytes.size() % 16 == 0, "Needs to be 16B aligned!");
+   auto AllocatedInfo = AllocateCodeBufferInSharedCache(HostBytes.size());
+diff --git a/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp b/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
+index 6e8df95..94e7ebe 100644
+--- a/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
+@@ -366,7 +366,7 @@ DEF_OP(MonoBackpatcherWrite) {
+   }
+ 
+ #ifdef ARCHITECTURE_arm64ec
+-  ldr(TMP2, ARMEmitter::XReg::x18, TEB_CPU_AREA_OFFSET);
++  LoadTEBField(TMP2, TEB_CPU_AREA_OFFSET);
+   LoadConstant(ARMEmitter::Size::i32Bit, TMP1, 1);
+   strb(TMP1.W(), TMP2, CPU_AREA_IN_SYSCALL_CALLBACK_OFFSET);
+ #endif
+@@ -379,7 +379,7 @@ DEF_OP(MonoBackpatcherWrite) {
+   }
+ 
+ #ifdef ARCHITECTURE_arm64ec
+-  ldr(TMP2, ARMEmitter::XReg::x18, TEB_CPU_AREA_OFFSET);
++  LoadTEBField(TMP2, TEB_CPU_AREA_OFFSET);
+   strb(ARMEmitter::WReg::zr, TMP2, CPU_AREA_IN_SYSCALL_CALLBACK_OFFSET);
+ #endif
+ 
+diff --git a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
+index 01e5bb2..8a3c828 100644
+--- a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
++++ b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
+@@ -3,6 +3,7 @@
+ #include "Interface/Core/CPUBackend.h"
+ #include "Interface/Context/Context.h"
+ #include <FEXCore/Utils/SpinWaitLock.h>
++#include <FEXCore/Utils/JITWriteScope.h>
+ 
+ #include <FEXCore/Debug/InternalThreadState.h>
+ #include <FEXCore/Utils/EnumUtils.h>
+@@ -2103,6 +2104,8 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
+   // Lock code mutex during any SIGBUS handling that potentially changes code.
+   // Due to code buffer sharing between threads, code must be carefully backpatched from last to first.
+   // Multiple threads can be attempting to handle the SIGBUS or even be executing the code being backpatched.
++  // neutron: the lock word lives in the code buffer, so write mode must cover the lock and outlive it.
++  FEXCore::Utils::JITWriteScope WriteScope;
+   FEXCore::Utils::SpinWaitLock::UniqueSpinMutex lk(&InlineTail->SpinLockFutex);
+ 
+   if ((Instr & LDAXR_MASK) == LDAR_INST ||  // LDAR*
+diff --git a/FEXCore/include/FEXCore/Utils/JITWriteScope.h b/FEXCore/include/FEXCore/Utils/JITWriteScope.h
+new file mode 100644
+index 0000000..b1d2287
+--- /dev/null
++++ b/FEXCore/include/FEXCore/Utils/JITWriteScope.h
+@@ -0,0 +1,27 @@
++// SPDX-License-Identifier: MIT
++#pragma once
++#include <FEXCore/Utils/CompilerDefs.h>
++
++namespace FEXCore::Utils {
++// neutron: on Apple Silicon, MAP_JIT memory is either writable or executable per thread.
++// The frontend installs a toggle that switches the current thread to write mode (true)
++// and back to exec mode (false); the toggle handles nesting itself.
++using JITWriteToggleFn = void (*)(bool Write);
++FEX_DEFAULT_VISIBILITY extern JITWriteToggleFn JITWriteToggle;
++
++class JITWriteScope final {
++public:
++  JITWriteScope() {
++    if (JITWriteToggle) {
++      JITWriteToggle(true);
++    }
++  }
++  ~JITWriteScope() {
++    if (JITWriteToggle) {
++      JITWriteToggle(false);
++    }
++  }
++  JITWriteScope(const JITWriteScope&) = delete;
++  JITWriteScope& operator=(const JITWriteScope&) = delete;
++};
++} // namespace FEXCore::Utils
+diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
+index 2489e65..4c7b8ca 100644
+--- a/Source/Windows/ARM64EC/Module.S
++++ b/Source/Windows/ARM64EC/Module.S
+@@ -1,3 +1,17 @@
++// neutron: macOS zeroes x18, load the TEB from the pthread TSD slot instead.
++.macro LOAD_TEB reg, tmp
++#ifdef NEUTRON_TEB_IN_TSD
++  mrs \reg, tpidrro_el0
++  and \reg, \reg, #~7
++  movz \tmp, #0x7fff, lsl #32
++  movk \tmp, #0xfdff, lsl #16
++  ldr \tmp, [\tmp]
++  ldr \reg, [\reg, \tmp]
++#else
++  mov \reg, x18
++#endif
++.endm
++
+ .text
+ .balign 16
+ 
+@@ -16,7 +30,8 @@ RetToEntryThunk:
+ 
+ check_target_ec:
+   // Check if target is in fact x86 code
+-  ldr x16, [x18, #0x60] // TEB->PEB
++  LOAD_TEB x16, x17
++  ldr x16, [x16, #0x60] // TEB->PEB
+   ldr x16, [x16, #0x368] // PEB->EcCodeBitMap
+   lsr x17, x9, #18
+   ldr x16, [x16, x17, lsl #3]
+@@ -32,7 +47,8 @@ ExitToX64:
+   str lr, [sp, #-8]! // Push return address to stack, this will be popped by the x86 RET instr.
+ 
+ enter_jit:
+-  ldr x17, [x18, #0x1788] // TEB->ChpeV2CpuAreaInfo
++  LOAD_TEB x17, x16
++  ldr x17, [x17, #0x1788] // TEB->ChpeV2CpuAreaInfo
+   mov w16, #1
+   strb w16, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation
+   ldr x16, [x17, #0x40] // ChpeV2CpuAreaInfo->EmulatorData[2] - DispatcherLoopTopEnterEC
+@@ -41,12 +57,14 @@ enter_jit:
+   // Invoked by KiUserEmulationDispatcher after e.g. an NtContinue to x86 code
+ .global BeginSimulation
+ BeginSimulation:
+-  ldr x17, [x18, #0x1788] // TEB->ChpeV2CpuAreaInfo
++  LOAD_TEB x17, x16
++  ldr x17, [x17, #0x1788] // TEB->ChpeV2CpuAreaInfo
+   ldr x16, [x17, #0x8] // ChpeV2CpuAreaInfo->EmulatorStackBase
+   mov sp, x16
+   ldr x0, [x17, #0x18] // ChpeV2CpuAreaInfo->ContextAmd64
+   bl "#SyncThreadContext"
+-  ldr x17, [x18, #0x1788] // TEB->ChpeV2CpuAreaInfo
++  LOAD_TEB x17, x16
++  ldr x17, [x17, #0x1788] // TEB->ChpeV2CpuAreaInfo
+   ldr x16, [x17, #0x48] // ChpeV2CpuAreaInfo->EmulatorData[3] - DispatcherLoopTopEnterECFillSRA
+   mov x11, #0 // Zero ENTRY_FILL_SRA_SINGLE_INST_REG to avoid single step
+   br x16 // DispatcherLoopTopEnterECFillSRA(SingleInst:x10, CPUArea:x17)
+@@ -59,7 +77,8 @@ ExitFunctionEC:
+   mrs x17, fpcr
+   and x17, x17, #~6 // NEP + AH
+   msr fpcr, x17
+-  ldr x17, [x18, #0x1788] // TEB->ChpeV2CpuAreaInfo
++  LOAD_TEB x17, x16
++  ldr x17, [x17, #0x1788] // TEB->ChpeV2CpuAreaInfo
+   strb wzr, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation
+   ldr x17, [x17, #0x20] // ChpeV2CpuAreaInfo->SuspendDoorbell
+   ldr w17, [x17]
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 633f252..7789216 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -47,6 +47,7 @@ $end_info$
+ #include "Common/PortabilityInfo.h"
+ #include "Common/Handle.h"
+ #include "DummyHandlers.h"
++#include <FEXCore/Utils/JITWriteScope.h>
+ #include "BTInterface.h"
+ #include "Windows/Common/SHMStats.h"
+ 
+@@ -668,6 +669,13 @@ NTSTATUS ProcessInit() {
+ 
+   FEX::Windows::Allocator::SetupHooks(NtDll);
+   FEX::Windows::UnixLib::Init(NtDll);
++  // neutron: Apple Silicon MAP_JIT code buffers need a per-thread write/exec switch.
++  if (FEX::Windows::UnixLib::JITWriteProtect(true)) {
++    FEX::Windows::UnixLib::JITWriteProtect(false);
++    FEXCore::Utils::JITWriteToggle = [](bool Write) {
++      FEX::Windows::UnixLib::JITWriteProtect(Write);
++    };
++  }
+   if (FEX::Windows::UnixLib::Available()) {
+     FEXCore::DiskCache::SetFileMapper(FEX::Windows::UnixLib::MapFile);
+   }
+diff --git a/Source/Windows/Common/FEXUnixLib.cpp b/Source/Windows/Common/FEXUnixLib.cpp
+index e37807f..5bfda1a 100644
+--- a/Source/Windows/Common/FEXUnixLib.cpp
++++ b/Source/Windows/Common/FEXUnixLib.cpp
+@@ -210,4 +210,16 @@ uint32_t GetPID() {
+   return GetCurrentProcessId();
+ }
+ 
++bool JITWriteProtect(bool Write) {
++  if (!Available()) {
++    return false;
++  }
++
++  FEXUnixLib_JITWriteProtect Args {
++    .Write = Write,
++  };
++
++  return Call(FEXUnixLibFunctions::JITWriteProtect, &Args) == STATUS_SUCCESS;
++}
++
+ } // namespace FEX::Windows::UnixLib
+diff --git a/Source/Windows/Common/FEXUnixLib.h b/Source/Windows/Common/FEXUnixLib.h
+index c62a763..4063bfb 100644
+--- a/Source/Windows/Common/FEXUnixLib.h
++++ b/Source/Windows/Common/FEXUnixLib.h
+@@ -53,4 +53,11 @@ void* MapFile(HANDLE FileHandle, uint64_t MapSize);
+ // Or returns the process ID otherwise.
+ uint32_t GetPID();
+ 
++/**
++ * @brief neutron: switches the thread between JIT write and exec mode (Apple Silicon MAP_JIT).
++ *
++ * @return false if the host does not need or support it.
++ */
++bool JITWriteProtect(bool Write);
++
+ } // namespace FEX::Windows::UnixLib
+diff --git a/Source/Windows/UnixLib/CMakeLists.txt b/Source/Windows/UnixLib/CMakeLists.txt
+index 37eda6a..d41cbbb 100644
+--- a/Source/Windows/UnixLib/CMakeLists.txt
++++ b/Source/Windows/UnixLib/CMakeLists.txt
+@@ -6,7 +6,9 @@ include(GNUInstallDirs)
+ function(CreateLib TargetName LibName)
+   add_library(${TargetName} SHARED FEXUnixLib.cpp)
+   set_target_properties(${TargetName} PROPERTIES OUTPUT_NAME ${LibName} PREFIX "lib" SUFFIX ".so")
+-  target_link_libraries(${TargetName} PRIVATE rt)
++  if (NOT APPLE)
++    target_link_libraries(${TargetName} PRIVATE rt)
++  endif()
+   install(TARGETS ${TargetName} LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT Runtime)
+ endfunction()
+ 
+diff --git a/Source/Windows/UnixLib/FEXUnixLib.cpp b/Source/Windows/UnixLib/FEXUnixLib.cpp
+index 8adef59..948e667 100644
+--- a/Source/Windows/UnixLib/FEXUnixLib.cpp
++++ b/Source/Windows/UnixLib/FEXUnixLib.cpp
+@@ -4,7 +4,15 @@
+ #include <fcntl.h>
+ #include <string>
+ #include <sys/mman.h>
++#ifdef __APPLE__
++#include <pthread.h>
++// neutron: macOS has no prctl, the handlers below report "not supported".
++static inline int prctl(int, ...) {
++  return -1;
++}
++#else
+ #include <sys/prctl.h>
++#endif
+ #include <unistd.h>
+ 
+ #include "FEXUnixLib.h"
+@@ -181,6 +189,23 @@ static NTSTATUS FEXUnixLib_GetPIDHandler(void* _Args) {
+   Args->Result = ::getpid();
+   return STATUS_SUCCESS;
+ }
++static NTSTATUS FEXUnixLib_JITWriteProtectHandler(void* _Args) {
++#ifdef __APPLE__
++  static __thread int Depth;
++  auto Args = reinterpret_cast<const FEXUnixLib_JITWriteProtect*>(_Args);
++  if (Args->Write) {
++    if (Depth++ == 0) {
++      pthread_jit_write_protect_np(0);
++    }
++  } else if (Depth > 0 && --Depth == 0) {
++    pthread_jit_write_protect_np(1);
++  }
++  return STATUS_SUCCESS;
++#else
++  return STATUS_NOT_SUPPORTED;
++#endif
++}
++
+ extern "C" const unixlib_entry_t __wine_unix_call_funcs[] = {
+   FEXUnixLib_SetHardwareTSOControlHandler,
+   FEXUnixLib_SetKernelUnalignedAtomicControlHandler,
+@@ -190,6 +215,7 @@ extern "C" const unixlib_entry_t __wine_unix_call_funcs[] = {
+   FEXUnixLib_DeleteSHMStatsFileHandler,
+   FEXUnixLib_MapFileHandler,
+   FEXUnixLib_GetPIDHandler,
++  FEXUnixLib_JITWriteProtectHandler,
+ };
+ 
+ static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == ToUnderlying(FEXUnixLibFunctions::MAX));
+diff --git a/Source/Windows/UnixLib/FEXUnixLib.h b/Source/Windows/UnixLib/FEXUnixLib.h
+index ed7f18c..123e028 100644
+--- a/Source/Windows/UnixLib/FEXUnixLib.h
++++ b/Source/Windows/UnixLib/FEXUnixLib.h
+@@ -12,6 +12,7 @@ enum class FEXUnixLibFunctions : uint32_t {
+   DeleteSHMStatsFile,
+   MapFile,
+   GetPID,
++  JITWriteProtect,
+   MAX,
+ };
+ 
+@@ -65,3 +66,10 @@ struct FEXUnixLib_GetPID {
+   uint32_t Result;
+ };
+ static_assert(sizeof(FEXUnixLib_GetPID) == 4);
++
++// neutron: switch the calling thread between write (true) and exec (false) mode for
++// MAP_JIT memory on Apple Silicon. Nesting is counted on the unix side.
++struct FEXUnixLib_JITWriteProtect {
++  bool Write;
++};
++static_assert(sizeof(FEXUnixLib_JITWriteProtect) == 1);

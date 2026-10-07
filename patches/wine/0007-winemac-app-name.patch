@@ -1,0 +1,97 @@
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -26,6 +26,8 @@
+ #import "cocoa_event.h"
+ #import "cocoa_window.h"
+ 
++WINE_DEFAULT_DEBUG_CHANNEL(macdrv);  /* neutron: for the resign-active log */
++
+ #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+ 
+ 
+@@ -230,6 +232,17 @@
+             NSString* bundleName;
+             NSString* title;
+             NSMenuItem* item;
++            const char* app_name = getenv("NEUTRON_APP_NAME");
++
++            /* neutron: show the game name instead of "Wine" in the menu bar and the Dock */
++            if (app_name && *app_name)
++            {
++                NSString* name = [NSString stringWithUTF8String:app_name];
++                id info = [[NSBundle mainBundle] infoDictionary];
++                if ([info isKindOfClass:[NSMutableDictionary class]])
++                    [(NSMutableDictionary*)info setObject:name forKey:(NSString*)kCFBundleNameKey];
++                [[NSProcessInfo processInfo] setProcessName:name];
++            }
+ 
+             [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+ 
+@@ -734,9 +747,48 @@
+         [self updateFullscreenWindows];
+         [self adjustWindowLevels];
+     }
++
++    /* neutron: displays, their bounds and current modes as a string, to tell whether the
++     * display setup really changed */
++    static NSString* neutron_display_signature(void)
++    {
++        NSMutableString* sig = [NSMutableString string];
++        CGDirectDisplayID displays[32];
++        uint32_t i, count;
+ 
++        if (CGGetActiveDisplayList(32, displays, &count) != kCGErrorSuccess)
++            return nil;
++        for (i = 0; i < count; i++)
++        {
++            CGRect bounds = CGDisplayBounds(displays[i]);
++            CGDisplayModeRef mode = CGDisplayCopyDisplayMode(displays[i]);
++            [sig appendFormat:@"%u:%g,%g,%g,%g", displays[i], bounds.origin.x, bounds.origin.y,
++                              bounds.size.width, bounds.size.height];
++            if (mode)
++            {
++                [sig appendFormat:@":%zux%zu/%zux%zu@%g", CGDisplayModeGetWidth(mode), CGDisplayModeGetHeight(mode),
++                                  CGDisplayModeGetPixelWidth(mode), CGDisplayModeGetPixelHeight(mode),
++                                  CGDisplayModeGetRefreshRate(mode)];
++                CGDisplayModeRelease(mode);
++            }
++            [sig appendString:@";"];
++        }
++        return sig;
++    }
++
+     - (void) sendDisplaysChanged:(BOOL)activating
+     {
++        static NSString* lastSignature;
++        NSString* signature = neutron_display_signature();
++
++        /* neutron: the resync on activation rebuilds Wine's whole display list (registry,
++         * IOKit EDID reads, 100+ ms on the game thread). Games get re-activated on clicks,
++         * so only resync when the setup differs from what Wine last saw. */
++        if (activating && signature && [signature isEqualToString:lastSignature])
++            return;
++        [lastSignature release];
++        lastSignature = [signature retain];
++
+         macdrv_event* event;
+         WineEventQueue* queue;
+ 
+@@ -1438,7 +1490,7 @@
+             }
+             else
+             {
+-                double scale = retina_on ? 2 : 1;
++                double scale = macdrv_win_scale();
+ 
+                 /* Add event delta to accumulated delta error */
+                 /* deltaY is already flipped */
+@@ -2241,6 +2293,9 @@
+ 
+         [self invalidateGotFocusEvents];
+ 
++        WARN("resigned active, frontmost is now %s\n",
++             [[[[NSWorkspace sharedWorkspace] frontmostApplication] localizedName] UTF8String]);
++
+         event = macdrv_create_event(APP_DEACTIVATED, nil);
+ 
+         [eventQueuesLock lock];

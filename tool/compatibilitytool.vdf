@@ -1,0 +1,16 @@
+// to_oslist is "linux" on purpose: the Mac client only enables its compat layer
+// when it starts with @sSteamCmdForcePlatformType linux, and then matches tools
+// against that platform. See docs/neutron.md.
+"compatibilitytools"
+{
+  "compat_tools"
+  {
+    "neutron"
+    {
+      "install_path" "."
+      "display_name" "Neutron"
+      "from_oslist"  "windows"
+      "to_oslist"    "linux"
+    }
+  }
+}

@@ -1,0 +1,208 @@
+diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
+index 86cf466..c6a0513 100644
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -818,82 +818,43 @@ public:
+   };
+ 
+   void UpdateStatistics(const FrameStatisticsContainer& statistics, uint64_t frame_id) {
++    /* neutron: readable labels, one value group per line (the HUD column is ~28 chars) */
+     hud.begin();
+     auto &frame = statistics.at(frame_id - 1); // show the previous one frame statistics
+     auto &average = statistics.average();
++    auto ms = [](auto d) { return std::min(d.count() / 1000000.0, 99.9); };
+     Flags<FeatureCompatibility> flags = frame.compatibility_flags;
+-    char text[] = "---------------------------";
+-    if (flags.test(FeatureCompatibility::UnsupportedGeometryDraw)) {
+-      text[3] = 'G';
+-    }
+-    if (flags.test(FeatureCompatibility::UnsupportedTessellationOutputPrimitive)) {
+-      text[5] = 'T';
+-      text[6] = 'O';
+-    }
+-    if (flags.test(FeatureCompatibility::UnsupportedIndirectTessellationDraw)) {
+-      text[8] = 'I';
+-      text[9] = 'T';
+-    }
+-    if (flags.test(FeatureCompatibility::UnsupportedGeometryTessellationDraw)) {
+-      text[11] = 'G';
+-      text[12] = 'T';
+-    }
+-    if (flags.test(FeatureCompatibility::UnsupportedDrawAuto)) {
+-      text[14] = 'A';
+-    }
+-    if (flags.test(FeatureCompatibility::UnsupportedPredication)) {
+-      text[16] = 'P';
+-    }
+-    if (flags.test(FeatureCompatibility::UnsupportedStreamOutputAppending)) {
+-      text[18] = 'S';
+-      text[19] = 'A';
+-    }
+-    if (flags.test(FeatureCompatibility::UnsupportedMultipleStreamOutput)) {
+-      text[21] = 'M';
+-      text[22] = 'S';
+-    }
+-    hud.printLine(text);
+-    hud.printLine(std::format(
+-        "Commit: {:2} -{:4.1f} -{:4.1f}", std::min(frame.command_buffer_count, 99u),
+-        std::min(average.commit_interval.count() / 1000000.0, 99.9),
+-        std::min(statistics.max().commit_interval.count() / 1000000.0, 99.9)
+-    ));
+-    hud.printLine(std::format(
+-        "Sync:   {:2} {:4.1f}  {:2} {:4.1f} {:2}", std::min(frame.sync_count, 99u),
+-        std::min(average.sync_interval.count() / 1000000.0, 99.9), std::min(statistics.max().event_stall, 99u),
+-        std::min(average.present_latency_interval.count() / 1000000.0, 99.9), frame.latency
+-    ));
+-    hud.printLine(std::format(
+-        "Encode: {:4.1f}+{:4.1f}+{:4.1f}={:4.1f}", std::min(average.encode_prepare_interval.count() / 1000000.0, 99.9),
+-        std::min((average.encode_flush_interval - average.drawable_blocking_interval).count() / 1000000.0, 99.9),
+-        std::min(average.drawable_blocking_interval.count() / 1000000.0, 99.9),
+-        std::min((average.encode_prepare_interval + average.encode_flush_interval).count() / 1000000.0, 99.9)
+-    ));
+-    hud.printLine(std::format(
+-        "Render:{:3}+{:<3} Clear:{:3}+{:<2}", std::min(frame.render_pass_count - frame.render_pass_optimized, 999u),
+-        std::min(frame.render_pass_optimized, 999u),
+-        std::min(frame.clear_pass_count - frame.clear_pass_optimized, 999u), std::min(frame.clear_pass_optimized, 99u)
+-    ));
++    std::string missing;
++    if (flags.test(FeatureCompatibility::UnsupportedGeometryDraw)) missing += " GS";
++    if (flags.test(FeatureCompatibility::UnsupportedTessellationOutputPrimitive)) missing += " TessOut";
++    if (flags.test(FeatureCompatibility::UnsupportedIndirectTessellationDraw)) missing += " IndTess";
++    if (flags.test(FeatureCompatibility::UnsupportedGeometryTessellationDraw)) missing += " GS+Tess";
++    if (flags.test(FeatureCompatibility::UnsupportedDrawAuto)) missing += " DrawAuto";
++    if (flags.test(FeatureCompatibility::UnsupportedPredication)) missing += " Predication";
++    if (flags.test(FeatureCompatibility::UnsupportedStreamOutputAppending)) missing += " SOAppend";
++    if (flags.test(FeatureCompatibility::UnsupportedMultipleStreamOutput)) missing += " MultiSO";
++
++    /* label, then one value word: the Metal HUD right-aligns the last word */
++    hud.printLine(std::format("CPU encode {:.1f}ms",
++        ms(average.encode_prepare_interval + average.encode_flush_interval - average.drawable_blocking_interval)));
++    hud.printLine(std::format("Drawable wait {:.1f}ms", ms(average.drawable_blocking_interval)));
++    hud.printLine(std::format("Present latency {:.1f}ms", ms(average.present_latency_interval)));
++    hud.printLine(std::format("Command buffers {}", std::min(frame.command_buffer_count, 999u)));
++    hud.printLine(std::format("GPU syncs {}", std::min(frame.sync_count, 999u)));
++    hud.printLine(std::format("Render passes {}+{}", std::min(frame.render_pass_count - frame.render_pass_optimized, 9999u),
++        std::min(frame.render_pass_optimized, 999u)));
++    hud.printLine(std::format("Clear passes {}+{}", std::min(frame.clear_pass_count - frame.clear_pass_optimized, 9999u),
++        std::min(frame.clear_pass_optimized, 999u)));
++    hud.printLine(std::format("Frames queued {}", frame.latency));
+     {
+-      /* scaler info */
+       auto &info = frame.last_scaler_info;
+-      if (info.type == ScalerType::Temporal) {
+-        auto &info = frame.last_scaler_info;
+-        hud.printLine(std::format(
+-            "MetalFX: Temporal {} {}", info.auto_exposure ? "AEXP" : "", info.motion_vector_highres ? "HMV" : ""
+-        ));
+-        hud.printLine(std::format(
+-            "Scale: {:4}x{:4}->{:4}x{:4}", info.input_width, info.input_height, info.output_width, info.output_height
+-        ));
+-      }
+-      if (info.type == ScalerType::Spatial) {
+-        hud.printLine(std::format(
+-            "MetalFX: Spatial"
+-        ));
+-        hud.printLine(std::format(
+-            "Scale: {:4}x{:4}->{:4}x{:4}", info.input_width, info.input_height, info.output_width, info.output_height
+-        ));
+-      }
++      if (info.type == ScalerType::Temporal || info.type == ScalerType::Spatial)
++        hud.printLine(std::format("MetalFX {} {}x{}>{}x{}", info.type == ScalerType::Temporal ? "temporal" : "spatial",
++            info.input_width, info.input_height, info.output_width, info.output_height));
++    }
++    if (!missing.empty()) {
++      for (auto &c : missing) if (c == ' ') c = ',';
++      hud.printLine("Unsupported " + missing.substr(1));
+     }
+     hud.end();
+   }
+diff --git a/src/dxmt/dxmt_hud_state.cpp b/src/dxmt/dxmt_hud_state.cpp
+index e626721..eab8330 100644
+--- a/src/dxmt/dxmt_hud_state.cpp
++++ b/src/dxmt/dxmt_hud_state.cpp
+@@ -1,5 +1,6 @@
+ #include "dxmt_hud_state.hpp"
+ #include "Metal.hpp"
++#include "util_env.hpp"
+ #include <string>
+ 
+ namespace dxmt {
+@@ -12,22 +13,44 @@ HUDState::initialize(const std::string &heading) {
+   hud_.addLabel(str_dxmt_version, String::string("com.apple.hud-graph.default", WMTUTF8StringEncoding));
+   hud_.updateLabel(str_dxmt_version, String::string(heading.c_str(), WMTUTF8StringEncoding));
+   line_labels_.push_back(std::move(str_dxmt_version));
++
++  /* neutron: runtime info from the compat tool, per-frame statistics with NEUTRON_HUD=2 */
++  /* lines separated by ';', the HUD right-aligns the last word of each line */
++  std::string info = env::getEnvVar("NEUTRON_HUD_INFO");
++  size_t pos = 0;
++  while (pos < info.size()) {
++    size_t end = info.find(';', pos);
++    if (end == std::string::npos)
++      end = info.size();
++    std::string line = info.substr(pos, end - pos);
++    pos = end + 1;
++    if (line.empty())
++      continue;
++    auto str_info = MakeString(("com.github.3shain.dxmt-neutron" + std::to_string(line_labels_.size())).c_str(),
++                               WMTUTF8StringEncoding);
++    hud_.addLabel(str_info, line_labels_.back());
++    hud_.updateLabel(str_info, String::string(line.c_str(), WMTUTF8StringEncoding));
++    line_labels_.push_back(std::move(str_info));
++  }
++  base_lines_ = line_labels_.size();
++  detail_ = env::getEnvVar("NEUTRON_HUD") == "2";
++#ifdef DXMT_DEBUG
++  detail_ = true;
++#endif
+ }
+ 
+ void
+ HUDState::begin() {
+-#ifndef DXMT_DEBUG
+-  return;
+-#endif
++  if (!detail_)
++    return;
+   pool_ = WMT::MakeAutoreleasePool();
+-  current_line_ = 1;
++  current_line_ = base_lines_;
+ }
+ 
+ void
+ HUDState::printLine(const char *c_str) {
+-#ifndef DXMT_DEBUG
+-  return;
+-#endif
++  if (!detail_)
++    return;
+   using namespace WMT;
+   while (current_line_ >= line_labels_.size()) {
+     String prev = line_labels_.back();
+@@ -42,9 +65,8 @@ HUDState::printLine(const char *c_str) {
+ 
+ void
+ HUDState::end() {
+-#ifndef DXMT_DEBUG
+-  return;
+-#endif
++  if (!detail_)
++    return;
+   while (line_labels_.size() > current_line_) {
+     hud_.remove(line_labels_.back());
+     line_labels_.pop_back();
+diff --git a/src/dxmt/dxmt_hud_state.hpp b/src/dxmt/dxmt_hud_state.hpp
+index ed1e5e5..5b2f62d 100644
+--- a/src/dxmt/dxmt_hud_state.hpp
++++ b/src/dxmt/dxmt_hud_state.hpp
+@@ -28,6 +28,9 @@ private:
+   std::vector<WMT::Reference<WMT::String>> line_labels_;
+   WMT::Reference<WMT::Object> pool_;
+   unsigned current_line_;
++  /* neutron: fixed lines on top (version, neutron info), per-frame lines below */
++  unsigned base_lines_ = 1;
++  bool detail_ = false;
+ };
+ 
+ } // namespace dxmt
+\ No newline at end of file

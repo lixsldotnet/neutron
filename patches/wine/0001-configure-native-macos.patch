@@ -1,0 +1,33 @@
+--- a/configure.ac
++++ b/configure.ac
+@@ -981,7 +981,13 @@
+     AC_SUBST(SECURITY_LIBS,"-framework Security -framework CoreFoundation")
+     AC_SUBST(SYSTEMCONFIGURATION_LIBS,"-framework SystemConfiguration")
+ 
+-    WINELOADER_LDFLAGS="-Wl,-segalign,0x1000,-pagezero_size,0x1000,-sectcreate,__TEXT,__info_plist,loader/wine_info.plist"
++    case $HOST_ARCH in
++      aarch64)
++        dnl neutron: arm64 macOS kills binaries with a __PAGEZERO below 4 GB and needs 16K segments
++        WINELOADER_LDFLAGS="-Wl,-sectcreate,__TEXT,__info_plist,loader/wine_info.plist" ;;
++      *)
++        WINELOADER_LDFLAGS="-Wl,-segalign,0x1000,-pagezero_size,0x1000,-sectcreate,__TEXT,__info_plist,loader/wine_info.plist" ;;
++    esac
+ 
+     case $HOST_ARCH in
+       x86_64)
+@@ -2866,6 +2872,7 @@
+ WINE_CONFIG_MAKEFILE(dlls/localui)
+ WINE_CONFIG_MAKEFILE(dlls/localui/tests)
+ WINE_CONFIG_MAKEFILE(dlls/lz32)
++WINE_CONFIG_MAKEFILE(dlls/lsteamclient)
+ WINE_CONFIG_MAKEFILE(dlls/lz32/tests)
+ WINE_CONFIG_MAKEFILE(dlls/lzexpand.dll16)
+ WINE_CONFIG_MAKEFILE(dlls/magnification)
+@@ -3664,6 +3671,7 @@
+ WINE_CONFIG_MAKEFILE(programs/sort)
+ WINE_CONFIG_MAKEFILE(programs/spoolsv)
+ WINE_CONFIG_MAKEFILE(programs/start)
++WINE_CONFIG_MAKEFILE(programs/steam_helper)
+ WINE_CONFIG_MAKEFILE(programs/subst)
+ WINE_CONFIG_MAKEFILE(programs/svchost)
+ WINE_CONFIG_MAKEFILE(programs/systeminfo)

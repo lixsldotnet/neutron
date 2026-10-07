@@ -1,0 +1,125 @@
+--- a/src/d3d12/d3d12_device.hpp
++++ b/src/d3d12/d3d12_device.hpp
+@@ -56,7 +56,11 @@
+ 
+ class MTLD3D12CommandQueue : public ID3D12CommandQueue {
+ public:
+-  virtual HRESULT Present(Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable, double after) = 0;
++  /* neutron: with a scaler, MetalFX scales the backbuffer into upscaled before presenting */
++  virtual HRESULT Present(
++      Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable, double after,
++      WMT::FXSpatialScaler scaler = {}, WMT::Texture upscaled = {}
++  ) = 0;
+ };
+ 
+ class MTLD3D12Resource : public ID3D12Resource {
+--- a/src/d3d12/d3d12_command_queue.cpp
++++ b/src/d3d12/d3d12_command_queue.cpp
+@@ -405,16 +405,26 @@
+   }
+ 
+   HRESULT
+-  Present(Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable, double after) {
++  Present(
++      Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable, double after,
++      WMT::FXSpatialScaler scaler, WMT::Texture upscaled
++  ) {
+     auto scope = StartCommitting();
+     auto &cmdbuf = scope.inflight.cmdbuf;
+ 
+     auto g = reinterpret_cast<MTLD3D12Resource *>(backbuffer);
+     auto &view = g->texture->view(g->texture->fullView);
++    WMT::Texture source = view.texture;
++
++    /* neutron: the scaler waits for and updates the queue fence like the render passes do */
++    if (scaler.handle != NULL_OBJECT_HANDLE && upscaled.handle != NULL_OBJECT_HANDLE) {
++      cmdbuf.encodeSpatialScale(scaler, source, upscaled, fence_);
++      source = upscaled;
++    }
+ 
+     auto state = presenter->synchronizeLayerProperties();
+     auto drawable = presenter->encodeCommands(
+-        cmdbuf, view.texture, state.metadata,
++        cmdbuf, source, state.metadata,
+         [&](auto encoder) { encoder.waitForFence(fence_, WMTRenderStageFragment); },
+         [&](auto encoder) { encoder.updateFence(fence_, WMTRenderStageFragment); }
+     );
+--- a/src/d3d12/d3d12_swapchain.cpp
++++ b/src/d3d12/d3d12_swapchain.cpp
+@@ -27,6 +27,7 @@
+ #include "wsi_window.hpp"
+ #include "util_hotpatch.h"
+ #include "config/config.hpp"
++#include "util_env.hpp"
+ #include <cfloat>
+ 
+ /**
+@@ -142,6 +143,9 @@
+   uint32_t frame_latency;
+   DXGI_COLOR_SPACE_TYPE colorspace_ = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+   float scale_factor = 1.0;
++  /* neutron: MetalFX spatial upscaling like the D3D11 swapchain (DXMT_METALFX_SPATIAL_SWAPCHAIN=1) */
++  WMT::Reference<WMT::FXSpatialScaler> metalfx_scaler_;
++  WMT::Reference<WMT::Texture> upscaled_;
+   HUDState hud;
+   double init_refresh_rate_ = DBL_MAX;
+   int preferred_max_frame_rate = 0;
+@@ -180,6 +184,13 @@
+       abort();
+     }
+ 
++    if (env::getEnvVar("DXMT_METALFX_SPATIAL_SWAPCHAIN") == "1") {
++      if (pDevice->GetMTLDevice().supportsFXSpatialScaler())
++        scale_factor = std::max(Config::getInstance().getOption<float>("d3d11.metalSpatialUpscaleFactor", 2), 1.0f);
++      else
++        WARN("MetalFX spatial scaler is not supported on this device");
++    }
++
+     presenter = Rc(new Presenter(pDevice->GetMTLDevice(), layer_weak_, lib, scale_factor, desc_.SampleDesc.Count));
+ 
+     frame_latency = kSwapchainLatency;
+@@ -534,6 +545,33 @@
+         return E_FAIL;
+       }
+       backbuffers_.push_back(reinterpret_cast<MTLD3D12Resource *>(backbuffer.ptr()));
++    }
++
++    metalfx_scaler_ = {};
++    upscaled_ = {};
++    if (scale_factor > 1.0f) {
++      auto source = backbuffers_[0]->texture->view(backbuffers_[0]->texture->fullView).texture;
++      WMTTextureInfo info = {};
++      info.type = WMTTextureType2D;
++      info.pixel_format = source.pixelFormat();
++      info.usage = (WMTTextureUsage)(WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite | WMTTextureUsageRenderTarget);
++      info.options = WMTResourceStorageModePrivate;
++      info.width = backbuffer_desc_.Width * scale_factor;
++      info.height = backbuffer_desc_.Height * scale_factor;
++      info.depth = 1;
++      info.array_length = 1;
++      info.mipmap_level_count = 1;
++      info.sample_count = 1;
++      upscaled_ = device_->GetMTLDevice().newTexture(info);
++
++      WMTFXSpatialScalerInfo scaler_info;
++      scaler_info.color_format = info.pixel_format;
++      scaler_info.output_format = info.pixel_format;
++      scaler_info.input_width = backbuffer_desc_.Width;
++      scaler_info.input_height = backbuffer_desc_.Height;
++      scaler_info.output_width = info.width;
++      scaler_info.output_height = info.height;
++      metalfx_scaler_ = device_->GetMTLDevice().newSpatialScaler(scaler_info);
+     }
+ 
+     return S_OK;
+@@ -715,7 +753,9 @@
+     );
+ 
+     auto &backbuffer = backbuffers_[presentation_count_ % backbuffers_.size()];
+-    hr = queue_->Present(this->presenter.ptr(), backbuffer.ptr(), present_semaphore_, vsync_duration);
++    hr = queue_->Present(
++        this->presenter.ptr(), backbuffer.ptr(), present_semaphore_, vsync_duration, metalfx_scaler_, upscaled_
++    );
+ 
+     presentation_count_ += 1;
+ 

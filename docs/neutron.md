@@ -1,0 +1,158 @@
+# neutron: design and findings
+
+Goal: the native Mac Steam client runs Windows games like Proton does on Linux.
+No second Windows Steam inside Wine, no Rosetta. Apple Silicon only.
+
+## Architecture
+
+```
+Mac Steam (native, the only Steam)
+  | starts Windows games through the compat tool "neutron"
+  v
+tool/neutron                          prefix setup, env, per-game settings
+  v
+Wine 11.19, arm64 unix side, ARM64EC + aarch64 Windows side
+  +- FEX (libarm64ecfex.dll)          translates only the game's x86_64 code
+  +- DXMT (d3d10/11/12, dxgi)         Direct3D on Metal, MetalFX upscaling
+  +- steam.exe (Proton steam_helper)  Steam registry and process state
+  +- steamclient64.dll = lsteamclient Windows side of the Steam bridge
+       v  Wine unix call
+     lsteamclient.so                  macOS side of the bridge
+       v  dlopen
+     steamclient.dylib (Mac Steam)    login, ownership, achievements, cloud
+```
+
+Everything except the game's own x86_64 code runs as arm64: Wine's system
+DLLs are ARM64EC, so calls from the game into Windows APIs leave the emulator
+right at the DLL boundary.
+
+## Steam Play in the Mac client
+
+Checked on client 1788652215.
+
+- `steamclient.dylib` is universal and exports 5 of the 7 functions
+  lsteamclient loads (`Steam_IsKnownInterface` and
+  `Steam_NotifyMissingInterface` are optional in our patch).
+- Steam Play is compiled in (`CCompatManager`, `compatibilitytools.d`,
+  `CompatToolMapping`, all `STEAM_COMPAT_*` env vars). The settings page is only
+  hidden in the UI by a `"linux" == PLATFORM` check in the steamui JS.
+- Proton's lsteamclient still has its `__APPLE__` path from 2018.
+
+How it is turned on (done by `dev/steam.sh`):
+
+1. **Compat layer flag.** `CCompatManager` enables the compat layer once in its
+   constructor when the ConVar `@sSteamCmdForcePlatformType` is `linux`. Steam
+   ignores it on the command line but reads `steam_dev.cfg` from
+   `Steam.AppBundle/Steam/Contents/MacOS/`.
+2. **Back to macos.** After startup `SteamClient.Console.ExecCommand(
+   "@sSteamCmdForcePlatformType macos")` sets the download platform back; the
+   compat flag stays on.
+3. **Tool discovery.** Steam scans `STEAM_EXTRA_COMPAT_TOOLS_PATHS` and
+   `/usr/local/share/steam/compatibilitytools.d`, not the Steam root.
+4. **Manifest.** `to_oslist` must be `linux`, tools are matched against the
+   platform Steam started with (`macos` fails with eAppError 29).
+5. **Mapping.** `SteamClient.Apps.SpecifyCompatTool(appid, "neutron")` over the
+   CEF debug port (`-cef-enable-debugging -devtools-port 8080`). A global tool
+   (`SpecifyGlobalCompatTool`) alone does not unlock installing a Windows-only
+   game, the per-game mapping does.
+
+Steam then downloads the Windows depots itself and runs
+`neutron waitforexitandrun <game exe>`. Mac Steam does not support
+`VAR=x %command%` launch options (AppError 46), so settings go into
+`neutron.env` next to the tool.
+
+## macOS findings
+
+These are the problems a Windows-on-ARM64 stack hits on macOS and how neutron
+solves them. Measured on macOS 27, M5 Max.
+
+- **x18.** Windows ARM64 keeps the TEB in x18, macOS clears x18 on syscalls
+  and on preemption. `NtCurrentTeb()` reads the TEB from a pthread TSD slot via
+  `TPIDRRO_EL0` instead (Wine `winnt.h`, the llvm-mingw `winnt.h`, FEX). The
+  prebuilt llvm-mingw CRT startup objects are rebuilt with that header. A fault
+  handler safety net covers the rest (libc++abi exception TLS).
+- **`__PAGEZERO`.** arm64 macOS kills binaries whose `__PAGEZERO` ends below
+  4 GB, so nothing lives there. `KUSER_SHARED_DATA` moves to `0x7ffffdfe0000`;
+  the page after it holds the TSD slot offset and the PEB pointer for PE code.
+- **execve** returns EFAULT for strings just below `0x7ffffe000000` (Wine's
+  thread stacks), exec env strings go to the heap.
+- **JIT memory.** Write+exec needs `MAP_JIT`, which cannot be combined with
+  `MAP_FIXED`, and the per-thread write/exec switch does not survive a signal
+  handler. Wine maps FEX's code buffers with `MAP_JIT` at a hint address, FEX
+  switches to write mode around code emission and patching (`JITWriteScope`).
+  Other RWX requests get RW.
+- **`mach_vm_map`** answers `KERN_INVALID_ADDRESS` above 4 GB near the main
+  binary; Wine treats that as "in use" and keeps searching.
+- **16K pages.** Wine shows Windows 4K pages and gives all 4K pages of a host
+  page the most permissive protection of them. FEX's 4K guard pages never
+  faulted: a call-return stack underflow (Unity/Mono) ran into the next
+  mapping and every exception handler faulted again until the stack overflowed.
+  FEX guard pages are 16K now.
+- **CPU features.** macOS traps EL0 reads of the ARM ID registers. Wine builds
+  the `CP 40xx` registry values from `hw.optional.arm.FEAT_*`, otherwise FEX
+  hides SSE4.2 and Unreal refuses to start.
+- **Hardware TSO** (the x86 memory order Rosetta uses) cannot be enabled for a
+  normal process, FEX emulates it with barriers.
+- **Never `cp` over a loaded Mach-O**, macOS kills the process with "Code
+  Signature Invalid". Delete first, then copy.
+- **SIP strips `DYLD_*`** when a system binary like `/usr/bin/perl` is in
+  between. GnuTLS and FreeType are bundled into `files/lib`.
+
+## Desktop integration
+
+- **Game Mode** needs a real app bundle with the games category. Windows
+  processes start from `files/lib/wine/aarch64-unix/Neutron.app` (a copy of the
+  loader with `tool/Neutron-Info.plist`), borderless fullscreen windows go into
+  macOS native fullscreen (`NEUTRON_NATIVE_FULLSCREEN`).
+- The menu bar shows the game name from Steam's app manifest
+  (`NEUTRON_APP_NAME`), not "Wine".
+- Cmd+Tab stays with macOS: games cannot register Alt+Tab as a hotkey (Command
+  is Windows Alt), and windows in native fullscreen keep the normal window level
+  so the switcher and the Dock draw above them.
+- Every click re-activates the app (cause unknown). Wine used to answer each
+  activation with a full display resync (registry rewrite, EDID reads, 100 to
+  170 ms on the game thread); it now skips the resync when the displays did not
+  change.
+- Steam's Stop: the tool runs the game in the background and ends the whole
+  Wine session of the prefix with `wineserver -k` on TERM.
+
+## Performance
+
+- **FEX TSO.** Fast mode is the default. Strict mode (`NEUTRON_FEX_TSO=strict`,
+  vector and memcpy TSO) costs a lot in CPU-bound games (Gamble With Your
+  Friends: 58 FPS strict, 98 FPS fast in the same view) and is set per game
+  where it fixes races (`APP_TSO_427410=strict`: Abiotic Factor deadlocks
+  between GameThread and SlateLoadingThread at startup without it).
+- **Render scale.** `NEUTRON_RENDER_SCALE` (default 0.85) scales all Windows
+  coordinates in winemac.drv the way Retina mode does with factor 2, so games
+  see a 2924x1224 desktop on a 3440x1440 display. The tool sets the DXMT MetalFX
+  factor to 1/scale (D3D11 and D3D12), and the output is native size again.
+  Only the desktop display mode is scaled; real mode switches are not.
+- **Measuring.** `NEUTRON_FPS_LOG=1` writes FPS and the slowest frame per
+  second to the game log, `NEUTRON_HUD=2` shows the Metal HUD with DXMT's
+  per-frame statistics.
+
+## Patches
+
+All third-party code is fetched at build time and patched (`build.sh`).
+
+| Folder | Upstream | What |
+|---|---|---|
+| `patches/wine` | Wine 11.19 | configure for arm64 macOS, KUSER above 4 GB, ntdll TEB/JIT/exec/ID registers, winemac for DXMT, makedep, Game Mode loader, app name, Cmd+Tab, native fullscreen, render scale |
+| `patches/proton` | Proton lsteamclient, steam_helper | lsteamclient on macOS (optional exports, libc++, key map, `NEUTRON_STEAMCLIENT_DYLIB`), libc++ link, `steam://` URLs via `open` |
+| `patches/llvm-mingw` | llvm-mingw 20260908 | `NtCurrentTeb()` via TSD in `winnt.h` |
+| `patches/fex` | FEX 2610 | TEB via TSD, `MAP_JIT` write scopes, macOS UnixLib, 16K guard pages |
+| `patches/dxmt` | DXMT main | D3D12 clock calibration, no `thread_local`, neutron HUD lines, FPS log, D3D12 MetalFX |
+
+## Open points
+
+- Black loading screen in Abiotic Factor: `LoadMap` stalls up to 60 s while the
+  GPU runs compute work.
+- 32-bit games (WoW64) are not built.
+- Allocations below 4 GB fail (seen once, relocated fine).
+- Overlay and anti-cheat (EAC, BattlEye) will not work.
+- A UI for the hidden compatibility page; today `dev/steam.sh` does the setup.
+- Whether a Steam client update removes `steam_dev.cfg`.
+- License: the lsteamclient folder is under the Steamworks SDK license, not
+  open source. The repo only holds patches and fetches Valve's code at build
+  time; check this before publishing binaries.

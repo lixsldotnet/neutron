@@ -1,0 +1,13 @@
+# build work dirs (./build.sh)
+/.native-build*/
+/.native-build*.log
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# local Claude Code settings
+.claude/settings.local.json

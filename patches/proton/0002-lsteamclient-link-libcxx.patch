@@ -1,0 +1,9 @@
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -1,5 +1,6 @@
+ MODULE    = lsteamclient.dll
+ UNIXLIB   = lsteamclient.so
++UNIX_LIBS = -lc++
+ IMPORTS   = user32 ws2_32
+ 
+ EXTRADEFS = -DSTEAM_API_EXPORTS -Dprivate=public -Dprotected=public
