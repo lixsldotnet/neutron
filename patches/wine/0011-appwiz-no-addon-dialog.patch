@@ -1,0 +1,18 @@
+--- a/dlls/appwiz.cpl/addons.c
++++ b/dlls/appwiz.cpl/addons.c
+@@ -774,11 +774,14 @@
+      * - /opt/wine/$addon_subdir/
+      * - download from URL stored in $url_config_key value of HKCU/Software/Wine/$config_key key
+      */
++    /* neutron: no download dialog. Game prefixes are set up while nobody watches,
++     * a dialog would block the start; an addon that is not bundled is skipped. */
+     if (install_from_registered_dir() == INSTALL_NEXT
+         && install_from_default_dir() == INSTALL_NEXT
+         && install_from_cache() == INSTALL_NEXT
+         && (url = get_url()))
+-        DialogBoxW(hInst, addon->dialog_template, 0, installer_proc);
++        WARN("%s not installed, no local package (download dialog %p disabled)\n",
++             debugstr_w(addon->file_name), installer_proc);
+ 
+     free(url);
+     url = NULL;
