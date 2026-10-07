@@ -101,8 +101,10 @@ if [ "$MAP_ALL" = 1 ]; then
       const h = SteamClient.Apps.RegisterForAppDetails(id, d => { if (done) return; done = true; h.unregister(); resolve(d); });
       setTimeout(() => { if (!done) { done = true; h.unregister(); resolve(null); } }, 3000);
     });
+    const games = () => (window.collectionStore?.allGamesCollection?.allApps || []).filter(a => a.app_type == 1);
+    for (let i = 0; i < 120 && !games().length; i++) await new Promise(r => setTimeout(r, 500));
     let mapped = 0, mac = 0, unknown = 0;
-    for (const app of collectionStore.allGamesCollection.allApps.filter(a => a.app_type == 1)) {
+    for (const app of games()) {
       const d = await details(app.appid);
       if (!d || !d.vecPlatforms || !d.vecPlatforms.length) { unknown++; continue; }
       if (d.vecPlatforms.includes('osx')) { mac++; continue; }

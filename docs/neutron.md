@@ -56,6 +56,12 @@ How it is turned on (done by `dev/steam.sh`):
    (`SpecifyGlobalCompatTool`) alone does not unlock installing a Windows-only
    game, the per-game mapping does.
 
+Steam Cloud works like with Proton: the Mac client resolves the Windows roots
+of a compat tool game (`WinAppDataLocalLow`, `WinMyDocuments` and co.) to
+`compatdata/<appid>/pfx/drive_c/users/steamuser/...` and skips paths that do
+not exist ("Steam Cloud out of sync"). So the prefix is `pfx` and the tool runs
+Wine with `USER=steamuser`; older prefixes are migrated on start.
+
 Steam then downloads the Windows depots itself and runs
 `neutron waitforexitandrun <game exe>`. Mac Steam does not support
 `VAR=x %command%` launch options (AppError 46), so settings go into

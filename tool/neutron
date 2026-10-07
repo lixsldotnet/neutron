@@ -59,7 +59,11 @@ die() { log "error: $*"; exit 1; }
 
 # arm64 Wine with ARM64EC system DLLs, the game's x86_64 code runs in FEX.
 [ -d "$FILES/lib/wine/aarch64-windows" ] || die "not a neutron runtime: $FILES"
+# Same prefix layout as Proton: Mac Steam resolves Steam Cloud paths of Windows
+# games (WinAppDataLocalLow and co.) to compatdata/<appid>/pfx/drive_c/users/steamuser.
 export WINEPREFIX="$STEAM_COMPAT_DATA_PATH/pfx"
+MAC_USER="${USER:-}"
+export USER=steamuser   # Wine names the Windows profile after $USER
 # FEX memory ordering: fast by default (Unity game 58 to 98 FPS against strict),
 # strict for games with threading races under fast (APP_TSO_<appid>, below).
 APP_TSO_427410=strict   # Abiotic Factor: GameThread vs SlateLoadingThread deadlock
@@ -140,6 +144,23 @@ export NEUTRON_STEAMCLIENT_DYLIB
 #  prefix
 #-------------------------------------------------------------------------------
 
+# Older neutron builds used pfx-native and the Mac user name as Windows profile.
+# Move both to the Proton layout; the old profile name stays as a symlink for
+# absolute paths in the registry.
+migrate_prefix() {
+  if [ -d "$STEAM_COMPAT_DATA_PATH/pfx-native" ] && [ ! -e "$WINEPREFIX" ]; then
+    log "moving pfx-native to pfx"
+    mv "$STEAM_COMPAT_DATA_PATH/pfx-native" "$WINEPREFIX"
+  fi
+  local users="$WINEPREFIX/drive_c/users"
+  if [ -n "$MAC_USER" ] && [ "$MAC_USER" != steamuser ] && [ -d "$users/$MAC_USER" ] \
+     && [ ! -L "$users/$MAC_USER" ] && [ ! -e "$users/steamuser" ]; then
+    log "renaming the Windows profile $MAC_USER to steamuser"
+    mv "$users/$MAC_USER" "$users/steamuser"
+    ln -s steamuser "$users/$MAC_USER"
+  fi
+}
+
 # Copies src to dst only when the content differs (keeps mtimes stable).
 sync_file() {
   local src="$1" dst="$2"
@@ -148,6 +169,7 @@ sync_file() {
 }
 
 setup_prefix() {
+  migrate_prefix
   if [ ! -f "$WINEPREFIX/system.reg" ]; then
     log "creating prefix $WINEPREFIX"
     mkdir -p "$WINEPREFIX"
