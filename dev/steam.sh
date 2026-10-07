@@ -107,8 +107,11 @@ if [ "$MAP_ALL" = 1 ]; then
     for (const app of games()) {
       const d = await details(app.appid);
       if (!d || !d.vecPlatforms || !d.vecPlatforms.length) { unknown++; continue; }
-      if (d.vecPlatforms.includes('osx')) { mac++; continue; }
-      if (d.strCompatToolName !== '$TOOL') { SteamClient.Apps.SpecifyCompatTool(app.appid, '$TOOL'); mapped++; }
+      if (d.strCompatToolName === '$TOOL') continue;
+      // A mapped compat tool makes Steam list osx too: games mapped to another
+      // (older) tool name are Windows games, remap them.
+      if (d.vecPlatforms.includes('osx') && !d.strCompatToolName) { mac++; continue; }
+      SteamClient.Apps.SpecifyCompatTool(app.appid, '$TOOL'); mapped++;
     }
     return 'mapped ' + mapped + ', Mac native ' + mac + ', unknown ' + unknown;
   })()"
