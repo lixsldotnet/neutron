@@ -5,7 +5,7 @@
 {
   "compat_tools"
   {
-    "neutron"
+    "neutron_proton"
     {
       "install_path" "."
       "display_name" "Neutron"

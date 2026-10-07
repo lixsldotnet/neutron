@@ -12,7 +12,7 @@
 # Usage: dev/steam.sh [--dist <dist/neutron>] [--tool <name>] [--map <appid>]... [--map-all]
 #                     [--launch <appid>=<options>]... [--global <name>|none]
 #   --map-all maps every game in the library that has no Mac version
-#   --tool    compat tool name for --map and --map-all (default neutron)
+#   --tool    compat tool name for --map and --map-all (default neutron_proton)
 #   --global  default compat tool for all Windows games (none removes it). This alone
 #             does not unlock installing a Windows-only game, the per-game mapping does.
 #   --launch  per-game launch options (Mac Steam ignores "VAR=x %command%", use neutron.env)
@@ -29,7 +29,7 @@ DIST=""
 MAP_APPS=()
 MAP_ALL=0
 LAUNCH_OPTS=()
-TOOL="neutron"
+TOOL="neutron_proton"
 GLOBAL_TOOL=""
 
 say() { printf '\033[36m> %s\033[0m\n' "$*"; }

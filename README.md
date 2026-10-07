@@ -74,13 +74,13 @@ neutron. After that the Windows games show an Install button in Mac Steam and
 start like any other game.
 
 Other options: `--map <appid>` for single games, `--launch <appid>=<options>`
-for launch options, `--global neutron|none` for the default compat tool.
+for launch options, `--global neutron_proton|none` for the default compat tool.
 
 ## Settings
 
 Mac Steam ignores `VAR=x %command%` in launch options. Put settings into
 `neutron.env` next to the tool
-(`~/Library/Application Support/neutron/compatibilitytools.d/neutron/neutron.env`),
+(`~/Library/Application Support/neutron/compatibilitytools.d/neutron_proton/neutron.env`),
 one `KEY=value` per line:
 
 | Setting | Default | What |

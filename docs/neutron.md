@@ -7,7 +7,7 @@ No second Windows Steam inside Wine, no Rosetta. Apple Silicon only.
 
 ```
 Mac Steam (native, the only Steam)
-  | starts Windows games through the compat tool "neutron"
+  | starts Windows games through the compat tool "neutron_proton"
   v
 tool/neutron                          prefix setup, env, per-game settings
   v
@@ -51,16 +51,19 @@ How it is turned on (done by `dev/steam.sh`):
    `/usr/local/share/steam/compatibilitytools.d`, not the Steam root.
 4. **Manifest.** `to_oslist` must be `linux`, tools are matched against the
    platform Steam started with (`macos` fails with eAppError 29).
-5. **Mapping.** `SteamClient.Apps.SpecifyCompatTool(appid, "neutron")` over the
+5. **Mapping.** `SteamClient.Apps.SpecifyCompatTool(appid, "neutron_proton")` over the
    CEF debug port (`-cef-enable-debugging -devtools-port 8080`). A global tool
    (`SpecifyGlobalCompatTool`) alone does not unlock installing a Windows-only
    game, the per-game mapping does.
 
 Steam Cloud works like with Proton: the Mac client resolves the Windows roots
 of a compat tool game (`WinAppDataLocalLow`, `WinMyDocuments` and co.) to
-`compatdata/<appid>/pfx/drive_c/users/steamuser/...` and skips paths that do
-not exist ("Steam Cloud out of sync"). So the prefix is `pfx` and the tool runs
-Wine with `USER=steamuser`; older prefixes are migrated on start.
+`compatdata/<appid>/pfx/drive_c/users/steamuser/...`, but only when the tool
+name contains "proton" (`strstr(name, "proton")` in `steamclient.dylib`).
+Otherwise every cloud file is skipped ("Steam Cloud out of sync"). So the
+internal tool name is `neutron_proton` (shown as "Neutron"), the prefix is
+`pfx`, and the tool runs Wine with `USER=steamuser`; older prefixes are
+migrated on start.
 
 Steam then downloads the Windows depots itself and runs
 `neutron waitforexitandrun <game exe>`. Mac Steam does not support
