@@ -1,3 +1,6 @@
+DXMT_SHADER_CACHE_PATH (absolute) holds the shader cache and the Metal pipeline
+cache, so both live in compatdata/<appid>/dxmt-cache instead of the purgeable user cache.
+
 diff --git a/src/dxgi/dxgi.cpp b/src/dxgi/dxgi.cpp
 --- a/src/dxgi/dxgi.cpp	2026-10-06 15:26:23
 +++ b/src/dxgi/dxgi.cpp	2026-10-08 04:17:10

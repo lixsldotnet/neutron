@@ -1,3 +1,6 @@
+No thread_local in DXMT: compiler TLS on Windows ARM64 goes through x18, which
+macOS clears on syscalls and preemption.
+
 diff --git a/src/dxmt/dxmt_occlusion_query.hpp b/src/dxmt/dxmt_occlusion_query.hpp
 index 56e9e76..99c5899 100644
 --- a/src/dxmt/dxmt_occlusion_query.hpp

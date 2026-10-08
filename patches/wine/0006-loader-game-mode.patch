@@ -1,3 +1,5 @@
+Loader inside an app bundle (Game Mode needs the games category) and a per-game app
+bundle that names ntdll through NEUTRON_NTDLL.
 --- a/loader/wine_info.plist.in
 +++ b/loader/wine_info.plist.in
 @@ -26,5 +26,9 @@

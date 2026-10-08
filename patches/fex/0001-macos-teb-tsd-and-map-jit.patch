@@ -1,3 +1,6 @@
+FEX on macOS: TEB from the pthread TSD slot (macOS clears x18), MAP_JIT write scopes
+around code emission and patching (per-thread W^X), and the macOS unix library.
+
 diff --git a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
 index 3ebadb5..3c0e85a 100644
 --- a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp

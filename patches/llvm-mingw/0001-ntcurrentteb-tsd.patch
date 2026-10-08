@@ -1,3 +1,6 @@
+llvm-mingw winnt.h: NtCurrentTeb() reads the TEB from the pthread TSD slot through
+TPIDRRO_EL0, because macOS clears x18. The CRT startup objects are rebuilt with it.
+
 --- a/generic-w64-mingw32/include/winnt.h
 +++ b/generic-w64-mingw32/include/winnt.h
 @@ -10393,10 +10393,14 @@

@@ -1,3 +1,6 @@
+Guard pages cover a whole host page: on a 16K page host a 4K guard never faults and a
+call-return stack underflow ran into the next mapping.
+
 --- a/FEXCore/include/FEXCore/Utils/TypeDefines.h
 +++ b/FEXCore/include/FEXCore/Utils/TypeDefines.h
 @@ -7,6 +7,9 @@

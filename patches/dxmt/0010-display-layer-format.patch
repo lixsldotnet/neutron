@@ -1,3 +1,6 @@
+Present 10-bit RGB backbuffers (Unreal's default) into a BGR10A2 layer, the
+display's own order, so macOS can show the game Direct. NEUTRON_LAYER_FORMAT=keep|bgra8.
+
 --- a/src/dxmt/dxmt_presenter.cpp
 +++ b/src/dxmt/dxmt_presenter.cpp
 @@ -2,6 +2,7 @@

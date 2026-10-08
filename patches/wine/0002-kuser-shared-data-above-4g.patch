@@ -1,3 +1,5 @@
+KUSER_SHARED_DATA above 4 GB: arm64 macOS allows nothing below 4 GB, so every user of
+the fixed 0x7ffe0000 address reads the moved one.
 --- a/dlls/ntdll/thread.c
 +++ b/dlls/ntdll/thread.c
 @@ -35,7 +35,7 @@

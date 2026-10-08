@@ -1,3 +1,5 @@
+makedep: version resources and import lists for arm64ec-only modules (the Unreal
+launcher checks vcruntime140_1's version resource).
 --- a/tools/makedep.c
 +++ b/tools/makedep.c
 @@ -3140,8 +3140,9 @@

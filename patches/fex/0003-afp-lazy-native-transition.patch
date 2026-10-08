@@ -1,3 +1,6 @@
+Leave FPCR alone on native transitions and set the AFP bits lazily in the JIT entry
+points that need them (FPCR writes are expensive).
+
 diff --git a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
 --- a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
 +++ b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h

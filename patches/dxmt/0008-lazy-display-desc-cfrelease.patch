@@ -1,3 +1,6 @@
+DXGI output: fill the native display description lazily (ColorSync XPC stalls at
+startup) and release the EDID tag data on every path.
+
 --- a/src/dxgi/dxgi_output.cpp
 +++ b/src/dxgi/dxgi_output.cpp	2026-10-08 05:36:06
 @@ -1,5 +1,6 @@

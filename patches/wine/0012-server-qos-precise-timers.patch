@@ -1,3 +1,5 @@
+wineserver at the top QoS class and latency tier 0, per-thread kqueue timers for
+precise sleeps (NEUTRON_PRECISE_TIMERS=0 disables).
 --- a/server/main.c
 +++ b/server/main.c
 @@ -35,6 +35,11 @@

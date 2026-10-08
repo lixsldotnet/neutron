@@ -1,3 +1,6 @@
+Proton lsteamclient on macOS: load the Mac client's steamclient.dylib, build against
+libc++, macOS virtual key codes for the overlay input. Applied in dlls/lsteamclient.
+
 diff -ru a/steamclient_structs.h b/steamclient_structs.h
 --- a/steamclient_structs.h	2026-10-07 13:28:39
 +++ b/steamclient_structs.h	2026-10-07 13:42:20

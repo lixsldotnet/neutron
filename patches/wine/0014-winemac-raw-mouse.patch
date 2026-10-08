@@ -1,6 +1,8 @@
+Raw input (mouse look) from GameController GCMouse: unaccelerated device deltas, sent
+only as WM_INPUT; the cursor follows the macOS cursor. NEUTRON_RAW_MOUSE=0 disables.
 --- a/dlls/winemac.drv/cocoa_rawmouse.m
 +++ b/dlls/winemac.drv/cocoa_rawmouse.m
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,136 @@
 +/*
 + * MACDRV raw mouse input from GameController
 + *
@@ -9,6 +11,8 @@
 + * pointer acceleration in them and get the render scale applied, so they are
 + * only used for the cursor. GCMouse gives the device deltas without
 + * acceleration; they go to the key window as MOUSE_MOVED_RAW events.
++ *
++ * Copyright 2026 the neutron contributors
 + *
 + * This library is free software; you can redistribute it and/or
 + * modify it under the terms of the GNU Lesser General Public

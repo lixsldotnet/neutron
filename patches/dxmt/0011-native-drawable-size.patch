@@ -1,3 +1,7 @@
+The drawable gets the view's size in screen pixels (set on the layer by winemac.drv)
+and the present pass scales the backbuffer into it, so macOS does not scale the layer
+in the compositor. NEUTRON_NATIVE_DRAWABLE=0 keeps DXMT's sizing.
+
 --- a/src/winemetal/winemetal.h
 +++ b/src/winemetal/winemetal.h
 @@ -1773,6 +1773,11 @@

@@ -1,3 +1,5 @@
+No Mono/Gecko download dialog: prefixes are set up while nobody watches; Wine Mono
+ships with the runtime.
 --- a/dlls/appwiz.cpl/addons.c
 +++ b/dlls/appwiz.cpl/addons.c
 @@ -774,11 +774,14 @@

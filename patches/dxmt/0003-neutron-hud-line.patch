@@ -1,3 +1,6 @@
+Metal HUD: readable DXMT labels, one value group per line, plus the runtime info
+lines the compat tool passes in NEUTRON_HUD_INFO; per-frame statistics with NEUTRON_HUD=2.
+
 diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
 index 86cf466..c6a0513 100644
 --- a/src/d3d11/d3d11_swapchain.cpp

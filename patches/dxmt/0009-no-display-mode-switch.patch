@@ -1,3 +1,6 @@
+Never switch the real display mode on macOS (flicker, other windows rearranged);
+fullscreen modes are emulated with the window size.
+
 --- a/src/util/wsi_window_win32.cpp
 +++ b/src/util/wsi_window_win32.cpp
 @@ -10,6 +10,7 @@

@@ -1,3 +1,5 @@
+NEUTRON_RENDER_SCALE: Windows sees a smaller screen (Windows pixels per Mac point like
+Retina mode), DXMT upscales with MetalFX. Also the raw mouse declarations and setting.
 --- a/dlls/winemac.drv/macdrv_cocoa.h
 +++ b/dlls/winemac.drv/macdrv_cocoa.h
 @@ -117,14 +117,29 @@

@@ -1,3 +1,6 @@
+D3D12: GetTimestampFrequency in GPU nanoseconds and GetClockCalibration with a QPC
+sample instead of E_NOTIMPL, which Unreal treats as fatal.
+
 diff --git a/src/d3d12/d3d12_command_queue.cpp b/src/d3d12/d3d12_command_queue.cpp
 index 57b0332..65e4532 100644
 --- a/src/d3d12/d3d12_command_queue.cpp

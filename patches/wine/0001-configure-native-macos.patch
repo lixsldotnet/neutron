@@ -1,3 +1,4 @@
+configure: native arm64 macOS build (4 GB __PAGEZERO, 16K segment alignment).
 --- a/configure.ac
 +++ b/configure.ac
 @@ -981,7 +981,13 @@

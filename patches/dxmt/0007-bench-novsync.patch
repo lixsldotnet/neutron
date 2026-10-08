@@ -1,3 +1,6 @@
+Benchmarks only: NEUTRON_BENCH_NOVSYNC=1 draws the present pass into an offscreen
+texture and never presents, so the display refresh does not cap the frame rate.
+
 --- a/src/dxmt/dxmt_presenter.cpp
 +++ b/src/dxmt/dxmt_presenter.cpp
 @@ -180,13 +180,41 @@

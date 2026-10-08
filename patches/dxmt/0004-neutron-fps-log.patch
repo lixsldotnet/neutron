@@ -1,3 +1,5 @@
+NEUTRON_FPS_LOG=1 writes the frame rate and the slowest frame once per second to the log.
+
 diff --git a/src/dxmt/dxmt_presenter.cpp b/src/dxmt/dxmt_presenter.cpp
 index e5aec04..9daa8b9 100644
 --- a/src/dxmt/dxmt_presenter.cpp

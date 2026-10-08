@@ -1,3 +1,5 @@
+Link lsteamclient's unix side with libc++ on macOS. Applied in dlls/lsteamclient.
+
 --- a/Makefile.in
 +++ b/Makefile.in
 @@ -1,5 +1,6 @@

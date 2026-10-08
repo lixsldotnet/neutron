@@ -1,3 +1,6 @@
+Proton steam_helper on macOS: hand steam:// URLs to the native client with
+/usr/bin/open. Applied in programs/steam_helper.
+
 --- a/steam.c	2026-10-07 13:57:24
 +++ b/steam.c	2026-10-07 13:57:24
 @@ -663,6 +663,7 @@

@@ -1,3 +1,5 @@
+The display lock is recursive for its owner thread: a driver mode change called back
+into win32u and deadlocked.
 --- a/dlls/win32u/sysparams.c
 +++ b/dlls/win32u/sysparams.c
 @@ -164,7 +164,33 @@

@@ -1,3 +1,5 @@
+winemac.drv cocoa_app.m: the game's name in the menu bar and Dock, no display resync on
+unchanged activations. Also carries the render scale and raw mouse parts of this file.
 --- a/dlls/winemac.drv/cocoa_app.m
 +++ b/dlls/winemac.drv/cocoa_app.m
 @@ -26,6 +26,8 @@

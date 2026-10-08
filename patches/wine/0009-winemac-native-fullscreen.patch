@@ -1,3 +1,6 @@
+Borderless windows covering the screen go into macOS native fullscreen (Game Mode,
+NEUTRON_NATIVE_FULLSCREEN); no blocking min/max query on Spaces changes in fullscreen;
+the Metal view's size in screen pixels for DXMT; window diagnostics with warn+macdrv.
 --- a/dlls/winemac.drv/cocoa_window.h
 +++ b/dlls/winemac.drv/cocoa_window.h
 @@ -66,6 +66,7 @@

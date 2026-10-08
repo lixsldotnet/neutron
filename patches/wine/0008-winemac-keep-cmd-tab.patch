@@ -1,3 +1,4 @@
+Cmd+Tab stays with macOS: Command is Windows Alt, games cannot register Alt+Tab.
 --- a/dlls/winemac.drv/cocoa_event.m
 +++ b/dlls/winemac.drv/cocoa_event.m
 @@ -454,7 +454,15 @@
