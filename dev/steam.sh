@@ -89,6 +89,28 @@ say "Platform back to macos"
 js 'new Promise(r=>{SteamClient.Console.ExecCommand("@sSteamCmdForcePlatformType macos"); setTimeout(()=>r(1),1000)})' >/dev/null
 say "Tools: $(js 'SteamClient.Settings.GetGlobalCompatTools()')"
 
+# After the platform switch Steam keeps "invalid platform" for games mapped to the
+# tool until the mapping is set again.
+say "Refreshing games mapped to $TOOL: $(js "(async () => {
+  const games = () => (window.collectionStore?.allGamesCollection?.allApps || []).filter(a => a.app_type == 1);
+  for (let i = 0; i < 120 && !games().length; i++) await new Promise(r => setTimeout(r, 500));
+  const tool = id => new Promise(resolve => {
+    let done = false;
+    const h = SteamClient.Apps.RegisterForAppDetails(id, d => { if (done) return; done = true; h.unregister(); resolve(d.strCompatToolName); });
+    setTimeout(() => { if (!done) { done = true; h.unregister(); resolve(''); } }, 3000);
+  });
+  let n = 0;
+  for (const app of games()) {
+    if (await tool(app.appid) !== '$TOOL') continue;
+    SteamClient.Apps.SpecifyCompatTool(app.appid, '');
+    await new Promise(r => setTimeout(r, 500));
+    SteamClient.Apps.SpecifyCompatTool(app.appid, '$TOOL');
+    await new Promise(r => setTimeout(r, 100));
+    n++;
+  }
+  return n;
+})()")"
+
 for app in ${MAP_APPS[@]+"${MAP_APPS[@]}"}; do
   say "Mapping $app to $TOOL"
   js "SteamClient.Apps.SpecifyCompatTool($app, \"$TOOL\")" >/dev/null
