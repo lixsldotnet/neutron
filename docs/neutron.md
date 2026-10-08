@@ -146,6 +146,11 @@ solves them. Measured on macOS 27, M5 Max.
   critical kqueue timer instead of select(). Sleep(1) went from 1.49 ms to
   1.04 ms; server round trips did not change. `NEUTRON_PRECISE_TIMERS=0`
   switches the timer part off (patch `0012-server-qos-precise-timers`).
+- **x64 syscall stub.** The ARM64EC x64 syscall stubs (`__ASM_SYSCALL_FUNC`) tested
+  `0x7ffe0308`, which faulted on every direct Nt call since KUSER moved above 4 GB
+  (2.4 us per call, mostly signal handling). The test is now `cmp %eax,%eax` plus a
+  nop of the same size (jne never taken), and `arm64x_check_call` in
+  `signal_arm64ec.c` accepts both forms. Direct x64 `Nt*` calls: 2.4 us to 0.17 us.
 - **Render scale.** `NEUTRON_RENDER_SCALE` (default 0.85) scales all Windows
   coordinates in winemac.drv the way Retina mode does with factor 2, so games
   see a 2924x1224 desktop on a 3440x1440 display. The tool sets the DXMT MetalFX

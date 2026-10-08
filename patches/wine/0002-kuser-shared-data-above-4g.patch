@@ -64,3 +64,29 @@
  
  static const struct ratio no_dpi;
  
+--- a/include/wine/asm.h
++++ b/include/wine/asm.h
+@@ -275,7 +275,10 @@
+                        ".byte 0x4c,0x8b,0xd1\n\t" /* 00: movq %rcx,%r10 */ \
+                        ".byte 0xb8\n\t"           /* 03: movl $i,%eax */ \
+                        ".long (" #id ")\n\t"                            \
+-                       ".byte 0xf6,0x04,0x25,0x08,0x03,0xfe,0x7f,0x01\n\t" /* 08: testb $1,0x7ffe0308 */ \
++                       /* neutron: KUSER moved above 4 GB, so testb $1,0x7ffe0308 faulted on every call. */ \
++                       /* cmp %eax,%eax + 6-byte nop: ZF set, jne never taken, same size and offsets. */ \
++                       ".byte 0x39,0xc0\n\t"     /* 08: cmp %eax,%eax */ \
++                       ".byte 0x66,0x0f,0x1f,0x44,0x00,0x00\n\t" /* 0a: nopw 0(%rax,%rax) */ \
+                        ".byte 0x75,0x03\n\t"      /* 10: jne 15 */ \
+                        ".byte 0x0f,0x05\n\t"      /* 12: syscall */ \
+                        ".byte 0xc3\n\t"           /* 14: ret */ \
+@@ -293,7 +296,10 @@
+                        ".byte 0x4c,0x8b,0xd1\n\t" /* 00: movq %rcx,%r10 */ \
+                        ".byte 0xb8\n\t"           /* 03: movl $i,%eax */ \
+                        ".long (" #id ")\n\t" \
+-                       ".byte 0xf6,0x04,0x25,0x08,0x03,0xfe,0x7f,0x01\n\t" /* 08: testb $1,0x7ffe0308 */ \
++                       /* neutron: KUSER moved above 4 GB, so testb $1,0x7ffe0308 faulted on every call. */ \
++                       /* cmp %eax,%eax + 6-byte nop: ZF set, jne never taken, same size and offsets. */ \
++                       ".byte 0x39,0xc0\n\t"     /* 08: cmp %eax,%eax */ \
++                       ".byte 0x66,0x0f,0x1f,0x44,0x00,0x00\n\t" /* 0a: nopw 0(%rax,%rax) */ \
+                        ".byte 0x75,0x03\n\t"      /* 10: jne 15 */ \
+                        ".byte 0x0f,0x05\n\t"      /* 12: syscall */ \
+                        ".byte 0xc3\n\t"           /* 14: ret */ \

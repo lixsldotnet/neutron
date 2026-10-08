@@ -97,7 +97,34 @@
           "lsr x17, x11, #18\n\t"            /* dest / page_size / 64 */
           "ldr x16, [x16, #0x368]\n\t"       /* peb->EcCodeBitMap */
           "lsr x9, x11, #12\n\t"             /* dest / page_size */
-@@ -2059,7 +2059,7 @@
+@@ -1932,7 +1932,12 @@
+          "ldr x16, [x11, #8]\n\t"
+          "ldr x17, .Lsyscall_seq + 8\n\t"
+          "cmp x16, x17\n\t"
+-         "b.ne .Lexit\n\t"
++         /* neutron: also accept the stub without the KUSER testb (cmp %eax,%eax + nop) */
++         "b.eq 1f\n\t"
++         "ldr x17, .Lsyscall_seq2\n\t"
++         "cmp x16, x17\n\t"
++         "b.ne .Lexit\n"
++         "1:\t"
+          "ldr x16, [x11, #16]\n\t"
+          "ldr x17, .Lsyscall_seq + 16\n\t"
+          "cmp x16, x17\n\t"
+@@ -1979,7 +1984,11 @@
+          ".byte 0x0f, 0x05\n\t"             /* syscall */
+          ".byte 0xc3\n\t"                   /* ret */
+          ".byte 0xcd, 0x2e\n\t"             /* 1: int $0x2e */
+-         ".byte 0xc3"                       /* ret */
++         ".byte 0xc3\n\t"                   /* ret */
++         ".balign 8\n"
++         ".Lsyscall_seq2:\n\t"             /* neutron: bytes 8..15 of the new stub */
++         ".byte 0x39, 0xc0\n\t"             /* cmp %eax,%eax */
++         ".byte 0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00"  /* nopw 0(%rax,%rax) */
+          :: "i" (__nb_syscalls) );
+ }
+ 
+@@ -2059,7 +2068,7 @@
           "add x1, sp, #0x20\n\t"       /* context pointer */
           "ldr x2, [x1, #0xf8]\n\t"     /* ctx->Rip */
           "str x2, [x0, #0x10]\n\t"     /* rec->ExceptionAddress */
@@ -106,7 +133,7 @@
           "ldrb w2, [x3, #2]\n\t"       /* peb->BeingDebugged */
           "cbnz w2, 1f\n\t"
           "bl \"#dispatch_exception\"\n"
-@@ -2163,7 +2163,7 @@
+@@ -2163,7 +2172,7 @@
           ".seh_save_fplr_x 16\n\t"
           ".seh_endprologue\n\t"
           ".seh_handler DbgUiRemoteBreakin_handler, @except\n\t"
