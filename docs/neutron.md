@@ -127,6 +127,13 @@ solves them. Measured on macOS 27, M5 Max.
 
 ## Performance
 
+- **Startup hang (display lock).** Abiotic Factor hung at startup after 2-3 FPS lines
+  (found with `dev/bench/hang-watch.sh`, which samples and lldb-dumps a stalled
+  game). GameThread held win32u's non-recursive display lock in
+  `apply_display_settings` while `macdrv_set_display_mode` waited for the main
+  thread and handled a QUERY_MIN_MAX_INFO on the same thread, which called
+  GetSystemMetrics and locked again (self-deadlock). Patch 0013 makes the lock
+  recursive for its owner. AF reaches the game 7 of 7 (was 0 of 3), Gamble 20 of 20.
 - **FEX TSO.** Fast mode is the default. Strict mode (`NEUTRON_FEX_TSO=strict`,
   vector and memcpy TSO) costs a lot in CPU-bound games (Gamble With Your
   Friends: 58 FPS strict, 98 FPS fast in the same view) and is set per game
