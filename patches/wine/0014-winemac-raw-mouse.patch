@@ -1,0 +1,202 @@
+--- a/dlls/winemac.drv/cocoa_rawmouse.m
++++ b/dlls/winemac.drv/cocoa_rawmouse.m
+@@ -0,0 +1,115 @@
++/*
++ * MACDRV raw mouse input from GameController
++ *
++ * neutron: Windows games read mouse look from raw input (WM_INPUT), which on
++ * Windows carries unaccelerated device counts. NSEvent deltas have the macOS
++ * pointer acceleration in them and get the render scale applied, so they are
++ * only used for the cursor. GCMouse gives the device deltas without
++ * acceleration; they go to the key window as MOUSE_MOVED_RAW events.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#import "config.h"
++#import "macdrv.h"
++
++#import <GameController/GameController.h>
++
++#import "cocoa_app.h"
++#import "cocoa_event.h"
++#import "cocoa_window.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(rawmouse);
++
++#pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
++
++
++/* Set while at least one GCMouse is connected. mouse.c then takes raw input
++ * only from MOUSE_MOVED_RAW events, not from cursor moves. */
++volatile bool neutron_raw_mouse = false;
++
++static double raw_remainder_x, raw_remainder_y;
++
++
++static void raw_mouse_moved(float deltaX, float deltaY)
++{
++    WineWindow* window;
++    macdrv_event* event;
++    int x, y;
++
++    if (![NSApp isActive]) return;
++    window = (WineWindow*)[NSApp keyWindow];
++    if (![window isKindOfClass:[WineWindow class]]) return;
++
++    /* GameController counts y up, Windows raw input counts y down. Keep the
++       fractional part for the next event. */
++    raw_remainder_x += deltaX;
++    raw_remainder_y -= deltaY;
++    x = (int)raw_remainder_x;
++    y = (int)raw_remainder_y;
++    if (!x && !y) return;
++    raw_remainder_x -= x;
++    raw_remainder_y -= y;
++
++    event = macdrv_create_event(MOUSE_MOVED_RAW, window);
++    event->mouse_moved.x = x;
++    event->mouse_moved.y = y;
++    event->mouse_moved.drag = false;
++    event->mouse_moved.time_ms = [[WineApplicationController sharedController]
++                                  ticksForEventTime:[[NSProcessInfo processInfo] systemUptime]];
++    [window.queue postEvent:event];
++    macdrv_release_event(event);
++}
++
++static void attach_mouse(GCMouse* mouse)
++{
++    TRACE("raw mouse %s\n", [[mouse vendorName] UTF8String]);
++    mouse.mouseInput.mouseMovedHandler = ^(GCMouseInput* input, float deltaX, float deltaY) {
++        raw_mouse_moved(deltaX, deltaY);
++    };
++}
++
++static void update_raw_mouse(void)
++{
++    neutron_raw_mouse = [[GCMouse mice] count] > 0;
++    TRACE("%lu mice, raw mouse %s\n", (unsigned long)[[GCMouse mice] count],
++          neutron_raw_mouse ? "on" : "off");
++}
++
++/***********************************************************************
++ *              macdrv_start_raw_mouse
++ *
++ * Start listening for GCMouse devices. The handlers run on the main queue.
++ */
++void macdrv_start_raw_mouse(void)
++{
++    dispatch_async(dispatch_get_main_queue(), ^{
++        NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
++
++        [nc addObserverForName:GCMouseDidConnectNotification object:nil queue:nil
++                    usingBlock:^(NSNotification* note){
++            attach_mouse(note.object);
++            update_raw_mouse();
++        }];
++        [nc addObserverForName:GCMouseDidDisconnectNotification object:nil queue:nil
++                    usingBlock:^(NSNotification* note){
++            update_raw_mouse();
++        }];
++
++        for (GCMouse* mouse in [GCMouse mice])
++            attach_mouse(mouse);
++        update_raw_mouse();
++    });
++}
+--- a/dlls/winemac.drv/mouse.c
++++ b/dlls/winemac.drv/mouse.c
+@@ -26,6 +26,7 @@
+ 
+ #include "config.h"
+ #include "macdrv.h"
++#include "wine/server.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(cursor);
+ 
+@@ -136,7 +137,8 @@
+     input.mi.time           = time;
+     input.mi.dwExtraInfo    = 0;
+ 
+-    NtUserSendHardwareInput(hwnd, 0, &input, 0);
++    /* neutron: with a GCMouse connected, raw input comes only from MOUSE_MOVED_RAW */
++    NtUserSendHardwareInput(hwnd, neutron_raw_mouse ? SEND_HWMSG_RAWINPUT : 0, &input, 0);
+ }
+ 
+ 
+@@ -885,6 +887,19 @@
+           event->mouse_moved.x, event->mouse_moved.y, event->mouse_moved.drag,
+           event->mouse_moved.time_ms, (NtGetTickCount() - event->mouse_moved.time_ms));
+ 
++    /* neutron: raw deltas only, the cursor follows the NSEvent moves */
++    if (event->type == MOUSE_MOVED_RAW)
++    {
++        INPUT input = { .type = INPUT_MOUSE };
++        struct raw_mouse raw = { .count = 1, .data = { { event->mouse_moved.x, event->mouse_moved.y } } };
++
++        if (!neutron_raw_mouse) return;
++        input.mi.dwFlags = MOUSEEVENTF_MOVE_NOCOALESCE;
++        input.mi.time    = event->mouse_moved.time_ms;
++        NtUserSendHardwareInput(hwnd, SEND_HWMSG_RAWINPUT, &input, (LPARAM)&raw);
++        return;
++    }
++
+     if (event->type == MOUSE_MOVED_ABSOLUTE)
+         flags |= MOUSEEVENTF_ABSOLUTE;
+ 
+--- a/dlls/winemac.drv/event.c
++++ b/dlls/winemac.drv/event.c
+@@ -47,6 +47,7 @@
+         "MOUSE_BUTTON",
+         "MOUSE_MOVED_RELATIVE",
+         "MOUSE_MOVED_ABSOLUTE",
++        "MOUSE_MOVED_RAW",
+         "MOUSE_SCROLL",
+         "QUERY_EVENT",
+         "QUERY_EVENT_NO_PREEMPT_WAIT",
+@@ -104,6 +105,7 @@
+     {
+         event_mask |= event_mask_for_type(MOUSE_MOVED_RELATIVE);
+         event_mask |= event_mask_for_type(MOUSE_MOVED_ABSOLUTE);
++        event_mask |= event_mask_for_type(MOUSE_MOVED_RAW);
+     }
+ 
+     if (mask & QS_POSTMESSAGE)
+@@ -349,6 +351,7 @@
+         break;
+     case MOUSE_MOVED_RELATIVE:
+     case MOUSE_MOVED_ABSOLUTE:
++    case MOUSE_MOVED_RAW:
+         macdrv_mouse_moved(hwnd, event);
+         break;
+     case MOUSE_SCROLL:
+--- a/dlls/winemac.drv/Makefile.in
++++ b/dlls/winemac.drv/Makefile.in
+@@ -7,6 +7,7 @@
+ 	-framework AppKit \
+ 	-framework Carbon \
+ 	-framework Foundation \
++	-framework GameController \
+ 	-framework IOKit \
+ 	-framework Metal \
+ 	-framework OpenGL \
+@@ -24,6 +25,7 @@
+ 	cocoa_event.m \
+ 	cocoa_main.m \
+ 	cocoa_opengl.m \
++	cocoa_rawmouse.m \
+ 	cocoa_status_item.m \
+ 	cocoa_window.m \
+ 	display.c \

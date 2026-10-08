@@ -15,6 +15,8 @@
 #                 NEUTRON_RENDER_SCALE=<0.5..1> (default 0.85) makes Windows see a
 #                   smaller display, so games render fewer pixels, and MetalFX (DXMT)
 #                   scales the picture back up to the real size. 1 turns it off.
+#                 NEUTRON_RAW_MOUSE=0 takes raw input (mouse look) from the accelerated
+#                   macOS cursor deltas again instead of the GCMouse device deltas.
 #                 NEUTRON_METALFX=<factor> upscales the game's output with MetalFX (DXMT) by
 #                   this factor. Set automatically from NEUTRON_RENDER_SCALE.
 #                 NEUTRON_FEX_TSO=strict gives FEX the full x86 memory ordering (much slower,

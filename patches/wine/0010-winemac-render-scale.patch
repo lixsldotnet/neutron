@@ -1,6 +1,6 @@
 --- a/dlls/winemac.drv/macdrv_cocoa.h
 +++ b/dlls/winemac.drv/macdrv_cocoa.h
-@@ -117,14 +117,25 @@
+@@ -117,14 +117,29 @@
  extern bool retina_on;       /* Whether Retina mode is currently active (enabled and display is in default mode). */
  extern bool enable_app_nap;
  
@@ -8,6 +8,10 @@
 + * (e.g. 0.85) lets Windows see a smaller screen: games render fewer pixels and DXMT
 + * upscales to the real size with MetalFX. */
 +extern double neutron_scale;
++
++/* neutron: raw input from GCMouse, see cocoa_rawmouse.m */
++extern volatile bool neutron_raw_mouse;
++extern void macdrv_start_raw_mouse(void);
 +
 +static inline double macdrv_win_scale(void)
 +{
@@ -31,7 +35,7 @@
      }
  
      return rect;
-@@ -132,12 +143,13 @@
+@@ -132,12 +147,13 @@
  
  static inline CGRect cgrect_win_from_mac(CGRect rect)
  {
@@ -50,7 +54,7 @@
      }
  
      return rect;
-@@ -145,10 +157,11 @@
+@@ -145,10 +161,11 @@
  
  static inline CGSize cgsize_mac_from_win(CGSize size)
  {
@@ -65,7 +69,7 @@
      }
  
      return size;
-@@ -156,10 +169,11 @@
+@@ -156,10 +173,11 @@
  
  static inline CGSize cgsize_win_from_mac(CGSize size)
  {
@@ -80,7 +84,7 @@
      }
  
      return size;
-@@ -167,10 +181,11 @@
+@@ -167,10 +185,11 @@
  
  static inline CGPoint cgpoint_mac_from_win(CGPoint point)
  {
@@ -95,7 +99,7 @@
      }
  
      return point;
-@@ -178,10 +193,11 @@
+@@ -178,10 +197,11 @@
  
  static inline CGPoint cgpoint_win_from_mac(CGPoint point)
  {
@@ -110,6 +114,14 @@
      }
  
      return point;
+@@ -265,6 +285,7 @@
+     MOUSE_BUTTON,
+     MOUSE_MOVED_RELATIVE,
+     MOUSE_MOVED_ABSOLUTE,
++    MOUSE_MOVED_RAW,     /* neutron: unaccelerated deltas for raw input only */
+     MOUSE_SCROLL,
+     QUERY_EVENT,
+     QUERY_EVENT_NO_PREEMPT_WAIT,
 --- a/dlls/winemac.drv/macdrv_main.c
 +++ b/dlls/winemac.drv/macdrv_main.c
 @@ -44,6 +44,7 @@
@@ -120,7 +132,7 @@
  bool right_command_is_ctrl = false;
  bool allow_software_rendering = false;
  bool allow_immovable_windows = true;
-@@ -367,6 +368,13 @@
+@@ -367,6 +368,19 @@
          retina_enabled = IS_OPTION_TRUE(buffer[0]);
  
      retina_on = retina_enabled;
@@ -130,6 +142,12 @@
 +        const char *env = getenv("NEUTRON_RENDER_SCALE");
 +        double value = env ? strtod(env, NULL) : 1.0;
 +        if (value >= 0.5 && value <= 1.0) neutron_scale = value;
++    }
++
++    /* neutron: raw input from GCMouse, NEUTRON_RAW_MOUSE=0 keeps Wine's NSEvent deltas */
++    {
++        const char *env = getenv("NEUTRON_RAW_MOUSE");
++        if (!env || strcmp(env, "0")) macdrv_start_raw_mouse();
 +    }
  
      if (appkey) NtClose(appkey);

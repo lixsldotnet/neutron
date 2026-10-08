@@ -215,6 +215,14 @@ solves them. Measured on macOS 27, M5 Max.
   see a 2924x1224 desktop on a 3440x1440 display. The tool sets the DXMT MetalFX
   factor to 1/scale (D3D11 and D3D12), and the output is native size again.
   Only the desktop display mode is scaled; real mode switches are not.
+- **Raw mouse.** Wine took the game's raw input (`WM_INPUT`, mouse look in Unity
+  and Unreal) from the NSEvent deltas, which carry the macOS pointer acceleration
+  and the render scale (mouse look 15% slower at 0.85). Patch 0014 reads the device
+  deltas from GameController `GCMouse` (`cocoa_rawmouse.m`, covers mice and the
+  internal trackpad) and sends them as raw input only (`SEND_HWMSG_RAWINPUT`, as
+  winewayland does); the cursor still follows the macOS cursor. GameController
+  counts y up. `NEUTRON_RAW_MOUSE=0` turns it off, `WINEDEBUG=+rawmouse` logs the
+  devices.
 - **Measuring.** `NEUTRON_FPS_LOG=1` writes FPS and the slowest frame per
   second to the game log, `NEUTRON_HUD=2` shows the Metal HUD with DXMT's
   per-frame statistics.
