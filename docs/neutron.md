@@ -167,6 +167,11 @@ solves them. Measured on macOS 27, M5 Max.
 - **Measuring.** `NEUTRON_FPS_LOG=1` writes FPS and the slowest frame per
   second to the game log, `NEUTRON_HUD=2` shows the Metal HUD with DXMT's
   per-frame statistics.
+- **HUD off for measuring.** `NEUTRON_HUD=2` (Metal HUD plus DXMT per-frame
+  statistics, loads libMetalMetricsInterpose) costs about 11% game CPU per frame in
+  the Gamble menu (4.56 ms without, 5.09 ms with, 3 runs each, FPS stays at the
+  display cap). `dev/bench/run.sh` unsets `NEUTRON_HUD`/`MTL_HUD_*` and records
+  them as `meta.hud_unset`; `BENCH_KEEP_HUD=1` keeps them. No runtime change.
 
 ## Patches
 

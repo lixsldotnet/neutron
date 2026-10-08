@@ -92,6 +92,16 @@ build "$BENCH_DIR/d3d11.c" "$WORK/d3d11.exe" -ld3d11 -ld3dcompiler -lgdi32 -luse
 #  meta
 #-------------------------------------------------------------------------------
 
+# neutron: the HUD (NEUTRON_HUD, MTL_HUD_ENABLED) costs frame time, so benchmarks run without it.
+# BENCH_KEEP_HUD=1 keeps it (only to measure the HUD itself). The removed values are recorded.
+HUD_REMOVED=""
+if [ "${BENCH_KEEP_HUD:-0}" != 1 ]; then
+  for v in NEUTRON_HUD MTL_HUD_ENABLED MTL_HUD_SCALE; do
+    if [ -n "${!v:-}" ]; then HUD_REMOVED="$HUD_REMOVED $v=${!v}"; unset "$v"; fi
+  done
+fi
+export HUD_REMOVED
+
 other_wine="$( (pgrep -f 'wineserver|\.exe' 2>/dev/null || true) | wc -l | tr -d ' ')"
 git_rev="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo none)"
 git -C "$REPO" diff --quiet HEAD 2>/dev/null || git_rev="$git_rev+dirty"
@@ -103,7 +113,7 @@ printf '{"meta":{"time":"%s","git":"%s","runtime":"%s","ntdll_mtime":"%s","k":%s
   "$(date '+%F %T')" "$git_rev" "$FILES" "$runtime_stamp" "$K" "$load" "$other_wine" "$(games_running)" >> "$RAW"
 # runtime knobs set by the caller (they change the numbers, so they go into the result)
 python3 -c 'import json, os, re; print(json.dumps({"meta": {"env": {k: v for k, v in sorted(os.environ.items())
-  if re.match(r"(NEUTRON_|FEX_|DXMT_|WINE|MTL_)", k) and k != "NEUTRON_FILES"}}}))' >> "$RAW"
+  if re.match(r"(NEUTRON_|FEX_|DXMT_|WINE|MTL_)", k) and k != "NEUTRON_FILES"}, "hud_unset": os.environ.get("HUD_REMOVED", "").split()}}))' >> "$RAW"
 
 #-------------------------------------------------------------------------------
 #  micro benches: own prefix through the tool (registers FEX like for a game)
