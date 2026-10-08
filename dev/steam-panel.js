@@ -136,9 +136,15 @@
     return p;
   }
 
-  function watch(popup) {
+  // Only game properties dialogs: Steam's main window and menus change all the
+  // time, watching them keeps Steam's UI thread busy (menus closed by themselves).
+  function watch(popup, tries = 0) {
     const win = popup && popup.m_popup;
-    if (!win || win.__neutronWatch || !win.document) return;
+    if (!win || win.__neutronWatch || !win.document || !/^PopupWindow/.test(popup.m_strName || '')) return;
+    if (!win.document.querySelector('.PageListColumn')) {
+      if (tries < 20) setTimeout(() => watch(popup, tries + 1), 100);
+      return;
+    }
     win.__neutronWatch = true;
     const doc = win.document;
     let pending = false, ours = null, hidden = [], prevActive = [], activeClass = '';
@@ -204,7 +210,7 @@
       for (const it of items) it.addEventListener('click', leave, true);
     };
 
-    new win.MutationObserver(() => { if (!pending) { pending = true; win.setTimeout(check, 60); } })
+    new win.MutationObserver(() => { if (!pending) { pending = true; win.setTimeout(check, 150); } })
       .observe(doc.body, { childList: true, subtree: true });
     check();
   }
