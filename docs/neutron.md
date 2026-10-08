@@ -151,6 +151,9 @@ solves them. Measured on macOS 27, M5 Max.
   (2.4 us per call, mostly signal handling). The test is now `cmp %eax,%eax` plus a
   nop of the same size (jne never taken), and `arm64x_check_call` in
   `signal_arm64ec.c` accepts both forms. Direct x64 `Nt*` calls: 2.4 us to 0.17 us.
+- **LLVM without assertions.** The LLVM 15 behind DXMT airconv is built with
+  `LLVM_ENABLE_ASSERTIONS=Off`. Converting 68 DXBC shaders: 0.525 s to 0.472 s (-10%),
+  winemetal.so 27 MB to 22 MB, output unchanged. No visible effect on game start.
 - **Render scale.** `NEUTRON_RENDER_SCALE` (default 0.85) scales all Windows
   coordinates in winemac.drv the way Retina mode does with factor 2, so games
   see a 2924x1224 desktop on a 3440x1440 display. The tool sets the DXMT MetalFX

@@ -178,7 +178,7 @@ if [ ! -d "$T/llvm-darwin-arm64" ]; then
   say "Building LLVM 15 for macOS arm64 (log: $T/llvm-darwin-arm64.log)"
   cmake -B "$T/llvm-darwin-arm64-build" -S "$T/llvm-project/llvm" -G Ninja \
     -DCMAKE_INSTALL_PREFIX="$T/llvm-darwin-arm64" -DCMAKE_OSX_ARCHITECTURES=arm64 \
-    -DLLVM_HOST_TRIPLE=arm64-apple-darwin -DLLVM_ENABLE_ASSERTIONS=On -DLLVM_ENABLE_ZSTD=Off \
+    -DLLVM_HOST_TRIPLE=arm64-apple-darwin -DLLVM_ENABLE_ASSERTIONS=Off -DLLVM_ENABLE_ZSTD=Off \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-D_LIBCPP_KEEP_TRANSITIVE_INCLUDES_LLVM23" \
     -DLLVM_TARGETS_TO_BUILD="" -DLLVM_BUILD_TOOLS=Off -DLLVM_INCLUDE_BENCHMARKS=Off \
     -DBUG_REPORT_URL="https://github.com/3Shain/dxmt" -DPACKAGE_VENDOR="DXMT" \
