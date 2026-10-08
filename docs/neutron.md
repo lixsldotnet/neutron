@@ -119,6 +119,13 @@ solves them. Measured on macOS 27, M5 Max.
   Other RWX requests get RW.
 - **`mach_vm_map`** answers `KERN_INVALID_ADDRESS` above 4 GB near the main
   binary; Wine treats that as "in use" and keeps searching.
+- **Free area search.** Wine finds free address space by trying `mach_vm_map`
+  at each 64K step while holding `virtual_mutex`. Metal, system libraries and FEX
+  map a lot Wine does not track, so one allocation took thousands of syscalls and
+  every thread needing the lock stalled (Ready or Not: 1.5-1.9 s freezes every few
+  seconds in `RegisterRawInputDevices` device ioctls, 74 s black screen at start).
+  On a collision Wine now asks `mach_vm_region` for the colliding mapping and
+  skips it in one step: first frame after 7.8 s, no periodic freezes.
 - **16K pages.** Wine shows Windows 4K pages and gives all 4K pages of a host
   page the most permissive protection of them. FEX's 4K guard pages never
   faulted: a call-return stack underflow (Unity/Mono) ran into the next

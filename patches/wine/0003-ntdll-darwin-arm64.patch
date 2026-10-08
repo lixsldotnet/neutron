@@ -196,7 +196,62 @@
          ptr = MAP_FAILED;
      }
  #else
-@@ -1974,12 +1988,46 @@
+@@ -1536,6 +1550,42 @@
+ }
+ 
+ 
++#ifdef __APPLE__
++/* neutron: next candidate after a collision with a host mapping Wine does not track
++ * (Metal and GPU memory, system libraries, FEX's JIT). Stepping by the alignment
++ * means one mach_vm_map per 64K under virtual_mutex, thousands of syscalls past
++ * Metal's reservations, and every thread waiting for the lock stalls meanwhile.
++ * Ask the kernel for the lowest mapping that ends above start and jump past it:
++ * bottom-up to its end, top-down below its start. */
++static void *skip_host_mapping( void *start, size_t size, ptrdiff_t step )
++{
++    mach_vm_address_t addr = (mach_vm_address_t)start;
++    mach_vm_size_t len;
++    vm_region_basic_info_data_64_t info;
++    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
++    mach_port_t object = MACH_PORT_NULL;
++    size_t align = step > 0 ? step : -step;
++    char *next = (char *)start + step;
++
++    if (mach_vm_region( mach_task_self(), &addr, &len, VM_REGION_BASIC_INFO_64,
++                        (vm_region_info_t)&info, &count, &object ) != KERN_SUCCESS)
++        return next;
++    if (object != MACH_PORT_NULL) mach_port_deallocate( mach_task_self(), object );
++    if (addr >= (mach_vm_address_t)start + size) return next;  /* not the colliding one */
++
++    if (step > 0)
++    {
++        char *after = (char *)(((addr + len) + align - 1) & ~(mach_vm_address_t)(align - 1));
++        return after > next ? after : next;
++    }
++    if (addr < size) return NULL;
++    {
++        char *below = (char *)((addr - size) & ~(mach_vm_address_t)(align - 1));
++        return below < next ? below : next;
++    }
++}
++#endif
++
+ /***********************************************************************
+  *           try_map_free_area
+  *
+@@ -1559,7 +1609,11 @@
+             (step < 0 && (char *)start - (char *)base < -step) ||
+             step == 0)
+             break;
++#ifdef __APPLE__
++        start = skip_host_mapping( start, size, step );
++#else
+         start = (char *)start + step;
++#endif
+     }
+ 
+     return NULL;
+@@ -1974,12 +2028,46 @@
          /* exec + write may legitimately fail, in that case fall back to write only */
          if (!(unix_prot & PROT_WRITE)) return -1;
      }
@@ -243,7 +298,7 @@
   *           mprotect_range
   *
   * Call mprotect on a page range, applying the protections from the per-page byte.
-@@ -3682,6 +3730,10 @@
+@@ -3682,6 +3770,10 @@
      pthread_mutexattr_t attr;
  
      pthread_key_create( &thread_data_key, NULL );
@@ -254,7 +309,7 @@
      pthread_mutexattr_init( &attr );
      pthread_mutexattr_settype( &attr, PTHREAD_MUTEX_RECURSIVE );
      pthread_mutex_init( &virtual_mutex, &attr );
-@@ -4123,6 +4175,18 @@
+@@ -4123,6 +4215,18 @@
          exit(1);
      }
  
@@ -273,7 +328,7 @@
      status = map_view( &view, NULL, signal_stack_mask + 1 + kernel_stack_size, MEM_TOP_DOWN,
                         VPROT_READ | VPROT_WRITE | VPROT_COMMITTED, 4 * limit_4g, 0, 0 );
      assert( !status );
-@@ -4172,6 +4236,11 @@
+@@ -4172,6 +4276,11 @@
  
      if (arm64ec_view) peb->EcCodeBitMap = arm64ec_view->base;
      init_teb( data, ptr );
@@ -285,7 +340,7 @@
      VIRTUAL_DEBUG_DUMP_VIEW( view );
  }
  
-@@ -5230,6 +5299,12 @@
+@@ -5230,6 +5339,12 @@
              if (status == STATUS_SUCCESS)
              {
                  base = view->base;
