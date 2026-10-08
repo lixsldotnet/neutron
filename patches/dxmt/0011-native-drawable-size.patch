@@ -1,0 +1,94 @@
+--- a/src/winemetal/winemetal.h
++++ b/src/winemetal/winemetal.h
+@@ -1773,6 +1773,11 @@
+   bool display_sync_enabled;
+   bool framebuffer_only;
+   enum WMTPixelFormat pixel_format;
++  /* neutron: the view's size in screen pixels and the screen's backing scale, set by
++     winemac.drv on the layer (0 when unknown); read-only */
++  double native_width;
++  double native_height;
++  double native_scale;
+ };
+ 
+ WINEMETAL_API void MetalLayer_setProps(obj_handle_t layer, const struct WMTLayerProps *props);
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -1650,6 +1650,10 @@
+   props->drawable_height = layer.drawableSize.height;
+   props->drawable_width = layer.drawableSize.width;
+   props->pixel_format = layer.pixelFormat;
++  /* neutron: set by winemac.drv's WineMetalView (neutronUpdateNativeSize) */
++  props->native_width = [[layer valueForKey:@"neutronNativeWidth"] doubleValue];
++  props->native_height = [[layer valueForKey:@"neutronNativeHeight"] doubleValue];
++  props->native_scale = [[layer valueForKey:@"neutronNativeScale"] doubleValue];
+   return STATUS_SUCCESS;
+ }
+ 
+--- a/src/dxmt/dxmt_presenter.hpp
++++ b/src/dxmt/dxmt_presenter.hpp
+@@ -72,6 +72,7 @@
+   );
+ 
+ private:
++  bool applyNativeSize();
+   void buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_ms, bool gamma_enable);
+ 
+   WMT::Device device_;
+--- a/src/dxmt/dxmt_presenter.cpp
++++ b/src/dxmt/dxmt_presenter.cpp
+@@ -26,9 +26,35 @@
+     return format;
+   if (layer_format && !strcmp(layer_format, "bgra8"))
+     return WMTPixelFormatBGRA8Unorm;
++  if (layer_format && !strcmp(layer_format, "keep"))
++    return format;
+   return WMTPixelFormatBGR10A2Unorm;
+ }
+ 
++/* neutron: the drawable gets the view's size in screen pixels (winemac.drv puts it on
++   the layer) instead of backbuffer size times the MetalFX factor, and the present pass
++   scales the backbuffer into it. A drawable of another size than the view makes macOS
++   scale the layer in the compositor: on Retina screens (Windows sees points), with a
++   backbuffer smaller than the window, and with a render scale that does not divide
++   evenly. NEUTRON_NATIVE_DRAWABLE=0 keeps DXMT's own sizing. */
++bool
++Presenter::applyNativeSize() {
++  static const bool enabled = !getenv("NEUTRON_NATIVE_DRAWABLE") || strcmp(getenv("NEUTRON_NATIVE_DRAWABLE"), "0");
++  if (!enabled)
++    return false;
++  WMTLayerProps current;
++  layer_.getProps(current);
++  if (current.native_width < 1 || current.native_height < 1 || current.native_scale <= 0)
++    return false;
++  if (layer_props_.drawable_width == current.native_width && layer_props_.drawable_height == current.native_height &&
++      layer_props_.contents_scale == current.native_scale)
++    return false;
++  layer_props_.drawable_width = current.native_width;
++  layer_props_.drawable_height = current.native_height;
++  layer_props_.contents_scale = current.native_scale;
++  return true;
++}
++
+ Presenter::Presenter(WMT::Device device, WMT::MetalLayer layer, InternalCommandLibrary &lib, float scale_factor, uint8_t sample_count) :
+     device_(device),
+     layer_(layer),
+@@ -67,6 +93,7 @@
+   layer_props_.pixel_format = DisplayLayerFormat(Forget_sRGB(format));
+   layer_props_.drawable_height = height;
+   layer_props_.drawable_width = width;
++  applyNativeSize();
+   colorspace_ = colorspace;
+   if (should_invalidated)
+     pso_valid.clear(); // defer changes
+@@ -145,6 +172,10 @@
+     buildRenderPipelineState(final_colorspace == WMTColorSpaceHDR_PQ, is_hdr && hdr_metadata != nullptr, sample_count_ > 1, gamma_version_ != 0);
+     layer_.setProps(layer_props_);
+     layer_.setColorSpace(final_colorspace);
++  } else if (unlikely(frame_requested_ % 60 == 0) && applyNativeSize()) {
++    /* neutron: the view changed size (fullscreen, other screen) after the swapchain was set up */
++    frame_presented_.wait(frame_requested_);
++    layer_.setProps(layer_props_);
+   }
+ 
+   DXMTPresentMetadata metadata;

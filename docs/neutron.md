@@ -247,6 +247,16 @@ solves them. Measured on macOS 27, M5 Max.
   winewayland does); the cursor still follows the macOS cursor. GameController
   counts y up. `NEUTRON_RAW_MOUSE=0` turns it off, `WINEDEBUG=+rawmouse` logs the
   devices.
+- **Direct presentation.** A fullscreen game is shown "Direct" (no compositor pass,
+  Metal HUD top right) or "Composited". Changes for Direct, not yet verified on
+  screen (`dev/direct-test.sh` shows each case with the HUD): 10-bit RGB backbuffers
+  (Unreal's default) get a BGR10A2 layer, the display's own order (DXMT patch 0010,
+  `NEUTRON_LAYER_FORMAT=keep|bgra8` for comparison); the drawable always has the
+  view's size in screen pixels, which winemac.drv puts on the layer, and the present
+  pass scales the backbuffer into it (patch 0011, `NEUTRON_NATIVE_DRAWABLE=0` turns it
+  off). With `WINEDEBUG=warn+macdrv` winemac.drv logs the windows visible when a
+  window enters fullscreen and every window shown over it (Unreal helper windows on
+  top force compositing).
 - **Measuring.** `NEUTRON_FPS_LOG=1` writes FPS and the slowest frame per
   second to the game log, `NEUTRON_HUD=2` shows the Metal HUD with DXMT's
   per-frame statistics.

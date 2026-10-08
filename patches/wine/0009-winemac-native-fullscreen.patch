@@ -69,16 +69,52 @@
  
          [super setRetinaMode:mode];
      }
-@@ -843,7 +849,7 @@
+@@ -843,8 +849,43 @@
  
      - (void) setRetinaMode:(BOOL)mode
      {
 -        self.layer.contentsScale = mode ? 2.0 : 1.0;
 +        self.layer.contentsScale = (mode ? 2.0 : 1.0) * neutron_scale;
          [super setRetinaMode:mode];
++    }
++
++    /* neutron: the view's size in real screen pixels, for DXMT. macOS shows a
++       fullscreen layer directly (no compositor pass) only when its drawable has
++       exactly that size; the Windows side sees a size scaled by the render scale and
++       Retina mode, so DXMT sizes the drawable from these values and scales the
++       backbuffer into it. Read by winemetal through key-value coding on the layer. */
++    - (void) neutronUpdateNativeSize
++    {
++        CALayer* layer = self.layer;
++        NSRect bounds = [self bounds];
++        CGFloat scale = self.window ? self.window.backingScaleFactor : NSScreen.mainScreen.backingScaleFactor;
++
++        if (!layer || scale <= 0) return;
++        [layer setValue:@(round(bounds.size.width * scale)) forKey:@"neutronNativeWidth"];
++        [layer setValue:@(round(bounds.size.height * scale)) forKey:@"neutronNativeHeight"];
++        [layer setValue:@(scale) forKey:@"neutronNativeScale"];
++    }
++
++    - (void) setFrameSize:(NSSize)newSize
++    {
++        [super setFrameSize:newSize];
++        [self neutronUpdateNativeSize];
++    }
++
++    - (void) viewDidMoveToWindow
++    {
++        [super viewDidMoveToWindow];
++        [self neutronUpdateNativeSize];
++    }
++
++    - (void) viewDidChangeBackingProperties
++    {
++        [super viewDidChangeBackingProperties];
++        [self neutronUpdateNativeSize];
      }
  
-@@ -852,9 +858,10 @@
+     - (CALayer*) makeBackingLayer
+@@ -852,9 +893,10 @@
          CAMetalLayer *layer = [CAMetalLayer layer];
          layer.device = _device;
          layer.framebufferOnly = YES;
@@ -91,7 +127,7 @@
          return layer;
      }
  
-@@ -1015,9 +1022,10 @@
+@@ -1015,9 +1057,10 @@
      {
          NSUInteger style = [self styleMask];
  
@@ -104,7 +140,7 @@
          {
              behavior |= NSWindowCollectionBehaviorFullScreenPrimary;
              behavior &= ~NSWindowCollectionBehaviorFullScreenAuxiliary;
-@@ -1117,7 +1125,9 @@
+@@ -1117,7 +1160,9 @@
  
              captured = (fullscreen || [self screen]) && [[WineApplicationController sharedController] areDisplaysCaptured];
  
@@ -115,7 +151,27 @@
              {
                  if (captured)
                      level = CGShieldingWindowLevel() + 1; /* Need +1 or we don't get mouse moves */
-@@ -1694,6 +1704,8 @@
+@@ -1592,6 +1637,19 @@
+         WineApplicationController* controller = [WineApplicationController sharedController];
+         if (![self isMiniaturized])
+         {
++            /* neutron: a window shown while another one is in fullscreen, see neutron_log_windows */
++            if (WARN_ON(macdrv) && ![self isVisible] && !([self styleMask] & NSWindowStyleMaskFullScreen))
++            {
++                for (NSWindow* other in [NSApp windows])
++                {
++                    if (other != self && [other isVisible] && ([other styleMask] & NSWindowStyleMaskFullScreen))
++                    {
++                        WARN("%p shown over fullscreen %p: frame %s level %ld opaque %d\n", self, other,
++                             [NSStringFromRect([self frame]) UTF8String], (long)[self level], [self isOpaque]);
++                        break;
++                    }
++                }
++            }
+             BOOL needAdjustWindowLevels = FALSE;
+             BOOL wasVisible;
+             WineWindow* parent;
+@@ -1694,6 +1752,8 @@
  
              [NSAnimationContext endGrouping];
  
@@ -124,7 +180,7 @@
              /* Cocoa may adjust the frame when the window is ordered onto the screen.
                 Generate a frame-changed event just in case.  The back end will ignore
                 it if nothing actually changed. */
-@@ -1776,9 +1788,74 @@
+@@ -1776,9 +1836,74 @@
                  [controller updateFullscreenWindows];
  
              [controller adjustWindowLevels];
@@ -199,7 +255,7 @@
      - (void) setFrameAndWineFrame:(NSRect)frame
      {
          [self setFrame:frame display:YES];
-@@ -1821,6 +1898,14 @@
+@@ -1821,6 +1946,14 @@
          {
              NSRect frame, oldFrame;
  
@@ -214,7 +270,7 @@
              oldFrame = self.wine_fractionalFrame;
              frame = [self frameRectForContentRect:contentRect];
              if (!NSEqualRects(frame, oldFrame))
-@@ -2475,7 +2560,7 @@
+@@ -2475,7 +2608,7 @@
  
          [transform scaleBy:scale];
  
@@ -223,7 +279,7 @@
  
          for (WineBaseView* subview in [self.contentView subviews])
          {
-@@ -2658,11 +2743,18 @@
+@@ -2658,11 +2791,18 @@
          macdrv_query* query;
          NSSize size;
  
@@ -247,7 +303,38 @@
  
          size = [self contentMaxSize];
          if (proposedSize.width < size.width)
-@@ -3735,7 +3827,7 @@
+@@ -2722,10 +2862,30 @@
+         }
+     }
+ 
++    /* neutron: macOS shows a fullscreen game directly (no compositor pass) only when
++       nothing else is on top of it; log the other visible windows of the process
++       (WINEDEBUG=warn+macdrv) to find helper windows that force compositing. */
++    static void neutron_log_windows(const char* reason)
++    {
++        NSWindow* window;
++
++        if (!WARN_ON(macdrv)) return;
++        for (window in [NSApp orderedWindows])
++        {
++            NSRect frame = [window frame];
++            if (![window isVisible]) continue;
++            WARN("%s: %p %s level %ld frame %s fullscreen %d opaque %d alpha %.2f\n", reason, window,
++                 [NSStringFromClass([window class]) UTF8String], (long)[window level],
++                 [NSStringFromRect(frame) UTF8String],
++                 ([window styleMask] & NSWindowStyleMaskFullScreen) != 0, [window isOpaque], [window alphaValue]);
++        }
++    }
++
+     - (void) windowDidEnterFullScreen:(NSNotification*)notification
+     {
+         enteringFullScreen = FALSE;
+         enteredFullScreenTime = [[NSProcessInfo processInfo] systemUptime];
++        neutron_log_windows("fullscreen entered");
+         if (pendingOrderOut)
+             [self doOrderOut];
+     }
+@@ -3735,7 +3895,7 @@
      offscreen_layer.framebufferOnly = YES;
      offscreen_layer.magnificationFilter = kCAFilterNearest;
      offscreen_layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);

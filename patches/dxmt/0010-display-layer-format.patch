@@ -1,0 +1,42 @@
+--- a/src/dxmt/dxmt_presenter.cpp
++++ b/src/dxmt/dxmt_presenter.cpp
+@@ -2,6 +2,7 @@
+ #include <algorithm>
+ #include <chrono>
+ #include <cstdlib>
++#include <cstring>
+ #include <format>
+ #include "log/log.hpp"
+ #include "Metal.hpp"
+@@ -12,6 +13,22 @@
+ 
+ namespace dxmt {
+ 
++/* neutron: macOS presents a fullscreen layer directly to the display (no compositor
++   pass) only in a format the display scans out. Unreal's default backbuffer is
++   R10G10B10A2 (RGB10A2Unorm), which a layer accepts but always composites; the
++   display's 10-bit order is BGR10A2. The present pass draws the backbuffer into the
++   drawable anyway, so the layer format may differ from the backbuffer format.
++   NEUTRON_LAYER_FORMAT=bgra8 presents 10-bit backbuffers in 8 bit instead. */
++static WMTPixelFormat
++DisplayLayerFormat(WMTPixelFormat format) {
++  static const char *layer_format = getenv("NEUTRON_LAYER_FORMAT");
++  if (format != WMTPixelFormatRGB10A2Unorm)
++    return format;
++  if (layer_format && !strcmp(layer_format, "bgra8"))
++    return WMTPixelFormatBGRA8Unorm;
++  return WMTPixelFormatBGR10A2Unorm;
++}
++
+ Presenter::Presenter(WMT::Device device, WMT::MetalLayer layer, InternalCommandLibrary &lib, float scale_factor, uint8_t sample_count) :
+     device_(device),
+     layer_(layer),
+@@ -47,7 +64,7 @@
+   source_format_ = format;
+   should_invalidated |= sample_count_ != sample_count;
+   sample_count_ = sample_count;
+-  layer_props_.pixel_format = Forget_sRGB(format);
++  layer_props_.pixel_format = DisplayLayerFormat(Forget_sRGB(format));
+   layer_props_.drawable_height = height;
+   layer_props_.drawable_width = width;
+   colorspace_ = colorspace;

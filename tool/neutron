@@ -134,6 +134,8 @@ NEUTRON_HUD_INFO="$NEUTRON_HUD_INFO;FEX TSO $NEUTRON_FEX_TSO"
   NEUTRON_HUD_INFO="$NEUTRON_HUD_INFO;Render scale $(awk -v s="$NEUTRON_RENDER_SCALE" 'BEGIN { printf "%d%%", s * 100 + 0.5 }')"
 [ -n "${NEUTRON_METALFX:-}" ] &&
   NEUTRON_HUD_INFO="$NEUTRON_HUD_INFO;MetalFX $(awk -v f="$NEUTRON_METALFX" 'BEGIN { printf "%.2fx", f }')"
+# NEUTRON_HUD_NOTE adds one free line (dev/direct-test.sh names its variants with it).
+[ -n "${NEUTRON_HUD_NOTE:-}" ] && NEUTRON_HUD_INFO="$NEUTRON_HUD_INFO;$NEUTRON_HUD_NOTE"
 export NEUTRON_HUD_INFO
 
 STEAM_ROOT="${STEAM_COMPAT_CLIENT_INSTALL_PATH:-$HOME/Library/Application Support/Steam}"
