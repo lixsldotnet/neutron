@@ -8,8 +8,8 @@
 #   3. starts Steam with the CEF debug port and STEAM_EXTRA_COMPAT_TOOLS_PATHS
 #   4. after login, sets the platform back to "macos" so Mac games keep Mac depots
 #   5. optional: maps games to neutron
-#   6. adds the "Neutron" settings panel to the game properties (dev/steam-panel.js,
-#      lives in the running Steam UI only)
+#   6. adds a Compatibility tab with the neutron settings to the game properties
+#      (dev/steam-panel.js, lives in the running Steam UI only)
 #
 # Usage: dev/steam.sh [--dist <dist/neutron>] [--tool <name>] [--map <appid>]... [--map-all]
 #                     [--launch <appid>=<options>]... [--global <name>|none]

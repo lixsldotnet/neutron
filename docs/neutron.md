@@ -66,9 +66,10 @@ internal tool name is `neutron_proton` (shown as "Neutron"), the prefix is
 migrated on start.
 
 Per-game settings: Mac Steam hides the Compatibility page (the same `"linux"`
-platform check), so `dev/steam.sh` adds a "Neutron" section to the General page of
-a game's properties at runtime (`dev/steam-panel.js`, through `g_PopupManager`
-popup callbacks in the SharedJSContext). It writes `NEUTRON_<NAME>=<value>` words
+platform check), so `dev/steam.sh` adds its own "Compatibility" tab to a game's
+properties at runtime (`dev/steam-panel.js`, through `g_PopupManager` popup
+callbacks in the SharedJSContext): the tool for the game (Neutron or none) and the
+neutron settings. It writes `NEUTRON_<NAME>=<value>` words
 into the launch options, which Steam appends to the tool's command line, and
 `tool/neutron` takes them out again. The idea of settings in the launch options
 comes from NotProton (github.com/NotProtonNot/NotProton), which patches Steam's

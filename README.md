@@ -78,9 +78,9 @@ for launch options, `--global neutron_proton|none` for the default compat tool.
 
 ## Settings
 
-Per game: open the game's Properties in Steam. On the General page, below Launch
-Options, there is a **Neutron** section (added by `dev/steam.sh` to the running
-Steam UI, Steam's files are not changed):
+Per game: open the game's Properties in Steam, tab **Compatibility** (added by
+`dev/steam.sh` to the running Steam UI, Steam's files are not changed). It picks
+the tool for the game (Neutron or none) and has the neutron settings:
 
 | Setting | Default | What |
 |---|---|---|

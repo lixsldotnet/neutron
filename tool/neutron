@@ -21,8 +21,8 @@
 #                   for games with threading bugs under the default fast mode; set per
 #                   game with APP_TSO_<appid> below).
 # Mac Steam does not support "VAR=x %command%" launch options. Per game, settings
-# go into the launch options as plain NEUTRON_<NAME>=<value> words (the "Neutron"
-# panel in the game's properties writes them, dev/steam-panel.js); they are taken
+# go into the launch options as plain NEUTRON_<NAME>=<value> words (the
+# Compatibility tab in the game's properties writes them, dev/steam-panel.js); they are taken
 # out of the game's command line here. For all games: neutron.env next to this
 # script (KEY=value lines).
 #
