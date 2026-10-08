@@ -69,6 +69,9 @@ How it is turned on (Steam.app start script from `install.sh`, then
    that is not in its seen list (`localStorage` key `neutron.seen` in the
    SharedJSContext) at start and every 30 s while Steam runs. Games mapped, Mac
    native, or set to none by the user are in the seen list and stay as they are.
+8. **UI reloads.** Steam reloads its SharedJSContext now and then (new
+   `CLIENT_SESSION`), which drops the injected tab and the watch. `steam-hook.sh`
+   stays running while Steam runs and injects both again (without the remap).
 
 Steam Cloud works like with Proton: the Mac client resolves the Windows roots
 of a compat tool game (`WinAppDataLocalLow`, `WinMyDocuments` and co.) to

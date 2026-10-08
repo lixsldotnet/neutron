@@ -45,3 +45,16 @@ say "Platform back to macos, tools: $(js 'SteamClient.Settings.GetGlobalCompatTo
 MAPPED="$(mapped_apps)"
 say "Games: $(js_file steam-sync.js)"
 say "Settings tab: $(js "$(cat "$DEV_DIR/steam-panel.js")")"
+
+# Steam reloads its UI context now and then (new CLIENT_SESSION), which drops the
+# tab and the new-game watch: put them back while this Steam runs. A hook from a
+# newer Steam start takes over.
+PIDFILE="$HOME/Library/Logs/neutron/steam-hook.pid"
+echo $$ > "$PIDFILE"
+while pgrep -x steam_osx >/dev/null && [ "$(cat "$PIDFILE" 2>/dev/null)" = $$ ]; do
+  sleep 10
+  [ "$(js 'window.__neutronPanel === true' 2>/dev/null)" = false ] || continue
+  MAPPED=""
+  say "Steam UI reloaded, games: $(js_file steam-sync.js)"
+  say "Steam UI reloaded, settings tab: $(js "$(cat "$DEV_DIR/steam-panel.js")")"
+done
