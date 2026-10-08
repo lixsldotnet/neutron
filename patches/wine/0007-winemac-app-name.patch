@@ -27,11 +27,41 @@
  
              [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
  
-@@ -734,9 +747,48 @@
-         [self updateFullscreenWindows];
+@@ -702,6 +715,30 @@
+ 
+     - (void) updateFullscreenWindows
+     {
++        /* neutron: a fullscreen game window that is not in macOS native fullscreen (notch
++         * displays) covers the whole screen at normal level; hide menu bar and Dock while the
++         * game is active, so the Cmd+Tab switcher still draws above it. */
++        if (getenv("NEUTRON_NATIVE_FULLSCREEN") && *getenv("NEUTRON_NATIVE_FULLSCREEN") == '1')
++        {
++            BOOL anyPlainFullscreen = FALSE;
++            NSApplicationPresentationOptions options;
++            for (NSNumber* number in [NSWindow windowNumbersWithOptions:0])
++            {
++                WineWindow* window = (WineWindow*)[NSApp windowWithWindowNumber:[number integerValue]];
++                if ([window isKindOfClass:[WineWindow class]] && window.fullscreen && !window.neutronNativeFullscreen &&
++                    [window isVisible])
++                {
++                    anyPlainFullscreen = TRUE;
++                    break;
++                }
++            }
++            options = anyPlainFullscreen ? (NSApplicationPresentationHideDock | NSApplicationPresentationHideMenuBar)
++                                         : NSApplicationPresentationDefault;
++            if ([NSApp isActive] && !([NSApp presentationOptions] & NSApplicationPresentationFullScreen) &&
++                [NSApp presentationOptions] != options)
++                [NSApp setPresentationOptions:options];
++        }
++
+         if (capture_displays_for_fullscreen && [NSApp isActive])
+         {
+             BOOL anyFullscreen = FALSE;
+@@ -735,8 +772,47 @@
          [self adjustWindowLevels];
      }
-+
+ 
 +    /* neutron: displays, their bounds and current modes as a string, to tell whether the
 +     * display setup really changed */
 +    static NSString* neutron_display_signature(void)
@@ -39,7 +69,7 @@
 +        NSMutableString* sig = [NSMutableString string];
 +        CGDirectDisplayID displays[32];
 +        uint32_t i, count;
- 
++
 +        if (CGGetActiveDisplayList(32, displays, &count) != kCGErrorSuccess)
 +            return nil;
 +        for (i = 0; i < count; i++)
@@ -76,7 +106,7 @@
          macdrv_event* event;
          WineEventQueue* queue;
  
-@@ -1438,7 +1490,7 @@
+@@ -1438,7 +1514,7 @@
              }
              else
              {
@@ -85,13 +115,13 @@
  
                  /* Add event delta to accumulated delta error */
                  /* deltaY is already flipped */
-@@ -2241,6 +2293,9 @@
+@@ -2240,6 +2316,9 @@
+         WineEventQueue* queue;
  
          [self invalidateGotFocusEvents];
- 
++
 +        WARN("resigned active, frontmost is now %s\n",
 +             [[[[NSWorkspace sharedWorkspace] frontmostApplication] localizedName] UTF8String]);
-+
+ 
          event = macdrv_create_event(APP_DEACTIVATED, nil);
  
-         [eventQueuesLock lock];

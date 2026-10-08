@@ -200,7 +200,6 @@ setup_prefix() {
 
   setup_steam_registry
   setup_emulator_registry
-  setup_display_registry
 }
 
 # FEX translates the x86_64 game code (ARM64EC emulator DLL).
@@ -210,18 +209,6 @@ setup_emulator_registry() {
   log "registering FEX as x64 emulator"
   "$WINE" reg add 'HKLM\Software\Microsoft\Wow64\amd64' /ve /d libarm64ecfex.dll /f >> "$LOG" 2>&1 \
     || die "emulator registry failed"
-  "$WINESERVER" -w
-  touch "$marker"
-}
-
-# Retina mode: on a HiDPI display games see the real pixels instead of points
-# (MacBook: 3024x1964 instead of 1512x982, blurry otherwise). No effect elsewhere.
-setup_display_registry() {
-  local marker="$WINEPREFIX/neutron-retina-v1"
-  [ -f "$marker" ] && return 0
-  log "enabling Retina mode"
-  "$WINE" reg add 'HKCU\Software\Wine\Mac Driver' /v RetinaMode /d y /f >> "$LOG" 2>&1 \
-    || die "display registry failed"
   "$WINESERVER" -w
   touch "$marker"
 }

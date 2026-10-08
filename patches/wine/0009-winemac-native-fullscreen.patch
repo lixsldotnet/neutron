@@ -8,9 +8,26 @@
      NSTimeInterval enteredFullScreenTime;
  
      int draggingPhase;
+@@ -89,6 +90,7 @@
+ @property (readonly, nonatomic) BOOL preventsAppActivation;
+ @property (readonly, nonatomic) BOOL floating;
+ @property (readonly, getter=isFullscreen, nonatomic) BOOL fullscreen;
++@property (readonly, nonatomic) BOOL neutronNativeFullscreen;
+ @property (readonly, getter=isFakingClose, nonatomic) BOOL fakingClose;
+ @property (readonly, nonatomic) NSRect wine_fractionalFrame;
+ 
 --- a/dlls/winemac.drv/cocoa_window.m
 +++ b/dlls/winemac.drv/cocoa_window.m
-@@ -581,7 +581,7 @@
+@@ -35,6 +35,8 @@
+ #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(macdrv);
++
++static BOOL neutron_native_fullscreen_enabled(void);
+ 
+ @interface NSWindow (PrivatePreventsActivation)
+ 
+@@ -581,7 +583,7 @@
          CALayerHost* host = [CALayerHost layer];
          [host setContextId:contextId];
          host.magnificationFilter = kCAFilterNearest;
@@ -19,7 +36,7 @@
          host.frame = self.layer.bounds;
          host.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
  
-@@ -600,9 +600,9 @@
+@@ -600,9 +602,9 @@
  
      - (void) setLayerRetinaProperties:(BOOL)mode
      {
@@ -32,7 +49,7 @@
      }
  
      - (void) setRetinaMode:(BOOL)mode
-@@ -622,7 +622,7 @@
+@@ -622,7 +624,7 @@
          [self setLayerRetinaProperties:mode];
  
          for (CALayerHost* host in [_caLayerHosts allValues])
@@ -41,7 +58,7 @@
  
          [super setRetinaMode:mode];
      }
-@@ -843,7 +843,7 @@
+@@ -843,7 +845,7 @@
  
      - (void) setRetinaMode:(BOOL)mode
      {
@@ -50,7 +67,7 @@
          [super setRetinaMode:mode];
      }
  
-@@ -852,9 +852,10 @@
+@@ -852,9 +854,10 @@
          CAMetalLayer *layer = [CAMetalLayer layer];
          layer.device = _device;
          layer.framebufferOnly = YES;
@@ -63,7 +80,7 @@
          return layer;
      }
  
-@@ -1015,9 +1016,10 @@
+@@ -1015,9 +1018,10 @@
      {
          NSUInteger style = [self styleMask];
  
@@ -76,18 +93,18 @@
          {
              behavior |= NSWindowCollectionBehaviorFullScreenPrimary;
              behavior &= ~NSWindowCollectionBehaviorFullScreenAuxiliary;
-@@ -1117,7 +1119,9 @@
+@@ -1117,7 +1121,9 @@
  
              captured = (fullscreen || [self screen]) && [[WineApplicationController sharedController] areDisplaysCaptured];
  
 -            if (captured || fullscreen)
 +            /* neutron: a window in macOS native fullscreen has its own space; raising it above
 +             * the status level would also hide the Cmd+Tab switcher and the Dock behind it */
-+            if (captured || (fullscreen && !neutronNativeFullscreen))
++            if (captured || (fullscreen && !neutronNativeFullscreen && !neutron_native_fullscreen_enabled()))
              {
                  if (captured)
                      level = CGShieldingWindowLevel() + 1; /* Need +1 or we don't get mouse moves */
-@@ -1693,6 +1697,8 @@
+@@ -1693,6 +1699,8 @@
              }
  
              [NSAnimationContext endGrouping];
@@ -96,13 +113,14 @@
  
              /* Cocoa may adjust the frame when the window is ordered onto the screen.
                 Generate a frame-changed event just in case.  The back end will ignore
-@@ -1777,8 +1783,55 @@
+@@ -1776,9 +1784,74 @@
+                 [controller updateFullscreenWindows];
  
              [controller adjustWindowLevels];
-         }
++        }
 +        [self neutronUpdateNativeFullscreen];
-     }
- 
++    }
++
 +    /* neutron: a borderless top-level window covering a whole screen (a game in borderless
 +     * fullscreen) goes into macOS native fullscreen, its own Space. Only there macOS scans
 +     * the Metal layer out directly instead of compositing it, and turns on Game Mode. */
@@ -113,13 +131,31 @@
 +        {
 +            const char* env = getenv("NEUTRON_NATIVE_FULLSCREEN");
 +            enabled = env && *env == '1';
-+        }
+         }
 +        return enabled;
+     }
+ 
++    /* neutron: on a display with a camera notch macOS puts native fullscreen windows below
++     * the notch and keeps the menu bar visible next to it; Windows still sees the whole
++     * screen and games fight over the window size (white screen in Unreal). There the game
++     * gets a plain window over the whole screen, the app hides menu bar and Dock instead. */
++    static BOOL neutron_screen_has_notch(NSScreen* screen)
++    {
++        if (@available(macOS 12.0, *))
++            return screen && screen.safeAreaInsets.top > 0;
++        return FALSE;
++    }
++
++    - (BOOL) neutronNativeFullscreen
++    {
++        return neutronNativeFullscreen;
 +    }
 +
 +    - (void) neutronUpdateNativeFullscreen
 +    {
 +        if (!neutron_native_fullscreen_enabled() || enteringFullScreen || exitingFullScreen)
++            return;
++        if (!neutronNativeFullscreen && neutron_screen_has_notch([self screen]))
 +            return;
 +        if (!neutronNativeFullscreen && fullscreen && [self isVisible] && !self.disabled &&
 +            !([self styleMask] & NSWindowStyleMaskTitled) &&
@@ -152,10 +188,11 @@
      - (void) setFrameAndWineFrame:(NSRect)frame
      {
          [self setFrame:frame display:YES];
-@@ -1821,6 +1874,14 @@
+@@ -1820,6 +1893,14 @@
+         if (!NSIsEmptyRect(contentRect))
          {
              NSRect frame, oldFrame;
- 
++
 +            if (neutronNativeFullscreen)
 +            {
 +                if (screen_covered_by_rect(contentRect, [NSScreen screens]))
@@ -163,11 +200,10 @@
 +                [self neutronLeaveNativeFullscreen:[self frameRectForContentRect:contentRect]];
 +                return;      /* windowDidExitFullScreen applies nonFullscreenFrame */
 +            }
-+
+ 
              oldFrame = self.wine_fractionalFrame;
              frame = [self frameRectForContentRect:contentRect];
-             if (!NSEqualRects(frame, oldFrame))
-@@ -2475,7 +2536,7 @@
+@@ -2475,7 +2556,7 @@
  
          [transform scaleBy:scale];
  
@@ -176,7 +212,7 @@
  
          for (WineBaseView* subview in [self.contentView subviews])
          {
-@@ -3735,7 +3796,7 @@
+@@ -3735,7 +3816,7 @@
      offscreen_layer.framebufferOnly = YES;
      offscreen_layer.magnificationFilter = kCAFilterNearest;
      offscreen_layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);

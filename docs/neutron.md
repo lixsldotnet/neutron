@@ -126,8 +126,13 @@ solves them. Measured on macOS 27, M5 Max.
   exclusive fullscreen at another resolution and the Metal layer scales the
   backbuffer to the screen (like Proton's fullscreen hack). Before, games made
   the MacBook display flicker through several modes at start.
-- Retina mode is on in every prefix, so on a HiDPI display games get real pixels
-  instead of points (MacBook: 2570x1669 at render scale 0.85 instead of 1285x835).
+- Notch displays (MacBook Pro): macOS puts native fullscreen windows below the
+  notch and keeps the menu bar next to it, while Windows sees the whole screen;
+  Unreal then fought over the window size (white screen). There games get a plain
+  window over the whole screen and the app hides menu bar and Dock while active.
+  External displays keep native fullscreen.
+- Wine's Retina mode breaks Unreal (white window), so it stays off: on a HiDPI
+  display games see points (MacBook 1285x835 at render scale 0.85). Open point.
 - Steam's Stop: the tool runs the game in the background and ends the whole
   Wine session of the prefix with `wineserver -k` on TERM.
 
