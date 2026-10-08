@@ -32,7 +32,7 @@ a loaded Mach-O). Logs: `~/Library/Logs/neutron/neutron-<appid>.log`,
 | `build.sh` | Fetch pinned upstreams, patch, build, assemble the tool folder |
 | `patches/` | Per upstream: `wine`, `proton`, `fex`, `dxmt`, `llvm-mingw` |
 | `tool/` | `neutron` entry script, `compatibilitytool.vdf`, `toolmanifest.vdf`, `Neutron-Info.plist` |
-| `dev/` | `steam.sh` (install, Steam Play on, game mapping), `steamjs.mjs` (Steam JS over CEF) |
+| `dev/` | `steam.sh` (install, Steam Play on, game mapping), `steam-panel.js` (settings panel in Steam), `steamjs.mjs` (Steam JS over CEF) |
 | `tests/` | Windows test programs: Steam bridge smoke test, D3D11/D3D12 |
 | `docs/neutron.md` | Architecture, Mac client findings, macOS pitfalls, open points |
 

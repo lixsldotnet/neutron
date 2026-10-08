@@ -8,6 +8,8 @@
 #   3. starts Steam with the CEF debug port and STEAM_EXTRA_COMPAT_TOOLS_PATHS
 #   4. after login, sets the platform back to "macos" so Mac games keep Mac depots
 #   5. optional: maps games to neutron
+#   6. adds the "Neutron" settings panel to the game properties (dev/steam-panel.js,
+#      lives in the running Steam UI only)
 #
 # Usage: dev/steam.sh [--dist <dist/neutron>] [--tool <name>] [--map <appid>]... [--map-all]
 #                     [--launch <appid>=<options>]... [--global <name>|none]
@@ -89,6 +91,7 @@ say "Platform back to macos"
 js 'new Promise(r=>{SteamClient.Console.ExecCommand("@sSteamCmdForcePlatformType macos"); setTimeout(()=>r(1),1000)})' >/dev/null
 say "Tools: $(js 'SteamClient.Settings.GetGlobalCompatTools()')"
 
+
 # After the platform switch Steam keeps "invalid platform" for games mapped to the
 # tool until the mapping is set again.
 say "Refreshing games mapped to $TOOL: $(js "(async () => {
@@ -149,4 +152,5 @@ elif [ -n "$GLOBAL_TOOL" ]; then
   say "Global compat tool: $GLOBAL_TOOL"
   js "SteamClient.Settings.SpecifyGlobalCompatTool(\"$GLOBAL_TOOL\")" >/dev/null
 fi
+say "Settings panel: $(js "$(cat "$DEV_DIR/steam-panel.js")")"
 say "Ready. Logs: ~/Library/Logs/neutron/"

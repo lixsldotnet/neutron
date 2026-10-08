@@ -78,18 +78,24 @@ for launch options, `--global neutron_proton|none` for the default compat tool.
 
 ## Settings
 
-Mac Steam ignores `VAR=x %command%` in launch options. Put settings into
-`neutron.env` next to the tool
-(`~/Library/Application Support/neutron/compatibilitytools.d/neutron_proton/neutron.env`),
-one `KEY=value` per line:
+Per game: open the game's Properties in Steam. On the General page, below Launch
+Options, there is a **Neutron** section (added by `dev/steam.sh` to the running
+Steam UI, Steam's files are not changed):
 
 | Setting | Default | What |
 |---|---|---|
-| `NEUTRON_RENDER_SCALE` | `0.85` | Games see a smaller display and render fewer pixels, MetalFX scales back to native size. `1` turns it off. |
-| `NEUTRON_FEX_TSO` | `fast` | `strict` gives FEX the full x86 memory ordering, for games with threading bugs. Much slower. |
-| `NEUTRON_HUD` | off | `1` shows the Metal HUD, `2` adds DXMT's per-frame statistics. |
-| `NEUTRON_FPS_LOG` | off | `1` writes FPS and the slowest frame per second to the log. |
-| `NEUTRON_LOG` | off | `1` enables Wine debug output. |
+| Performance HUD | off | FPS and frame time, or the full Metal HUD with DXMT's per-frame statistics |
+| Render scale | 85% | Games render fewer pixels, MetalFX scales back to native size. 100% turns it off. |
+| x86 memory ordering | per game | `Strict` gives FEX the full x86 memory ordering, for games with threading bugs. Much slower. |
+| macOS fullscreen and Game Mode | on | Borderless fullscreen games get their own Space and Game Mode |
+| FPS log | off | FPS and the slowest frame per second in the log |
+
+The panel stores them as `NEUTRON_<NAME>=<value>` words in the game's launch
+options, the tool takes them out again before the game starts. For all games the
+same settings go into `neutron.env` next to the tool
+(`~/Library/Application Support/neutron/compatibilitytools.d/neutron_proton/neutron.env`),
+one `KEY=value` per line, e.g. `NEUTRON_HUD=2`. `NEUTRON_LOG=1` enables Wine debug
+output.
 
 Logs: `~/Library/Logs/neutron/neutron-<appid>.log`. Each game gets its own Wine
 prefix in `steamapps/compatdata/<appid>/pfx`.
@@ -108,7 +114,7 @@ prefix in `steamapps/compatdata/<appid>/pfx`.
 | `build.sh` | Fetches, patches and builds the runtime, assembles the tool folder |
 | `patches/` | Patches per upstream project: `wine`, `proton`, `fex`, `dxmt`, `llvm-mingw` |
 | `tool/` | The compat tool: `neutron` entry script, Steam manifests, Neutron.app Info.plist |
-| `dev/` | `steam.sh` (Steam setup, game mapping) and `steamjs.mjs` (Steam JS calls over CEF) |
+| `dev/` | `steam.sh` (Steam setup, game mapping), `steam-panel.js` (settings panel in Steam), `steamjs.mjs` (Steam JS calls over CEF) |
 | `tests/` | Small Windows test programs: Steam bridge, D3D11 and D3D12 |
 | `docs/` | Design, macOS findings, open points |
 

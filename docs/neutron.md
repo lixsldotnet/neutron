@@ -65,6 +65,15 @@ internal tool name is `neutron_proton` (shown as "Neutron"), the prefix is
 `pfx`, and the tool runs Wine with `USER=steamuser`; older prefixes are
 migrated on start.
 
+Per-game settings: Mac Steam hides the Compatibility page (the same `"linux"`
+platform check), so `dev/steam.sh` adds a "Neutron" section to the General page of
+a game's properties at runtime (`dev/steam-panel.js`, through `g_PopupManager`
+popup callbacks in the SharedJSContext). It writes `NEUTRON_<NAME>=<value>` words
+into the launch options, which Steam appends to the tool's command line, and
+`tool/neutron` takes them out again. The idea of settings in the launch options
+comes from NotProton (github.com/NotProtonNot/NotProton), which patches Steam's
+UI in memory through an injected dylib; neutron changes no Steam file.
+
 Steam then downloads the Windows depots itself and runs
 `neutron waitforexitandrun <game exe>`. Mac Steam does not support
 `VAR=x %command%` launch options (AppError 46), so settings go into
