@@ -5,6 +5,10 @@
 //     for mapped games until the mapping changes. Setting the same tool again does
 //     nothing, so all games go to the second tool name (__TOOL___remap, same files)
 //     and back. No per-game details.
+//     The platform switch also drops the Windows depot of installed games and
+//     marks them "Update Required" (Steam delays that update for games not played
+//     recently). A user-started update after the remap is a 0-byte check ("has no
+//     changes") that puts the depot back.
 //  2. Map new games: every library game without a Mac version that neutron has not
 //     seen yet gets the tool, at start and while Steam runs. Seen games (mapped, Mac
 //     native, or set to none by the user) are kept in localStorage, so a game set
@@ -21,14 +25,23 @@
   await sleep(500);
   for (const id of mapped) SteamClient.Apps.SpecifyCompatTool(id, TOOL);
 
-  if (window.__neutronSync) return `remapped ${mapped.length}, watch already running`;
+  const games = () => (window.collectionStore?.allGamesCollection?.allApps || []).filter(a => a.app_type == 1);
+  for (let i = 0; i < 120 && !games().length; i++) await sleep(500);
+  await sleep(1000);
+  const isMapped = new Set(mapped);
+  const installed = games().filter(a => a.installed && isMapped.has(a.appid)).map(a => a.appid);
+  for (const id of installed) {
+    SteamClient.Downloads.QueueAppUpdate(id, 0);
+    SteamClient.Downloads.ResumeAppUpdate(id);
+  }
+
+  if (window.__neutronSync) return `remapped ${mapped.length}, checked ${installed.length} installed, watch already running`;
 
   const details = id => new Promise(resolve => {
     let done = false;
     const h = SteamClient.Apps.RegisterForAppDetails(id, d => { if (done) return; done = true; h.unregister(); resolve(d); });
     setTimeout(() => { if (!done) { done = true; h.unregister(); resolve(null); } }, 3000);
   });
-  const games = () => (window.collectionStore?.allGamesCollection?.allApps || []).filter(a => a.app_type == 1);
   let seen;
   try { seen = new Set(JSON.parse(localStorage.getItem(KEY) || '[]')); } catch { seen = new Set(); }
   for (const id of mapped) seen.add(id);
@@ -59,8 +72,7 @@
     return n;
   };
 
-  for (let i = 0; i < 120 && !games().length; i++) await sleep(500);
   const added = await check();
   window.__neutronSync = setInterval(check, 30000);
-  return `remapped ${mapped.length}, mapped ${added} new, seen ${seen.size}`;
+  return `remapped ${mapped.length}, checked ${installed.length} installed, mapped ${added} new, seen ${seen.size}`;
 })()
