@@ -1,6 +1,6 @@
 --- a/dlls/winemac.drv/cocoa_rawmouse.m
 +++ b/dlls/winemac.drv/cocoa_rawmouse.m
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,130 @@
 +/*
 + * MACDRV raw mouse input from GameController
 + *
@@ -46,6 +46,22 @@
 +static double raw_remainder_x, raw_remainder_y;
 +
 +
++/* The window that gets the raw input: the key window, or after Cmd+Tab back into
++ * a fullscreen game, when macOS does not make a window key again, the frontmost
++ * visible Wine window. */
++static WineWindow* raw_mouse_window(void)
++{
++    NSWindow* window = [NSApp keyWindow];
++
++    if ([window isKindOfClass:[WineWindow class]]) return (WineWindow*)window;
++    for (window in [NSApp orderedWindows])
++    {
++        if ([window isKindOfClass:[WineWindow class]] && [window isVisible] && ![window isMiniaturized])
++            return (WineWindow*)window;
++    }
++    return nil;
++}
++
 +static void raw_mouse_moved(float deltaX, float deltaY)
 +{
 +    WineWindow* window;
@@ -53,8 +69,7 @@
 +    int x, y;
 +
 +    if (![NSApp isActive]) return;
-+    window = (WineWindow*)[NSApp keyWindow];
-+    if (![window isKindOfClass:[WineWindow class]]) return;
++    if (!(window = raw_mouse_window())) return;
 +
 +    /* GameController counts y up, Windows raw input counts y down. Keep the
 +       fractional part for the next event. */
