@@ -7,12 +7,12 @@
 #   - a start script in /Applications/Steam.app, so every Steam start (Dock, login,
 #     Steam's own restart) comes up with Steam Play for neutron: Steam.app's
 #     CFBundleExecutable points to Contents/MacOS/steam_neutron, which turns Steam
-#     Play on, starts dev/steam-hook.sh (platform back to macOS, mapping refresh,
-#     Compatibility tab) and runs Valve's unchanged steam_osx with the CEF debug port.
+#     Play on, starts dev/steam-hook.sh (platform back to macOS, games remapped and
+#     new games mapped, Compatibility tab) and runs Valve's unchanged steam_osx with the CEF debug port.
 #     Valve's steam_osx is bound to Info.plist, so it and the bundle are signed ad hoc
 #     afterwards (like NotProton does); steam_osx, Info.plist and _CodeSignature are
 #     backed up first and --uninstall puts Valve's originals back.
-#   - then starts Steam and maps all games without a Mac version
+#   - then starts Steam; the hook maps all games without a Mac version
 #
 # A Steam client update can replace Steam.app: run ./install.sh again.
 #
@@ -151,6 +151,7 @@ fi
 
 say "Installing the helper scripts"
 mkdir -p "$BIN"
+rm -f "$BIN"/steam-*.js
 cp "$ROOT/dev/steam.sh" "$ROOT/dev/steam-hook.sh" "$ROOT/dev/steamjs.mjs" "$ROOT"/dev/steam-*.js "$BIN/"
 chmod +x "$BIN/steam.sh" "$BIN/steam-hook.sh"
 
@@ -160,6 +161,6 @@ patch_steam
 
 if [ "$START" = 1 ]; then
   say "Starting Steam (maps all games without a Mac version)"
-  "$BIN/steam.sh" --map-all
+  "$BIN/steam.sh"
 fi
 say "Done. Start Steam as usual; after a Steam update run ./install.sh again."

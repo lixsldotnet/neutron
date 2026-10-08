@@ -12,5 +12,15 @@
       "from_oslist"  "windows"
       "to_oslist"    "linux"
     }
+    // Second name for the same tool: dev/steam-sync.js maps games to it and back to
+    // neutron_proton after the platform switch, which clears "invalid platform"
+    // without a moment with no tool (that deletes the installed files).
+    "neutron_proton_remap"
+    {
+      "install_path" "."
+      "display_name" "Neutron (remap)"
+      "from_oslist"  "windows"
+      "to_oslist"    "linux"
+    }
   }
 }

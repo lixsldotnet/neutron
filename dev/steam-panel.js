@@ -103,7 +103,8 @@
   // Our Compatibility page: the compat tool for the game, then the settings.
   async function page(doc, appid) {
     const d = await details(appid);
-    const tools = (await SteamClient.Apps.GetAvailableCompatTools(appid)).filter(t => isNeutron(t.strToolName));
+    const tools = (await SteamClient.Apps.GetAvailableCompatTools(appid))
+      .filter(t => isNeutron(t.strToolName) && !t.strToolName.endsWith('_remap'));
     if (isNeutron(d.strCompatToolName) && !tools.some(t => t.strToolName === d.strCompatToolName))
       tools.unshift({ strToolName: d.strCompatToolName, strDisplayName: 'Neutron' });
 

@@ -80,14 +80,17 @@ After that the Windows games show an Install button in Mac Steam and start like
 any other game. A Steam client update can replace Steam.app: run `./install.sh`
 again.
 
-`dev/steam.sh` restarts Steam the same way for development and also takes
-`--map <appid>`, `--map-all`, `--launch <appid>=<options>` and
-`--global neutron_proton|none`.
+Windows games are mapped to Neutron automatically: at every Steam start and
+while Steam runs, every game without a Mac version that neutron has not seen
+before gets the tool. A game you set back to none stays none.
+
+`dev/steam.sh` restarts Steam and waits for the setup, it also takes
+`--map <appid>`, `--launch <appid>=<options>` and `--global neutron_proton|none`.
 
 ## Settings
 
-Per game: open the game's Properties in Steam, tab **Compatibility** (added by
-`dev/steam.sh` to the running Steam UI, Steam's files are not changed). It picks
+Per game: open the game's Properties in Steam, tab **Compatibility** (added to the
+running Steam UI at every start). It picks
 the tool for the game (Neutron or none) and has the neutron settings:
 
 | Setting | Default | What |

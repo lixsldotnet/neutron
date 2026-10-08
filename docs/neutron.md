@@ -38,7 +38,8 @@ Checked on client 1788652215.
   hidden in the UI by a `"linux" == PLATFORM` check in the steamui JS.
 - Proton's lsteamclient still has its `__APPLE__` path from 2018.
 
-How it is turned on (done by `dev/steam.sh`):
+How it is turned on (Steam.app start script from `install.sh`, then
+`dev/steam-hook.sh`):
 
 1. **Compat layer flag.** `CCompatManager` enables the compat layer once in its
    constructor when the ConVar `@sSteamCmdForcePlatformType` is `linux`. Steam
@@ -55,6 +56,19 @@ How it is turned on (done by `dev/steam.sh`):
    CEF debug port (`-cef-enable-debugging -devtools-port 8080`). A global tool
    (`SpecifyGlobalCompatTool`) alone does not unlock installing a Windows-only
    game, the per-game mapping does.
+6. **Remap after the switch.** After step 2 Steam shows "invalid platform"
+   (display status 14) for every mapped game until its mapping changes; setting
+   the same tool again does nothing. `dev/steam-sync.js` maps all games from
+   config.vdf's `CompatToolMapping` to a second name of the same tool
+   (`neutron_proton_remap`) and back, about 1 s for 200 games. Never clear the
+   mapping on the way: with no tool, Steam computes the Mac depots, which a
+   Windows-only game does not have, deletes the installed files ("0 mounted
+   depots", "341 deleted files" in `logs/content_log.txt`), and downloads the
+   whole game again once the tool is back. A running download restarts from 0.
+7. **New games.** The same script maps every library game without a Mac version
+   that is not in its seen list (`localStorage` key `neutron.seen` in the
+   SharedJSContext) at start and every 30 s while Steam runs. Games mapped, Mac
+   native, or set to none by the user are in the seen list and stay as they are.
 
 Steam Cloud works like with Proton: the Mac client resolves the Windows roots
 of a compat tool game (`WinAppDataLocalLow`, `WinMyDocuments` and co.) to
@@ -253,7 +267,6 @@ All third-party code is fetched at build time and patched (`build.sh`).
   0x10000-0x7fff0001 fails, c0000017). Only a Rosetta x86_64 Wine could run them.
 - Allocations below 4 GB fail (seen once, relocated fine).
 - Overlay and anti-cheat (EAC, BattlEye) will not work.
-- A UI for the hidden compatibility page; today `dev/steam.sh` does the setup.
 - Whether a Steam client update removes `steam_dev.cfg`.
 - License: the lsteamclient folder is under the Steamworks SDK license, not
   open source. The repo only holds patches and fetches Valve's code at build
