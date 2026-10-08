@@ -76,8 +76,8 @@ fi
 # Start scripts, independent of where this repo lives
 say "Installing the start scripts"
 mkdir -p "$BIN"
-cp "$ROOT/dev/steam.sh" "$ROOT/dev/steamjs.mjs" "$ROOT"/dev/steam-*.js "$BIN/"
-chmod +x "$BIN/steam.sh"
+cp "$ROOT/dev/steam.sh" "$ROOT/dev/steam-hook.sh" "$ROOT/dev/steamjs.mjs" "$ROOT"/dev/steam-*.js "$BIN/"
+chmod +x "$BIN/steam.sh" "$BIN/steam-hook.sh"
 NODE_DIR="$(dirname "$(command -v node)")"
 cat > "$BIN/start" <<EOF
 #!/bin/bash

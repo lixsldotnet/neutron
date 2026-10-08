@@ -9,7 +9,7 @@
 #   4. after login, sets the platform back to "macos" so Mac games keep Mac depots
 #   5. optional: maps games to neutron
 #   6. adds a Compatibility tab with the neutron settings to the game properties
-#      (dev/steam-panel.js, lives in the running Steam UI only)
+#      (steps after the start: dev/steam-hook.sh)
 #
 # Usage: dev/steam.sh [--dist <dist/neutron>] [--tool <name>] [--map <appid>]... [--map-all]
 #                     [--launch <appid>=<options>]... [--global <name>|none]
@@ -80,23 +80,8 @@ fi
 say "Starting Steam"
 open --env "STEAM_EXTRA_COMPAT_TOOLS_PATHS=$TOOLS_DIR" -a Steam \
   --args -cef-enable-debugging -devtools-port "$CEF_PORT"
-
-say "Waiting for the Steam UI"
-for _ in $(seq 1 90); do
-  curl -sf "http://127.0.0.1:$CEF_PORT/json" 2>/dev/null | grep -q SharedJSContext && break
-  sleep 2
-done
-curl -sf "http://127.0.0.1:$CEF_PORT/json" 2>/dev/null | grep -q SharedJSContext || die "Steam UI did not come up"
-
-say "Compat layer: $(js 'new Promise(r=>SteamClient.Settings.RegisterForSettingsChanges(s=>r(s.bCompatEnabled)))')"
-say "Platform back to macos"
-js 'new Promise(r=>{SteamClient.Console.ExecCommand("@sSteamCmdForcePlatformType macos"); setTimeout(()=>r(1),1000)})' >/dev/null
-say "Tools: $(js 'SteamClient.Settings.GetGlobalCompatTools()')"
-
-
-# After the platform switch Steam keeps "invalid platform" (display status 14) for
-# games mapped to the tool until the mapping is set again.
-say "Refreshing games mapped to $TOOL: $(js_file steam-refresh.js)"
+say "Waiting for the Steam UI, then platform back to macos, mapping refresh, settings tab"
+"$DEV_DIR/steam-hook.sh" "$TOOL" | while IFS= read -r line; do say "${line#* * }"; done
 
 for app in ${MAP_APPS[@]+"${MAP_APPS[@]}"}; do
   say "Mapping $app to $TOOL"
@@ -117,5 +102,4 @@ elif [ -n "$GLOBAL_TOOL" ]; then
   say "Global compat tool: $GLOBAL_TOOL"
   js "SteamClient.Settings.SpecifyGlobalCompatTool(\"$GLOBAL_TOOL\")" >/dev/null
 fi
-say "Settings panel: $(js "$(cat "$DEV_DIR/steam-panel.js")")"
 say "Ready. Logs: ~/Library/Logs/neutron/"
