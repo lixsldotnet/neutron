@@ -13,7 +13,7 @@ Windows Steam, no Rosetta. Apple Silicon only. Design and findings:
 
 ```sh
 ./build.sh [work-dir]   # default ./.native-build, tool folder in <work>/dist/neutron
-./install.sh             # or --dev to link the dev tree; Steam (Neutron) app + login item
+./install.sh             # or --dev to link the dev tree; patches Steam.app's start (--uninstall reverts)
 ```
 
 Needs Xcode and Homebrew bison flex autoconf cmake ninja meson pkgconf gnutls
@@ -30,7 +30,7 @@ a loaded Mach-O). Logs: `~/Library/Logs/neutron/neutron-<appid>.log`,
 | Path | Purpose |
 |------|---------|
 | `build.sh` | Fetch pinned upstreams, patch, build, assemble the tool folder |
-| `install.sh` | Install the tool, start scripts, Steam (Neutron) launcher, login item; `--uninstall` |
+| `install.sh` | Install the tool, helper scripts and the start script in Steam.app; `--uninstall` |
 | `patches/` | Per upstream: `wine`, `proton`, `fex`, `dxmt`, `llvm-mingw` |
 | `tool/` | `neutron` entry script, `compatibilitytool.vdf`, `toolmanifest.vdf`, `Neutron-Info.plist` |
 | `dev/` | `steam.sh` (install, Steam Play on, game mapping), `steam-panel.js` (settings panel in Steam), `steamjs.mjs` (Steam JS over CEF) |

@@ -77,11 +77,26 @@ if pgrep -x steam_osx >/dev/null; then
   pgrep -x steam_osx >/dev/null && die "Steam did not quit"
 fi
 
-say "Starting Steam"
-open --env "STEAM_EXTRA_COMPAT_TOOLS_PATHS=$TOOLS_DIR" -a Steam \
-  --args -cef-enable-debugging -devtools-port "$CEF_PORT"
-say "Waiting for the Steam UI, then platform back to macos, mapping refresh, settings tab"
-"$DEV_DIR/steam-hook.sh" "$TOOL" | while IFS= read -r line; do say "${line#* * }"; done
+HOOK_LOG="$HOME/Library/Logs/neutron/steam-hook.log"
+if [ "$(plutil -extract CFBundleExecutable raw /Applications/Steam.app/Contents/Info.plist 2>/dev/null)" = steam_neutron ]; then
+  # install.sh's start script in Steam.app turns Steam Play on and runs steam-hook.sh
+  # itself: start Steam normally and wait for the hook.
+  mkdir -p "$(dirname "$HOOK_LOG")"; touch "$HOOK_LOG"
+  start_at=$(wc -c < "$HOOK_LOG")
+  say "Starting Steam"
+  open -a Steam
+  for _ in $(seq 1 180); do
+    tail -c +"$((start_at + 1))" "$HOOK_LOG" | grep -q "Settings tab:" && break
+    sleep 2
+  done
+  tail -c +"$((start_at + 1))" "$HOOK_LOG" | sed 's/^[0-9-]* [0-9:]* /  /'
+else
+  say "Starting Steam"
+  open --env "STEAM_EXTRA_COMPAT_TOOLS_PATHS=$TOOLS_DIR" -a Steam \
+    --args -cef-enable-debugging -devtools-port "$CEF_PORT"
+  say "Waiting for the Steam UI, then platform back to macos, mapping refresh, settings tab"
+  "$DEV_DIR/steam-hook.sh" "$TOOL" | while IFS= read -r line; do say "${line#* * }"; done
+fi
 
 for app in ${MAP_APPS[@]+"${MAP_APPS[@]}"}; do
   say "Mapping $app to $TOOL"

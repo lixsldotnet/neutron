@@ -67,21 +67,22 @@ work dir to redo a step.
 ./install.sh            # after ./build.sh; --dev uses the dev tree instead of the build
 ```
 
-This installs the tool into `~/Library/Application Support/neutron`, adds
-**Steam (Neutron)** to `~/Applications` and a login item, then starts Steam with
-Steam Play turned on and maps every game in your library that has no Mac version
-to neutron. After that the Windows games show an Install button in Mac Steam and
-start like any other game.
+This installs the tool into `~/Library/Application Support/neutron`, then changes
+`/Applications/Steam.app` so that every Steam start (Dock, login, Steam's own
+restart) comes up with Steam Play for neutron: the bundle's start file points to a
+small script (`Contents/MacOS/steam_neutron`) that turns Steam Play on, starts the
+helper that adds the Compatibility tab, and runs Valve's `steam_osx` with the CEF
+debug port. Because Valve's `steam_osx` is bound to the bundle's `Info.plist`, it and
+the bundle are signed ad hoc, so Steam.app no longer carries Valve's signature.
+Valve's originals are backed up, `./install.sh --uninstall` puts them back.
 
-Steam only finds neutron when it is started this way, so start it with
-"Steam (Neutron)" (put it in the Dock) and turn off Steam's own "Run Steam when my
-computer starts". `./install.sh --uninstall` removes everything again except the
-game prefixes.
+After that the Windows games show an Install button in Mac Steam and start like
+any other game. A Steam client update can replace Steam.app: run `./install.sh`
+again.
 
-Under the hood `dev/steam.sh` writes `steam_dev.cfg` (Steam enables its compat
-layer), starts Steam with the CEF debug port, switches the platform back to macOS
-and adds the settings tab. It also takes `--map <appid>`, `--launch
-<appid>=<options>` and `--global neutron_proton|none`.
+`dev/steam.sh` restarts Steam the same way for development and also takes
+`--map <appid>`, `--map-all`, `--launch <appid>=<options>` and
+`--global neutron_proton|none`.
 
 ## Settings
 
@@ -119,10 +120,10 @@ prefix in `steamapps/compatdata/<appid>/pfx`.
 | Path | What |
 |---|---|
 | `build.sh` | Fetches, patches and builds the runtime, assembles the tool folder |
-| `install.sh` | Installs the tool, the Steam (Neutron) launcher and the login item |
+| `install.sh` | Installs the tool and the start script in Steam.app (`--uninstall` reverts) |
 | `patches/` | Patches per upstream project: `wine`, `proton`, `fex`, `dxmt`, `llvm-mingw` |
 | `tool/` | The compat tool: `neutron` entry script, Steam manifests, Neutron.app Info.plist |
-| `dev/` | `steam.sh` (Steam setup, game mapping), `steam-panel.js` (settings panel in Steam), `steamjs.mjs` (Steam JS calls over CEF) |
+| `dev/` | `steam.sh` (Steam restart, game mapping), `steam-hook.sh` (steps after each Steam start), `steam-panel.js` (Compatibility tab), `steamjs.mjs` (Steam JS calls over CEF) |
 | `tests/` | Small Windows test programs: Steam bridge, D3D11 and D3D12 |
 | `docs/` | Design, macOS findings, open points |
 
