@@ -61,20 +61,27 @@ applies `patches/` and builds everything. The first run takes a while (LLVM
 and Wine). Steps are skipped when their output exists; delete a folder in the
 work dir to redo a step.
 
-## Install and turn on Steam Play
+## Install
 
 ```sh
-dev/steam.sh --dist .native-build/dist/neutron --map-all
+./install.sh            # after ./build.sh; --dev uses the dev tree instead of the build
 ```
 
-This installs the tool into `~/Library/Application Support/neutron`, writes
-`steam_dev.cfg` (Steam then enables its compat layer), restarts Steam with the
-CEF debug port and maps every game in your library that has no Mac version to
-neutron. After that the Windows games show an Install button in Mac Steam and
+This installs the tool into `~/Library/Application Support/neutron`, adds
+**Steam (Neutron)** to `~/Applications` and a login item, then starts Steam with
+Steam Play turned on and maps every game in your library that has no Mac version
+to neutron. After that the Windows games show an Install button in Mac Steam and
 start like any other game.
 
-Other options: `--map <appid>` for single games, `--launch <appid>=<options>`
-for launch options, `--global neutron_proton|none` for the default compat tool.
+Steam only finds neutron when it is started this way, so start it with
+"Steam (Neutron)" (put it in the Dock) and turn off Steam's own "Run Steam when my
+computer starts". `./install.sh --uninstall` removes everything again except the
+game prefixes.
+
+Under the hood `dev/steam.sh` writes `steam_dev.cfg` (Steam enables its compat
+layer), starts Steam with the CEF debug port, switches the platform back to macOS
+and adds the settings tab. It also takes `--map <appid>`, `--launch
+<appid>=<options>` and `--global neutron_proton|none`.
 
 ## Settings
 
@@ -112,6 +119,7 @@ prefix in `steamapps/compatdata/<appid>/pfx`.
 | Path | What |
 |---|---|
 | `build.sh` | Fetches, patches and builds the runtime, assembles the tool folder |
+| `install.sh` | Installs the tool, the Steam (Neutron) launcher and the login item |
 | `patches/` | Patches per upstream project: `wine`, `proton`, `fex`, `dxmt`, `llvm-mingw` |
 | `tool/` | The compat tool: `neutron` entry script, Steam manifests, Neutron.app Info.plist |
 | `dev/` | `steam.sh` (Steam setup, game mapping), `steam-panel.js` (settings panel in Steam), `steamjs.mjs` (Steam JS calls over CEF) |

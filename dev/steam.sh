@@ -92,19 +92,20 @@ js 'new Promise(r=>{SteamClient.Console.ExecCommand("@sSteamCmdForcePlatformType
 say "Tools: $(js 'SteamClient.Settings.GetGlobalCompatTools()')"
 
 
-# After the platform switch Steam keeps "invalid platform" for games mapped to the
-# tool until the mapping is set again.
+# After the platform switch Steam keeps "invalid platform" (display status 14) for
+# games mapped to the tool until the mapping is set again.
 say "Refreshing games mapped to $TOOL: $(js "(async () => {
   const games = () => (window.collectionStore?.allGamesCollection?.allApps || []).filter(a => a.app_type == 1);
   for (let i = 0; i < 120 && !games().length; i++) await new Promise(r => setTimeout(r, 500));
-  const tool = id => new Promise(resolve => {
+  const details = id => new Promise(resolve => {
     let done = false;
-    const h = SteamClient.Apps.RegisterForAppDetails(id, d => { if (done) return; done = true; h.unregister(); resolve(d.strCompatToolName); });
-    setTimeout(() => { if (!done) { done = true; h.unregister(); resolve(''); } }, 3000);
+    const h = SteamClient.Apps.RegisterForAppDetails(id, d => { if (done) return; done = true; h.unregister(); resolve(d); });
+    setTimeout(() => { if (!done) { done = true; h.unregister(); resolve({}); } }, 3000);
   });
   let n = 0;
   for (const app of games()) {
-    if (await tool(app.appid) !== '$TOOL') continue;
+    const d = await details(app.appid);
+    if (d.strCompatToolName !== '$TOOL' || d.eDisplayStatus !== 14) continue;
     SteamClient.Apps.SpecifyCompatTool(app.appid, '');
     await new Promise(r => setTimeout(r, 500));
     SteamClient.Apps.SpecifyCompatTool(app.appid, '$TOOL');
