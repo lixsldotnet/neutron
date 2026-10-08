@@ -37,6 +37,8 @@ GLOBAL_TOOL=""
 say() { printf '\033[36m> %s\033[0m\n' "$*"; }
 die() { printf '\033[31mx %s\033[0m\n' "$*" >&2; exit 1; }
 js()  { STEAM_CEF_PORT=$CEF_PORT node "$DEV_DIR/steamjs.mjs" "$1"; }
+# Larger snippets live in files: macOS bash 3.2 garbles long JS inside "$(...)".
+js_file() { js "$(sed "s/__TOOL__/$TOOL/g" "$DEV_DIR/$1")"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -94,26 +96,7 @@ say "Tools: $(js 'SteamClient.Settings.GetGlobalCompatTools()')"
 
 # After the platform switch Steam keeps "invalid platform" (display status 14) for
 # games mapped to the tool until the mapping is set again.
-say "Refreshing games mapped to $TOOL: $(js "(async () => {
-  const games = () => (window.collectionStore?.allGamesCollection?.allApps || []).filter(a => a.app_type == 1);
-  for (let i = 0; i < 120 && !games().length; i++) await new Promise(r => setTimeout(r, 500));
-  const details = id => new Promise(resolve => {
-    let done = false;
-    const h = SteamClient.Apps.RegisterForAppDetails(id, d => { if (done) return; done = true; h.unregister(); resolve(d); });
-    setTimeout(() => { if (!done) { done = true; h.unregister(); resolve({}); } }, 3000);
-  });
-  let n = 0;
-  for (const app of games()) {
-    const d = await details(app.appid);
-    if (d.strCompatToolName !== '$TOOL' || d.eDisplayStatus !== 14) continue;
-    SteamClient.Apps.SpecifyCompatTool(app.appid, '');
-    await new Promise(r => setTimeout(r, 500));
-    SteamClient.Apps.SpecifyCompatTool(app.appid, '$TOOL');
-    await new Promise(r => setTimeout(r, 100));
-    n++;
-  }
-  return n;
-})()")"
+say "Refreshing games mapped to $TOOL: $(js_file steam-refresh.js)"
 
 for app in ${MAP_APPS[@]+"${MAP_APPS[@]}"}; do
   say "Mapping $app to $TOOL"
@@ -121,26 +104,7 @@ for app in ${MAP_APPS[@]+"${MAP_APPS[@]}"}; do
 done
 if [ "$MAP_ALL" = 1 ]; then
   say "Mapping all games without a Mac version to $TOOL"
-  js "(async () => {
-    const details = id => new Promise(resolve => {
-      let done = false;
-      const h = SteamClient.Apps.RegisterForAppDetails(id, d => { if (done) return; done = true; h.unregister(); resolve(d); });
-      setTimeout(() => { if (!done) { done = true; h.unregister(); resolve(null); } }, 3000);
-    });
-    const games = () => (window.collectionStore?.allGamesCollection?.allApps || []).filter(a => a.app_type == 1);
-    for (let i = 0; i < 120 && !games().length; i++) await new Promise(r => setTimeout(r, 500));
-    let mapped = 0, mac = 0, unknown = 0;
-    for (const app of games()) {
-      const d = await details(app.appid);
-      if (!d || !d.vecPlatforms || !d.vecPlatforms.length) { unknown++; continue; }
-      if (d.strCompatToolName === '$TOOL') continue;
-      // A mapped compat tool makes Steam list osx too: games mapped to another
-      // (older) tool name are Windows games, remap them.
-      if (d.vecPlatforms.includes('osx') && !d.strCompatToolName) { mac++; continue; }
-      SteamClient.Apps.SpecifyCompatTool(app.appid, '$TOOL'); mapped++;
-    }
-    return 'mapped ' + mapped + ', Mac native ' + mac + ', unknown ' + unknown;
-  })()"
+  js_file steam-mapall.js
 fi
 for entry in ${LAUNCH_OPTS[@]+"${LAUNCH_OPTS[@]}"}; do
   say "Launch options for ${entry%%=*}: ${entry#*=}"
