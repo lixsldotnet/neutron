@@ -140,6 +140,12 @@ solves them. Measured on macOS 27, M5 Max.
   from integer code cost about 5 ns, d3d11 draw loop +19% FPS (patch
   `0003-afp-lazy-native-transition`). Do not use `FEX_HOSTFEATURES=disableafp`,
   it slows scalar float code.
+- **Wineserver QoS and timers.** The wineserver thread runs at
+  QOS_CLASS_USER_INTERACTIVE, normal threads use latency tier 0 (tier 1 doubles
+  timer leeway), and a non-alertable NtDelayExecution waits on a one-shot
+  critical kqueue timer instead of select(). Sleep(1) went from 1.49 ms to
+  1.04 ms; server round trips did not change. `NEUTRON_PRECISE_TIMERS=0`
+  switches the timer part off (patch `0012-server-qos-precise-timers`).
 - **Render scale.** `NEUTRON_RENDER_SCALE` (default 0.85) scales all Windows
   coordinates in winemac.drv the way Retina mode does with factor 2, so games
   see a 2924x1224 desktop on a 3440x1440 display. The tool sets the DXMT MetalFX

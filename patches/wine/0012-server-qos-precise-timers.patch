@@ -1,0 +1,99 @@
+--- a/server/main.c
++++ b/server/main.c
+@@ -35,6 +35,11 @@
+ # include <sys/sysctl.h>
+ #endif
+ 
++#ifdef __APPLE__
++# include <pthread.h>
++# include <pthread/qos.h>
++#endif
++
+ #include "object.h"
+ #include "file.h"
+ #include "thread.h"
+@@ -266,6 +271,10 @@
+     init_directories( load_intl_file() );
+     init_threading();
+     init_registry();
++#ifdef __APPLE__
++    /* neutron: the server thread is on the critical path of every wait and event, run it at the top QoS class */
++    pthread_set_qos_class_self_np( QOS_CLASS_USER_INTERACTIVE, 0 );
++#endif
+     main_loop();
+     return 0;
+ }
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -272,7 +272,7 @@
+     case THREAD_PRIORITY_NORMAL: /* THREAD_QOS_LEGACY */
+     case THREAD_PRIORITY_ABOVE_NORMAL: /* THREAD_QOS_USER_INITIATED */
+         throughput_qos = THROUGHPUT_QOS_TIER_1;
+-        latency_qos = LATENCY_QOS_TIER_1;
++        latency_qos = LATENCY_QOS_TIER_0; /* neutron: tier 1 doubles the timer leeway */
+         break;
+     case THREAD_PRIORITY_HIGHEST: /* THREAD_QOS_USER_INTERACTIVE */
+         throughput_qos = THROUGHPUT_QOS_TIER_0;
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -2416,6 +2416,31 @@
+ }
+ 
+ 
++#ifdef __APPLE__
++/* neutron: per-thread kqueue for precise sleeps, NEUTRON_PRECISE_TIMERS=0 disables */
++static int precise_timers_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled < 0)
++    {
++        const char *e = getenv( "NEUTRON_PRECISE_TIMERS" );
++        enabled = !(e && e[0] == '0');
++    }
++    return enabled;
++}
++
++static __thread int precise_kq = -2;
++static int precise_timer_kq(void)
++{
++    if (precise_kq == -2)
++    {
++        precise_kq = kqueue();
++        if (precise_kq >= 0) fcntl( precise_kq, F_SETFD, FD_CLOEXEC );
++    }
++    return precise_kq;
++}
++#endif
++
+ /******************************************************************
+  *		NtDelayExecution (NTDLL.@)
+  */
+@@ -2459,6 +2484,28 @@
+             NtQuerySystemTime( &now );
+             diff = (when - now.QuadPart + 9) / 10;
+             if (diff <= 0) break;
++#ifdef __APPLE__
++            /* neutron: one-shot critical kqueue timer, much less overshoot than select() */
++            if (precise_timers_enabled())
++            {
++                int kq = precise_timer_kq();
++                struct kevent kev, out;
++                struct timespec zero = { 0, 0 };
++                if (kq >= 0)
++                {
++                    EV_SET( &kev, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_USECONDS | NOTE_CRITICAL, diff, 0 );
++                    if (kevent( kq, &kev, 1, NULL, 0, &zero ) != -1)
++                    {
++                        if (kevent( kq, NULL, 0, &out, 1, NULL ) == -1 && errno == EINTR)
++                        {
++                            EV_SET( &kev, 1, EVFILT_TIMER, EV_DELETE, 0, 0, 0 );
++                            kevent( kq, &kev, 1, NULL, 0, &zero );
++                        }
++                        continue;
++                    }
++                }
++            }
++#endif
+             tv.tv_sec  = diff / 1000000;
+             tv.tv_usec = diff % 1000000;
+             if (select( 0, NULL, NULL, NULL, &tv ) != -1) break;
