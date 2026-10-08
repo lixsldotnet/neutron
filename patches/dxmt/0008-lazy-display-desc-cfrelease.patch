@@ -1,0 +1,89 @@
+--- a/src/dxgi/dxgi_output.cpp
++++ b/src/dxgi/dxgi_output.cpp	2026-10-08 05:36:06
+@@ -1,5 +1,6 @@
+ #include <algorithm>
+ #include <numeric>
++#include <mutex>
+ 
+ #include "com/com_guid.hpp"
+ #include "com/com_pointer.hpp"
+@@ -139,10 +140,7 @@
+ public:
+   MTLDXGIOutputImpl(IMTLDXGIAdapter *adapter, HMONITOR monitor, DxgiOptions &options)
+       : adapter_(adapter), monitor_(monitor), options_(options) {
+-    WMTGetDisplayDescription(monitor_ == wsi::getDefaultMonitor()
+-                                 ? WMTGetPrimaryDisplayId()
+-                                 : WMTGetSecondaryDisplayId(),
+-                             &native_desc_);
++    /* neutron: native_desc_ is filled lazily in GetDesc1 (ColorSync XPC stall) */
+     for (uint32_t i = 0; i < DXMT_GAMMA_CP_COUNT; i++) {
+       gamma_ramp_.red[i] = gamma_ramp_.green[i] = gamma_ramp_.blue[i] =
+           float(i) / float(DXMT_GAMMA_CP_COUNT - 1);
+@@ -589,6 +587,13 @@
+     pDesc->AttachedToDesktop = 1;
+     pDesc->Rotation = DXGI_MODE_ROTATION_UNSPECIFIED;
+     pDesc->Monitor = monitor_;
++    /* neutron: lazy native display description */
++    std::call_once(native_desc_once_, [this]() {
++      WMTGetDisplayDescription(monitor_ == wsi::getDefaultMonitor()
++                                   ? WMTGetPrimaryDisplayId()
++                                   : WMTGetSecondaryDisplayId(),
++                               &native_desc_);
++    });
+     if (options_.forceSDR) {
+       pDesc->BitsPerColor = 8;
+       pDesc->ColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+@@ -637,6 +642,7 @@
+   Com<IMTLDXGIAdapter> adapter_ = nullptr;
+   HMONITOR monitor_ = nullptr;
+   WMTDisplayDescription native_desc_;
++  std::once_flag native_desc_once_;
+   DxgiOptions &options_;
+   DXMTGammaRamp gamma_ramp_;
+ };
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c	2026-10-08 05:36:06
+@@ -2331,16 +2331,22 @@
+   CFDataRef tag_data = ColorSyncProfileCopyTag(profile, tag);
+   if (!tag_data)
+     return false;
+-  if (CFDataGetLength(tag_data) != sizeof(icc_XYZ_t))
++  /* neutron: release tag_data on every path */
++  if (CFDataGetLength(tag_data) != sizeof(icc_XYZ_t)) {
++    CFRelease(tag_data);
+     return false;
++  }
+   icc_XYZ_t *data = (icc_XYZ_t *)CFDataGetBytePtr(tag_data);
+-  if (data->sig != 0x205a5958)
++  if (data->sig != 0x205a5958) {
++    CFRelease(tag_data);
+     return false;
++  }
+   double X = (int32_t)__builtin_bswap32(data->x) / 65536.0;
+   double Y = (int32_t)__builtin_bswap32(data->y) / 65536.0;
+   double Z = (int32_t)__builtin_bswap32(data->z) / 65536.0;
+   *out_x = X / (X + Y + Z);
+   *out_y = Y / (X + Y + Z);
++  CFRelease(tag_data);
+   return true;
+ }
+ 
+@@ -2377,8 +2383,16 @@
+   CGDirectDisplayID display_id = params->handle;
+   struct WMTDisplayDescription *desc_out = params->arg.ptr;
+   ColorSyncProfileRef profile = ColorSyncProfileCreateWithDisplayID(display_id);
+-  if (!profile || !GetDisplayColorGamut(profile, desc_out))
+-    GetDisplayColorGamut(ColorSyncProfileCreateWithName(kColorSyncGenericRGBProfile), desc_out);
++  if (!profile || !GetDisplayColorGamut(profile, desc_out)) {
++    /* neutron: release the profiles */
++    ColorSyncProfileRef generic = ColorSyncProfileCreateWithName(kColorSyncGenericRGBProfile);
++    if (generic) {
++      GetDisplayColorGamut(generic, desc_out);
++      CFRelease(generic);
++    }
++  }
++  if (profile)
++    CFRelease(profile);
+   NSScreen *screen = GetNSScreenForDisplayID(display_id);
+   if (screen) {
+     desc_out->maximum_edr_color_component_value = [screen maximumExtendedDynamicRangeColorComponentValue];

@@ -164,6 +164,12 @@ solves them. Measured on macOS 27, M5 Max.
   light, strict only costs about 3% there (464 against 476 FPS fast), so a TSO
   change is hardly visible; the in-game view is not driveable. New metric
   `wall_ms_per_frame` is also written for the other game profiles.
+- **Lazy DXGI output description.** `MTLDXGIOutputImpl` queried the ColorSync profile
+  (XPC round trip, about 0.45 ms) in its constructor, and Gamble creates outputs every
+  frame through `GetContainingOutput`. The query now runs once, in `GetDesc1` (patch
+  `0008-lazy-display-desc-cfrelease`), and the unix side releases the ColorSync profiles
+  and tag data it leaked. `EnumOutputs` 0.455 ms to 0.0003 ms; `gwyfs.fps` 480 to 575
+  (+20%), CPU per frame 4.43 to 3.95 ms.
 - **x64 syscall stub.** The ARM64EC x64 syscall stubs (`__ASM_SYSCALL_FUNC`) tested
   `0x7ffe0308`, which faulted on every direct Nt call since KUSER moved above 4 GB
   (2.4 us per call, mostly signal handling). The test is now `cmp %eax,%eax` plus a
