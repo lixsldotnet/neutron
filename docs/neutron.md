@@ -248,7 +248,9 @@ All third-party code is fetched at build time and patched (`build.sh`).
 
 - Black loading screen in Abiotic Factor: `LoadMap` stalls up to 60 s while the
   GPU runs compute work.
-- 32-bit games (WoW64) are not built.
+- 32-bit games do not run and are out of scope: their image must load below 4 GB,
+  which arm64 macOS does not allow (BO2 `t6mp.exe`: `map_free_area` in
+  0x10000-0x7fff0001 fails, c0000017). Only a Rosetta x86_64 Wine could run them.
 - Allocations below 4 GB fail (seen once, relocated fine).
 - Overlay and anti-cheat (EAC, BattlEye) will not work.
 - A UI for the hidden compatibility page; today `dev/steam.sh` does the setup.
