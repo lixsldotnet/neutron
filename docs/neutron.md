@@ -154,6 +154,11 @@ solves them. Measured on macOS 27, M5 Max.
 - **LLVM without assertions.** The LLVM 15 behind DXMT airconv is built with
   `LLVM_ENABLE_ASSERTIONS=Off`. Converting 68 DXBC shaders: 0.525 s to 0.472 s (-10%),
   winemetal.so 27 MB to 22 MB, output unchanged. No visible effect on game start.
+- **DXMT caches in compatdata.** The shader cache (`shaders_320.db`) and the Metal PSO
+  cache (`com.apple.metal`) live in `compatdata/<appid>/dxmt-cache` (tool sets
+  `DXMT_SHADER_CACHE_PATH`, patch 0006 makes dxgi use it for the Metal cache too)
+  instead of the macOS user cache dir, which the system can purge. The old caches are
+  copied once, never deleted. Durability only, no speed change measured.
 - **Render scale.** `NEUTRON_RENDER_SCALE` (default 0.85) scales all Windows
   coordinates in winemac.drv the way Retina mode does with factor 2, so games
   see a 2924x1224 desktop on a 3440x1440 display. The tool sets the DXMT MetalFX

@@ -92,6 +92,10 @@ if [ "${NEUTRON_HUD:-0}" = "1" ] || [ "${NEUTRON_HUD:-0}" = "2" ]; then
   export MTL_HUD_SCALE="${MTL_HUD_SCALE:-0.12}"
 fi
 
+# DXMT shader cache and Metal PSO cache live in the compat data of the game, not
+# in macOS's user cache dir (/var/folders), which the system may purge.
+export DXMT_SHADER_CACHE_PATH="${DXMT_SHADER_CACHE_PATH:-$STEAM_COMPAT_DATA_PATH/dxmt-cache}"
+
 if [ -n "${NEUTRON_METALFX:-}" ]; then
   export DXMT_METALFX_SPATIAL_SWAPCHAIN=1
   export DXMT_CONFIG="d3d11.metalSpatialUpscaleFactor = $NEUTRON_METALFX${DXMT_CONFIG:+; $DXMT_CONFIG}"
@@ -254,10 +258,23 @@ app_args() {
   done
 }
 
+# One time: copy the caches of the old location (<user cache dir>/dxmt/<exe>) into
+# the new one when that is still empty. Copy only, the old one stays.
+seed_dxmt_cache() {
+  local exe="${1##*[/\\]}" old
+  old="$(getconf DARWIN_USER_CACHE_DIR 2>/dev/null)dxmt/$exe"
+  case "$DXMT_SHADER_CACHE_PATH" in /*) ;; *) return 0 ;; esac
+  [ -d "$old" ] && [ ! -e "$DXMT_SHADER_CACHE_PATH" ] || return 0
+  log "seeding DXMT cache from $old"
+  mkdir -p "$DXMT_SHADER_CACHE_PATH" && cp -R "$old/." "$DXMT_SHADER_CACHE_PATH/" 2>/dev/null || true
+  rm -f "$DXMT_SHADER_CACHE_PATH"/*.db-lock "$DXMT_SHADER_CACHE_PATH"/*.db-shm
+}
+
 # Starts the game through Proton's steam.exe, which sets up the Steam registry
 # keys and process state the game expects.
 run_game() {
   local extra=()
+  seed_dxmt_cache "${1:-}"
   while IFS= read -r arg; do [ -n "$arg" ] && extra+=("$arg"); done < <(app_args "$@")
   set -- "$@" ${extra[@]+"${extra[@]}"}
   log "run appid=$APP_ID args: $*"
