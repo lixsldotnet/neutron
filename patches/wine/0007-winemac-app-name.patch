@@ -9,12 +9,12 @@
  #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
  
  
-@@ -230,6 +232,17 @@
+@@ -230,7 +232,18 @@
              NSString* bundleName;
              NSString* title;
              NSMenuItem* item;
 +            const char* app_name = getenv("NEUTRON_APP_NAME");
-+
+ 
 +            /* neutron: show the game name instead of "Wine" in the menu bar and the Dock */
 +            if (app_name && *app_name)
 +            {
@@ -24,9 +24,10 @@
 +                    [(NSMutableDictionary*)info setObject:name forKey:(NSString*)kCFBundleNameKey];
 +                [[NSProcessInfo processInfo] setProcessName:name];
 +            }
- 
++
              [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
  
+             if (activateIfTransformed)
 @@ -702,6 +715,30 @@
  
      - (void) updateFullscreenWindows
@@ -115,7 +116,25 @@
  
                  /* Add event delta to accumulated delta error */
                  /* deltaY is already flipped */
-@@ -2240,6 +2316,9 @@
+@@ -1999,6 +2075,9 @@
+ 
+         if ([NSApp isActive]) return;  /* Nothing to do. */
+ 
++        WARN("activating the app (ignore other apps %d), frontmost is %s\n", ignore,
++             [[[[NSWorkspace sharedWorkspace] frontmostApplication] localizedName] UTF8String]);
++
+         if (!ignore ||
+             ![NSApplication instancesRespondToSelector:@selector(yieldActivationToApplication:)])
+         {
+@@ -2199,6 +2278,7 @@
+ 
+     - (void)applicationDidBecomeActive:(NSNotification *)notification
+     {
++        WARN("became active\n");
+         NSNumber* displayID;
+         NSDictionary* modesToRealize = [latentDisplayModes autorelease];
+ 
+@@ -2240,6 +2320,9 @@
          WineEventQueue* queue;
  
          [self invalidateGotFocusEvents];

@@ -516,15 +516,18 @@
                     "stp x24, x25, [x10, #0xc0]\n\t"
 --- a/dlls/ntdll/unix/loader.c
 +++ b/dlls/ntdll/unix/loader.c
-@@ -398,6 +398,15 @@
+@@ -398,6 +398,18 @@
          bin_dir = build_relative_path( dll_dir, LIBDIR "/wine", BINDIR );
          data_dir = build_relative_path( dll_dir, LIBDIR "/wine", DATADIR "/wine" );
          wineloader = build_path( ntdll_dir, "wine" );
 +#ifdef __APPLE__
 +        /* neutron: start Windows processes from inside an app bundle, so macOS sees its
-+         * Info.plist (game category for Game Mode, app name) */
++         * Info.plist (game category for Game Mode, app name); NEUTRON_APP_BUNDLE names a
++         * per-game bundle with the game's name and icon */
 +        {
-+            char *bundled = build_path( ntdll_dir, "Neutron.app/Contents/MacOS/wine" );
++            const char *game_app = getenv( "NEUTRON_APP_BUNDLE" );
++            char *bundled = game_app ? build_path( game_app, "Contents/MacOS/wine" )
++                                     : build_path( ntdll_dir, "Neutron.app/Contents/MacOS/wine" );
 +            if (!access( bundled, X_OK )) wineloader = bundled;
 +            else free( bundled );
 +        }
@@ -532,7 +535,7 @@
      }
  
      set_dll_path();
-@@ -480,7 +489,9 @@
+@@ -480,7 +492,9 @@
      WORD machine = pe_info->machine;
      ULONGLONG res_start = pe_info->base;
      ULONGLONG res_end = pe_info->base + pe_info->map_size;
@@ -543,7 +546,7 @@
  
      if (pe_info->wine_fakedll) res_start = res_end = 0;
      if (pe_info->image_flags & IMAGE_FLAGS_ComPlusNativeReady)
-@@ -488,8 +499,8 @@
+@@ -488,8 +502,8 @@
  
      signal( SIGPIPE, SIG_DFL );
  

@@ -21,3 +21,17 @@
      else
          path = build_path( dir, "ntdll.so" );
  
+@@ -173,6 +175,13 @@
+ 
+     init_reserved_areas();
+ 
++    /* neutron: a per-game app bundle (icon, name) lives outside the runtime and names ntdll */
++    if (getenv( "NEUTRON_NTDLL" ) && (handle = dlopen( getenv( "NEUTRON_NTDLL" ), RTLD_NOW )))
++    {
++        void (*init_func)(int, char **) = dlsym( handle, "__wine_main" );
++        if (init_func) init_func( argc, argv );
++    }
++
+     if ((handle = try_dlopen( get_self_exe() )) ||
+         (handle = try_dlopen( argv[0] )))
+     {

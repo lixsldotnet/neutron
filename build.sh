@@ -249,7 +249,7 @@ fi
 mkdir -p "$FILES/share/wine/mono"
 tar xJf "$MONO_TAR" -C "$FILES/share/wine/mono"
 
-cp "$ROOT/tool/neutron" "$ROOT/tool/toolmanifest.vdf" "$ROOT/tool/compatibilitytool.vdf" "$DIST/"
+cp "$ROOT/tool/neutron" "$ROOT/tool/peicon.py" "$ROOT/tool/toolmanifest.vdf" "$ROOT/tool/compatibilitytool.vdf" "$DIST/"
 chmod +x "$DIST/neutron"
 
 say "Done: $DIST ($(du -sh "$DIST" | cut -f1))"

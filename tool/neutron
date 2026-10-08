@@ -285,7 +285,40 @@ seed_dxmt_cache() {
 
 # Starts the game through Proton's steam.exe, which sets up the Steam registry
 # keys and process state the game expects.
+# Per-game app bundle in the prefix folder: Windows processes start from it (Wine's
+# NEUTRON_APP_BUNDLE), so the Dock, Cmd+Tab and window switchers show the game's
+# name and the icon from its exe. The loader inside is a hard link to the runtime's.
+setup_app_bundle() {
+  local exe="$1" src="$FILES/lib/wine/aarch64-unix/Neutron.app" app="$STEAM_COMPAT_DATA_PATH/Neutron.app"
+  local script_dir stamp tmp
+  [ -x "$src/Contents/MacOS/wine" ] || return 0
+  script_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+  stamp="$(stat -f '%i %m' "$src/Contents/MacOS/wine") $APP_ID ${NEUTRON_APP_NAME:-}"
+  if [ "$(cat "$app/neutron-stamp" 2>/dev/null)" != "$stamp" ]; then
+    log "building the app bundle for $APP_ID"
+    rm -rf "$app"
+    mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+    ln "$src/Contents/MacOS/wine" "$app/Contents/MacOS/wine" 2>/dev/null \
+      || cp "$src/Contents/MacOS/wine" "$app/Contents/MacOS/wine"
+    cp "$src/Contents/Info.plist" "$app/Contents/Info.plist"
+    plutil -replace CFBundleIdentifier -string "net.lixsl.neutron.app$APP_ID" "$app/Contents/Info.plist"
+    [ -n "${NEUTRON_APP_NAME:-}" ] && plutil -replace CFBundleName -string "$NEUTRON_APP_NAME" "$app/Contents/Info.plist"
+    tmp="$(mktemp -d)"
+    if command -v python3 >/dev/null && [ -f "$exe" ] \
+       && python3 -I "$script_dir/peicon.py" "$exe" "$tmp/icon.ico" \
+       && sips -s format png "$tmp/icon.ico" --out "$tmp/icon.png" >/dev/null 2>&1 \
+       && sips -z 256 256 "$tmp/icon.png" --out "$tmp/icon.png" >/dev/null 2>&1 \
+       && sips -s format icns "$tmp/icon.png" --out "$app/Contents/Resources/AppIcon.icns" >/dev/null 2>&1; then
+      plutil -replace CFBundleIconFile -string AppIcon "$app/Contents/Info.plist"
+    fi
+    rm -rf "$tmp"
+    printf '%s' "$stamp" > "$app/neutron-stamp"
+  fi
+  export NEUTRON_APP_BUNDLE="$app" NEUTRON_NTDLL="$FILES/lib/wine/aarch64-unix/ntdll.so"
+}
+
 run_game() {
+  setup_app_bundle "${1:-}"
   local extra=()
   seed_dxmt_cache "${1:-}"
   while IFS= read -r arg; do [ -n "$arg" ] && extra+=("$arg"); done < <(app_args "$@")

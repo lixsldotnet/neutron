@@ -145,7 +145,7 @@ if [ "$DEV" = 1 ]; then
 else
   [ -x "$DIST/neutron" ] && [ -d "$DIST/files" ] || die "no build at $DIST (run ./build.sh, or --dev)"
   cp -R "$DIST/files" "$TOOL_DIR/files"
-  cp "$DIST/neutron" "$DIST/compatibilitytool.vdf" "$DIST/toolmanifest.vdf" "$TOOL_DIR/"
+  cp "$DIST/neutron" "$DIST/peicon.py" "$DIST/compatibilitytool.vdf" "$DIST/toolmanifest.vdf" "$TOOL_DIR/"
 fi
 [ -f "$TOOL_DIR/neutron.env" ] || printf '# KEY=value lines for all games, e.g. NEUTRON_HUD=1\n' > "$TOOL_DIR/neutron.env"
 

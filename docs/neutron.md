@@ -125,6 +125,12 @@ solves them. Measured on macOS 27, M5 Max.
   macOS native fullscreen (`NEUTRON_NATIVE_FULLSCREEN`).
 - The menu bar shows the game name from Steam's app manifest
   (`NEUTRON_APP_NAME`), not "Wine".
+- Each game gets its own app bundle in its prefix folder
+  (`compatdata/<appid>/Neutron.app`, loader hard-linked from the runtime, own
+  bundle ID, the icon from the game's exe via `tool/peicon.py` and `sips`). Wine
+  starts the game's processes from it (`NEUTRON_APP_BUNDLE`, the loader finds
+  ntdll through `NEUTRON_NTDLL`), so the Dock, Cmd+Tab and window switchers show
+  the game's name and icon.
 - Cmd+Tab stays with macOS: games cannot register Alt+Tab as a hotkey (Command
   is Windows Alt), and windows in native fullscreen keep the normal window level
   so the switcher and the Dock draw above them.
