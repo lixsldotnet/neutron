@@ -1,0 +1,23 @@
+--- a/src/util/wsi_window_win32.cpp
++++ b/src/util/wsi_window_win32.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include "util_d3dkmt.h"
+ #include "wsi_window.hpp"
++#include "util_env.hpp"
+ #include "wsi_monitor.hpp"
+ 
+ #include "util_string.hpp"
+@@ -58,6 +59,12 @@
+       return true;
+   }
+ 
++  /* neutron: never switch the real display mode on macOS (flicker, other windows and the
++   * other displays rearrange). The game keeps its backbuffer size and the Metal layer scales
++   * it to the screen, like Proton's fullscreen hack. DXMT_ALLOW_MODESWITCH=1 restores it. */
++  if (env::getEnvVar("DXMT_ALLOW_MODESWITCH") != "1")
++    return true;
++
+   LONG status = ::ChangeDisplaySettingsExW(monInfo.szDevice, pMode, nullptr,
+                                            CDS_FULLSCREEN, nullptr);
+ 

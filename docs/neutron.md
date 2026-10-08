@@ -122,6 +122,12 @@ solves them. Measured on macOS 27, M5 Max.
   activation with a full display resync (registry rewrite, EDID reads, 100 to
   170 ms on the game thread); it now skips the resync when the displays did not
   change.
+- No real display mode switches: DXMT keeps the desktop mode when a game goes
+  exclusive fullscreen at another resolution and the Metal layer scales the
+  backbuffer to the screen (like Proton's fullscreen hack). Before, games made
+  the MacBook display flicker through several modes at start.
+- Retina mode is on in every prefix, so on a HiDPI display games get real pixels
+  instead of points (MacBook: 2570x1669 at render scale 0.85 instead of 1285x835).
 - Steam's Stop: the tool runs the game in the background and ends the whole
   Wine session of the prefix with `wineserver -k` on TERM.
 
