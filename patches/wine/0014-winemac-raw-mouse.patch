@@ -1,6 +1,6 @@
 --- a/dlls/winemac.drv/cocoa_rawmouse.m
 +++ b/dlls/winemac.drv/cocoa_rawmouse.m
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,134 @@
 +/*
 + * MACDRV raw mouse input from GameController
 + *
@@ -68,8 +68,12 @@
 +    macdrv_event* event;
 +    int x, y;
 +
-+    if (![NSApp isActive]) return;
-+    if (!(window = raw_mouse_window())) return;
++    static unsigned int calls, inactive, nowindow;
++
++    if (!(++calls % 500))
++        TRACE("%u deltas, %u while inactive, %u without window, key %p\n", calls, inactive, nowindow, [NSApp keyWindow]);
++    if (![NSApp isActive]) { inactive++; return; }
++    if (!(window = raw_mouse_window())) { nowindow++; return; }
 +
 +    /* GameController counts y up, Windows raw input counts y down. Keep the
 +       fractional part for the next event. */
@@ -133,15 +137,18 @@
 +}
 --- a/dlls/winemac.drv/mouse.c
 +++ b/dlls/winemac.drv/mouse.c
-@@ -26,6 +26,7 @@
+@@ -26,8 +26,10 @@
  
  #include "config.h"
  #include "macdrv.h"
 +#include "wine/server.h"
  
  WINE_DEFAULT_DEBUG_CHANNEL(cursor);
++WINE_DECLARE_DEBUG_CHANNEL(rawmouse);
  
-@@ -136,7 +137,8 @@
+ 
+ static pthread_mutex_t cursor_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+@@ -136,7 +138,8 @@
      input.mi.time           = time;
      input.mi.dwExtraInfo    = 0;
  
@@ -151,7 +158,7 @@
  }
  
  
-@@ -885,6 +887,19 @@
+@@ -885,6 +888,22 @@
            event->mouse_moved.x, event->mouse_moved.y, event->mouse_moved.drag,
            event->mouse_moved.time_ms, (NtGetTickCount() - event->mouse_moved.time_ms));
  
@@ -161,7 +168,10 @@
 +        INPUT input = { .type = INPUT_MOUSE };
 +        struct raw_mouse raw = { .count = 1, .data = { { event->mouse_moved.x, event->mouse_moved.y } } };
 +
++        static unsigned int sent;
++
 +        if (!neutron_raw_mouse) return;
++        if (!(++sent % 500)) TRACE_(rawmouse)("%u raw deltas sent to %p\n", sent, hwnd);
 +        input.mi.dwFlags = MOUSEEVENTF_MOVE_NOCOALESCE;
 +        input.mi.time    = event->mouse_moved.time_ms;
 +        NtUserSendHardwareInput(hwnd, SEND_HWMSG_RAWINPUT, &input, (LPARAM)&raw);
