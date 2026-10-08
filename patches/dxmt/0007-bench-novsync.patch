@@ -1,0 +1,71 @@
+--- a/src/dxmt/dxmt_presenter.cpp
++++ b/src/dxmt/dxmt_presenter.cpp
+@@ -180,13 +180,41 @@
+     }
+   }
+ 
+-  auto drawable = layer_.nextDrawable();
++  /* neutron: NEUTRON_BENCH_NOVSYNC=1 (benchmarks only) draws the present pass into an offscreen
++     texture and never presents. The display refresh (drawable pacing of the compositor) no longer
++     limits the frame rate, so a game at the display cap shows its real frame time. */
++  static const bool bench_novsync = getenv("NEUTRON_BENCH_NOVSYNC") && *getenv("NEUTRON_BENCH_NOVSYNC") == '1';
++  WMT::MetalDrawable drawable;
++  WMT::Texture target;
++  if (unlikely(bench_novsync)) {
++    uint64_t w = (uint64_t)layer_props_.drawable_width, h = (uint64_t)layer_props_.drawable_height;
++    if (bench_target_ == nullptr || bench_target_width_ != w || bench_target_height_ != h) {
++      WMTTextureInfo ti;
++      ti.type = WMTTextureType2D;
++      ti.pixel_format = layer_props_.pixel_format;
++      ti.usage = WMTTextureUsageRenderTarget;
++      ti.options = WMTResourceStorageModePrivate;
++      ti.width = w;
++      ti.height = h;
++      ti.depth = 1;
++      ti.mipmap_level_count = 1;
++      ti.sample_count = 1;
++      ti.array_length = 1;
++      bench_target_ = device_.newTexture(ti);
++      bench_target_width_ = w;
++      bench_target_height_ = h;
++    }
++    target = bench_target_;
++  } else {
++    drawable = layer_.nextDrawable();
++    target = drawable.texture();
++  }
+ 
+   WMTRenderPassInfo info;
+   WMT::InitializeRenderPassInfo(info);
+   info.colors[0].load_action = WMTLoadActionDontCare;
+   info.colors[0].store_action = WMTStoreActionStore;
+-  info.colors[0].texture = drawable.texture();
++  info.colors[0].texture = target;
+   auto encoder = cmdbuf.renderCommandEncoder(info);
+   wait_fences(encoder);
+   encoder.setFragmentTexture(backbuffer, 0);
+--- a/src/dxmt/dxmt_presenter.hpp
++++ b/src/dxmt/dxmt_presenter.hpp
+@@ -90,6 +90,9 @@
+   uint64_t gamma_version_ = 0;
+   std::array<float, DXMT_GAMMA_CP_COUNT * 4> gamma_lut_rgba_;
+   WMT::Reference<WMT::Texture> gamma_lut_texture_;
++  /* neutron: NEUTRON_BENCH_NOVSYNC=1 renders the present pass into this texture instead of a drawable */
++  WMT::Reference<WMT::Texture> bench_target_;
++  uint64_t bench_target_width_ = 0, bench_target_height_ = 0;
+   WMT::Reference<WMT::RenderPipelineState> present_blit_;
+   WMT::Reference<WMT::RenderPipelineState> present_scale_;
+   std::atomic_flag pso_valid = 0;
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -1098,7 +1098,9 @@
+       );
+       auto t1 = clock::now();
+       currentFrameStatistics().drawable_blocking_interval += (t1 - t0);
+-      if (data->after > 0)
++      if (drawable == nullptr) /* neutron: NEUTRON_BENCH_NOVSYNC, nothing to present */
++        ;
++      else if (data->after > 0)
+         cmdbuf.presentDrawableAfterMinimumDuration(drawable, data->after);
+       else
+         cmdbuf.presentDrawable(drawable);

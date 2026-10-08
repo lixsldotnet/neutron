@@ -11,15 +11,20 @@
 #   d3d11_5k.*    dev/bench/d3d11.c, 5000 draws per frame: draw loop time and process CPU
 #                 time per frame (its FPS sits at the display refresh, so it is left out)
 #   d3d11_20k.*   20000 draws per frame, CPU bound, so its fps is a CPU number too
+#   gwyfs.*       with --games: Gamble again with forced strict TSO (NEUTRON_FEX_TSO=strict)
+#                 and NEUTRON_BENCH_NOVSYNC=1 (DXMT draws the present pass offscreen and
+#                 never presents). Strict alone still sits at the 160 Hz cap in the menu;
+#                 without the present, fps and wall_ms_per_frame are not capped and show
+#                 gains that gwyf hides
 #   gwyf.*, af.*  with --games: Gamble With Your Friends and Abiotic Factor main menu,
 #                 FPS log (one line per second of rendering), 20 lines warmup, median
 #                 over the next 40; first_fps_s is the time from launch to the first
 #                 FPS line, menu_s to steady rendering (after loading stalls),
 #                 cpu_per_frame_ms the CPU time of the game process per frame (shows
 #                 gains when a menu sits at the display refresh), busy_cores the same
-#                 CPU time over wall time
+#                 CPU time over wall time, wall_ms_per_frame is 1000 / median fps
 #
-# Usage: dev/bench/run.sh [--games] [--only-games] [--game gwyf|af] [-k N] [--out FILE]
+# Usage: dev/bench/run.sh [--games] [--only-games] [--game gwyf|gwyfs|af] [-k N] [--out FILE]
 #                         [--compare BASELINE]
 #   --games     micro benches and both games, --only-games skips the micro benches,
 #               --game X runs only that game (and no micro benches)
@@ -44,7 +49,7 @@ HISTORY="$OPT/bench-history.jsonl"
 
 K=5
 GAMES=0
-GAME_LIST="gwyf af"
+GAME_LIST="gwyf gwyfs af"
 MICRO=1
 OUT=""
 COMPARE=""
@@ -201,6 +206,9 @@ game() {
     cd "$game_dir"
     export STEAM_COMPAT_DATA_PATH="$compat" STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT" \
       STEAM_COMPAT_APP_ID="$appid" NEUTRON_FILES="$FILES" NEUTRON_FPS_LOG=1
+    # neutron: GAME_ENV = extra "VAR=value" words for this profile (gwyfs: strict TSO)
+    # shellcheck disable=SC2086
+    [ -z "${GAME_ENV:-}" ] || export $GAME_ENV
     exec "$TOOL" waitforexitandrun "$game_dir/$exe" "$@"
   ) > /dev/null 2>&1 &
   local pid=$!
@@ -218,6 +226,10 @@ game() {
 
 if [ "$GAMES" = 1 ] && [[ " $GAME_LIST " == *" gwyf "* ]]; then
   game gwyf 3892270 "Gamble With Your Friends" "Gamble With Your Friends.exe" 180 \
+    '^Z:.*Gamble With Your Friends\.exe' -force-d3d11
+fi
+if [ "$GAMES" = 1 ] && [[ " $GAME_LIST " == *" gwyfs "* ]]; then
+  GAME_ENV="NEUTRON_FEX_TSO=strict NEUTRON_BENCH_NOVSYNC=1" game gwyfs 3892270 "Gamble With Your Friends" "Gamble With Your Friends.exe" 180 \
     '^Z:.*Gamble With Your Friends\.exe' -force-d3d11
 fi
 if [ "$GAMES" = 1 ] && [[ " $GAME_LIST " == *" af "* ]]; then

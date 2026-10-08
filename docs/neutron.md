@@ -146,6 +146,17 @@ solves them. Measured on macOS 27, M5 Max.
   critical kqueue timer instead of select(). Sleep(1) went from 1.49 ms to
   1.04 ms; server round trips did not change. `NEUTRON_PRECISE_TIMERS=0`
   switches the timer part off (patch `0012-server-qos-precise-timers`).
+- **Uncapped Gamble profile (bench only).** The Gamble menu sits at the 160 Hz
+  display cap, also with strict TSO (4.9 ms CPU per frame, still 160 FPS), so FPS
+  hid every gain. `NEUTRON_BENCH_NOVSYNC=1` (patch `0007-bench-novsync`, never set
+  by the tool) makes DXMT draw the present pass into an offscreen texture and skip
+  `nextDrawable`/present, because `Present(0)` and `displaySyncEnabled = NO` do not
+  lift the compositor's drawable pacing. `dev/bench/run.sh` profile `gwyfs`
+  (strict TSO plus this switch) gives `gwyfs.fps` (about 464, spread 6%),
+  `wall_ms_per_frame` (2.16) and `cpu_per_frame_ms` (4.58). Limits: the menu is
+  light, strict only costs about 3% there (464 against 476 FPS fast), so a TSO
+  change is hardly visible; the in-game view is not driveable. New metric
+  `wall_ms_per_frame` is also written for the other game profiles.
 - **x64 syscall stub.** The ARM64EC x64 syscall stubs (`__ASM_SYSCALL_FUNC`) tested
   `0x7ffe0308`, which faulted on every direct Nt call since KUSER moved above 4 GB
   (2.4 us per call, mostly signal handling). The test is now `cmp %eax,%eax` plus a

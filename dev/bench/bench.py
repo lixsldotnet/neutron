@@ -202,6 +202,7 @@ def watch(log, offset, pid, warmup, measure, first_timeout, proc_pattern, stall_
         "first_fps_s": round(times[0], 1),
         "menu_s": round(menu, 1),
         "fps": round(statistics.median(fps), 1),
+        "wall_ms_per_frame": round(1000 / statistics.median(fps), 3),
         "worst_ms": round(statistics.median(worst), 1),
         "lines": len(fps),
     }
