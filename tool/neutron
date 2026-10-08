@@ -265,6 +265,9 @@ EOF
 # Per-game fixes (like Proton's game fixes): extra arguments appended to the
 # game's command line unless the launch options already contain them.
 # Example: APP_ARGS_<appid>="-dx11"
+# With -dx11 in APP_ARGS, a -dx12/-d3d12 from the game's launch entry is dropped
+# (DXMT's D3D12 is not enough for these games yet).
+APP_ARGS_1144200="-dx11"   # Ready or Not: "DirectX 12 is not supported" with -dx12
 
 app_args() {
   local var="APP_ARGS_$APP_ID" arg
@@ -324,6 +327,12 @@ run_game() {
   local extra=()
   seed_dxmt_cache "${1:-}"
   while IFS= read -r arg; do [ -n "$arg" ] && extra+=("$arg"); done < <(app_args "$@")
+  local var="APP_ARGS_$APP_ID" kept=() arg
+  case " ${!var:-} " in
+    *" -dx11 "*)
+      for arg in "$@"; do case "$arg" in -dx12|-d3d12) ;; *) kept+=("$arg") ;; esac; done
+      set -- ${kept[@]+"${kept[@]}"} ;;
+  esac
   set -- "$@" ${extra[@]+"${extra[@]}"}
   log "run appid=$APP_ID args: $*"
   # In the background plus wait, so Steam's Stop (SIGTERM to this script) is handled

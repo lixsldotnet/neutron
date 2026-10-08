@@ -124,13 +124,14 @@
              /* Cocoa may adjust the frame when the window is ordered onto the screen.
                 Generate a frame-changed event just in case.  The back end will ignore
                 it if nothing actually changed. */
-@@ -1777,8 +1789,73 @@
+@@ -1776,9 +1788,74 @@
+                 [controller updateFullscreenWindows];
  
              [controller adjustWindowLevels];
-         }
++        }
 +        [self neutronUpdateNativeFullscreen];
-     }
- 
++    }
++
 +    /* neutron: a borderless top-level window covering a whole screen (a game in borderless
 +     * fullscreen) goes into macOS native fullscreen, its own Space. Only there macOS scans
 +     * the Metal layer out directly instead of compositing it, and turns on Game Mode. */
@@ -176,9 +177,9 @@
 +            [self adjustFullScreenBehavior:[self collectionBehavior]];
 +            [[WineApplicationController sharedController] adjustWindowLevels];
 +            [self performSelector:@selector(neutronEnterNativeFullscreen) withObject:nil afterDelay:0];
-+        }
-+    }
-+
+         }
+     }
+ 
 +    - (void) neutronEnterNativeFullscreen
 +    {
 +        if (neutronNativeFullscreen && !([self styleMask] & NSWindowStyleMaskFullScreen) && [self isVisible])
@@ -222,7 +223,31 @@
  
          for (WineBaseView* subview in [self.contentView subviews])
          {
-@@ -3735,7 +3820,7 @@
+@@ -2658,11 +2743,18 @@
+         macdrv_query* query;
+         NSSize size;
+ 
+-        query = macdrv_create_query();
+-        query->type = QUERY_MIN_MAX_INFO;
+-        query->window = [self retain];
+-        [self.queue query:query timeout:0.5];
+-        macdrv_release_query(query);
++        /* neutron: AppKit asks again on every Spaces change while the window is in
++           fullscreen. The query waits up to 0.5 s per window for the game's window
++           thread, which a busy game (Unreal) does not answer in time: 1.5 s frame
++           stalls. In fullscreen the cached max size is enough. */
++        if (!([self styleMask] & NSWindowStyleMaskFullScreen))
++        {
++            query = macdrv_create_query();
++            query->type = QUERY_MIN_MAX_INFO;
++            query->window = [self retain];
++            [self.queue query:query timeout:0.5];
++            macdrv_release_query(query);
++        }
+ 
+         size = [self contentMaxSize];
+         if (proposedSize.width < size.width)
+@@ -3735,7 +3827,7 @@
      offscreen_layer.framebufferOnly = YES;
      offscreen_layer.magnificationFilter = kCAFilterNearest;
      offscreen_layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
