@@ -1,7 +1,8 @@
 ntdll on arm64 macOS: TEB and PEB without x18 (TSD slot, page after KUSER), JIT memory
 (MAP_JIT), exec env strings, CPU feature registry values from sysctl, signal handling,
 and the free area search that skips host mappings in one step (no 64K mach_vm_map probing
-under the virtual lock).
+under the virtual lock), and with NEUTRON_SANDBOX=1 a sandboxed client refuses a wineserver
+that runs outside the sandbox (it opens files and sockets for its clients).
 --- a/include/winnt.h
 +++ b/include/winnt.h
 @@ -2575,6 +2575,10 @@
@@ -359,7 +360,45 @@ under the virtual lock).
          }
 --- a/dlls/ntdll/unix/server.c
 +++ b/dlls/ntdll/unix/server.c
-@@ -1784,6 +1784,9 @@
+@@ -1394,6 +1394,27 @@
+ }
+ 
+ 
++#ifdef __APPLE__
++/* neutron: tool/neutron runs a game's Wine processes in a macOS sandbox
++ * (NEUTRON_SANDBOX=1). The wineserver opens files and sockets for its clients, so a
++ * sandboxed client must not use a server that runs outside a sandbox (started by a
++ * Wine call without the setting): it would open everything the sandbox denies. */
++int sandbox_check( pid_t pid, const char *operation, int type, ... );
++
++static void check_server_sandbox( int s )
++{
++    pid_t pid = 0;
++    socklen_t len = sizeof(pid);
++
++    if (sandbox_check( getpid(), NULL, 0 ) <= 0) return;  /* we are not sandboxed */
++    if (getsockopt( s, SOL_LOCAL, LOCAL_PEERPID, &pid, &len ) == -1 || pid <= 0)
++        fatal_perror( "wineserver pid" );
++    if (sandbox_check( pid, NULL, 0 ) <= 0)
++        fatal_error( "the wineserver for %s (pid %d) runs outside the sandbox; "
++                     "end it (wineserver -k) and start again\n", config_dir, (int)pid );
++}
++#endif
++
+ /***********************************************************************
+  *           server_connect
+  *
+@@ -1459,6 +1480,9 @@
+ #endif
+         if (connect( s, (struct sockaddr *)&addr, slen ) != -1)
+         {
++#ifdef __APPLE__
++            check_server_sandbox( s );  /* neutron: sandboxed client, sandboxed server */
++#endif
+             fchdir( initial_cwd );  /* switch back to the starting directory */
+             fcntl( s, F_SETFD, FD_CLOEXEC );
+             return s;
+@@ -1784,6 +1808,9 @@
  
      data->pthread_id = pthread_self();
      pthread_setspecific( thread_data_key, data );

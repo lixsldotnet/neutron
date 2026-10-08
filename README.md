@@ -127,6 +127,33 @@ so neutron hooks into every Steam start (Dock, login item, Steam's own restart):
 - **Steam updates.** A Steam client update can replace Steam.app. Run
   `./install.sh` again after one.
 
+## Security
+
+Wine is not a sandbox. Code that a game runs, including exploit code from an
+attacker in an old multiplayer game, runs as you: it can read your home folder
+(the prefix maps `Z:` to `/`), start Mac programs and use the network. Steam's
+debug port (see above) lets any local process, a compromised game too, run code
+in Steam's UI.
+
+`NEUTRON_SANDBOX=1` (opt-in, still being tested with real games) runs every Wine
+process of the game under a macOS sandbox profile (`tool/neutron.sb`):
+
+- Denied: your home folder except what the game needs (Documents, Desktop,
+  Downloads, `~/.ssh`, keychain folders, other apps' data), Steam's `config/`
+  and `local.vdf`, starting Mac programs (`open`, shells, AppleScript, launchd
+  jobs), Steam's debug port and its `steam://` pipe, other Unix sockets.
+- Allowed: the runtime, the game folder, the game's prefix, logs, network, Metal,
+  audio, controllers, and what Steam's client library needs (Steam IPC, the
+  game's Steam Cloud folder).
+- The game's Documents, Desktop and other user folders become real folders in
+  the prefix (like Proton); saves a game wrote into `~/Documents` before stay
+  there and are no longer visible to it. Links a game opens in the browser and
+  `steam://` links do not work.
+- Cost: about 5 ms more per Wine start, nothing measurable at run time.
+
+`tests/sandbox/sbtest.sh` checks all of this headless; `tests/sandbox/sandbox-denials.sh`
+shows what the sandbox denied while a game ran.
+
 ## Usage
 
 Games without a Mac version are mapped to neutron automatically, at every Steam
@@ -164,6 +191,7 @@ Launch options override `neutron.env`. Changes apply at the next game start.
 | `NEUTRON_METALFX` | from render scale | MetalFX upscale factor, normally `1 / NEUTRON_RENDER_SCALE`. |
 | `NEUTRON_APP_NAME` | game name | Name in the menu bar and Dock. |
 | `NEUTRON_LOG` | off | `1`: Wine debug output in the game log. |
+| `NEUTRON_SANDBOX` | off | `1`: run the game in a macOS sandbox, see Security. Set it in `neutron.env` (Steam's helper calls do not carry the launch options). |
 
 `tool/neutron` lists the development and diagnostic variables in its header.
 

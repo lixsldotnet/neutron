@@ -22,6 +22,8 @@
       choices: [['', 'On'], ['0', 'Off']] },
     { key: 'NEUTRON_FPS_LOG', label: 'FPS log',
       choices: [['', 'Off'], ['1', 'On (~/Library/Logs/neutron)']] },
+    { key: 'NEUTRON_SANDBOX', label: 'Sandbox (game cannot read your files or start programs)',
+      choices: [['', 'Off'], ['1', 'On (experimental)']] },
   ];
 
   const details = appid => new Promise(resolve => {

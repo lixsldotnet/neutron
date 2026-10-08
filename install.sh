@@ -140,7 +140,7 @@ command -v node >/dev/null || die "node is needed (brew install node)"
 
 say "Installing the compat tool"
 mkdir -p "$TOOL_DIR" "$LOGS"
-for f in neutron peicon.py files compatibilitytool.vdf toolmanifest.vdf; do rm -rf "${TOOL_DIR:?}/$f"; done
+for f in neutron neutron.sb peicon.py files compatibilitytool.vdf toolmanifest.vdf; do rm -rf "${TOOL_DIR:?}/$f"; done
 if [ "$DEV" = 1 ]; then
   # Dev install: links tool/neutron from this repo, so script changes apply at the next
   # game start, and links the runtime of the build (.native-build/dist/neutron/files),
@@ -149,12 +149,13 @@ if [ "$DEV" = 1 ]; then
   [ -d "$runtime" ] || runtime="$ROOT/.native-build/wine-install"
   [ -d "$runtime/lib/wine/aarch64-windows" ] || die "no runtime in $runtime (run ./build.sh)"
   ln -s "$ROOT/tool/neutron" "$TOOL_DIR/neutron"
+  ln -s "$ROOT/tool/neutron.sb" "$TOOL_DIR/neutron.sb"
   ln -s "$runtime" "$TOOL_DIR/files"
   cp "$ROOT/tool/compatibilitytool.vdf" "$ROOT/tool/toolmanifest.vdf" "$TOOL_DIR/"
 else
   [ -x "$DIST/neutron" ] && [ -d "$DIST/files" ] || die "no build at $DIST (run ./build.sh, or --dev)"
   cp -R "$DIST/files" "$TOOL_DIR/files"
-  cp "$DIST/neutron" "$DIST/peicon.py" "$DIST/compatibilitytool.vdf" "$DIST/toolmanifest.vdf" "$TOOL_DIR/"
+  cp "$DIST/neutron" "$DIST/neutron.sb" "$DIST/peicon.py" "$DIST/compatibilitytool.vdf" "$DIST/toolmanifest.vdf" "$TOOL_DIR/"
 fi
 [ -f "$TOOL_DIR/neutron.env" ] || printf '# KEY=value lines for all games, e.g. NEUTRON_HUD=1\n' > "$TOOL_DIR/neutron.env"
 

@@ -249,6 +249,43 @@ them.
   window shown over it (Unreal helper windows on top force compositing).
   `dev/direct-test.sh` runs each case with the HUD.
 
+## Game sandbox
+
+`NEUTRON_SANDBOX=1` runs every Wine process of a prefix (wineboot, reg, steam.exe,
+the game) under `sandbox-exec -f neutron.sb` with parameters for the home folder,
+runtime, compatdata, game folder, Steam root, app id and the CEF port (`run_wine`
+in tool/neutron). `sandbox-exec` is a SIP binary, so dyld drops `DYLD_*` for it;
+the tool puts `DYLD_FALLBACK_LIBRARY_PATH` back through `/usr/bin/env`. The
+profile allows by default and denies the dangerous parts explicitly; a deny-default
+profile cannot be validated headless for AppKit windows, Game Mode and GCMouse. In
+SBPL a more specific operation beats a wildcard regardless of order (`deny
+file-read-data` wins over `allow file-read*`), so denies and allows use the same
+level.
+
+- wineserver opens files and sockets for its clients, so an unsandboxed server for
+  the same prefix bypasses the sandbox (tested: reading `~/Documents` through it
+  worked). The tool waits for an old server (`wineserver -w`) before `run`, and
+  ntdll (patch 0003) refuses a server outside the sandbox when the client is in
+  one (peer pid through `LOCAL_PEERPID`, then `sandbox_check`).
+- Wine links the prefix's Documents, Desktop, Downloads, Music, Pictures and
+  Videos to the real folders; with the sandbox they become real folders in the
+  prefix.
+- Steam's client library talks to Steam through POSIX shared memory (`/Shm/<hex>`),
+  semaphores (`/Evt/<hex>`, `*.BinSemLock`), the Mach service
+  `com.valvesoftware.steam.ipctool`, `registry.vdf` (Steam PID) and writes logs,
+  `appcache/stats` and `userdata/<id>/<appid>` (Steam Cloud); the profile allows
+  exactly these. The real Steam path still needs a test with a game.
+- The CEF port is denied on 127.0.0.1 and ::1, other localhost ports stay open
+  (`NEUTRON_SANDBOX_LOCALHOST=0` denies all localhost). securityd stays reachable:
+  Wine's crypt32 loads the root certificates through it (HTTPS).
+- Overhead: `sandbox-exec` adds about 5.5 ms per Wine start; `dev/bench/cpu.c`
+  (server round trips, threads, memory) within noise.
+- Steam's CEF port cannot be closed or switched at runtime (the Developer setting
+  only takes effect at a Steam start, CEF's pipe mode cannot be passed through
+  Steam). Chrome already rejects web pages (Origin and Host checks); the risk is
+  local processes. A random port per start makes blind attacks on 8080 fail but
+  not a targeted local scan.
+
 ## Performance work
 
 Benchmarks and their conditions: [dev/bench/README.md](../dev/bench/README.md).

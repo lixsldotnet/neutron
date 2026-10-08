@@ -29,6 +29,16 @@
 #   NEUTRON_APP_NAME=<name>     name in the menu bar and Dock (default from Steam's
 #                               app manifest)
 #   NEUTRON_LOG=1               Wine debug output in the log (WINEDEBUG overrides it)
+#   NEUTRON_SANDBOX=1           run Wine in a macOS sandbox (neutron.sb): no access to
+#                               the home folder outside the game, its prefix and the
+#                               Steam files it needs, no host programs, no CEF port.
+#                               Best in neutron.env: Steam's getcompatpath calls do not
+#                               carry the launch options
+#   NEUTRON_SANDBOX_LOCALHOST=0 sandbox: no connections to localhost at all (default
+#                               only Steam's CEF debug port is closed)
+#   NEUTRON_SANDBOX_GAME_DIR=<dir>  game folder the sandbox opens (default
+#                               STEAM_COMPAT_INSTALL_PATH, else steamapps/common/<game>
+#                               or the exe's folder)
 #
 # Development and diagnostics:
 #   NEUTRON_FILES=<dir>         runtime to use instead of ./files
@@ -37,6 +47,8 @@
 #   NEUTRON_HUD_NOTE=<text>     one extra line in the HUD's neutron block
 #   NEUTRON_LAYER_FORMAT=keep|bgra8  Metal layer format for 10-bit backbuffers:
 #                               RGB10A2 like DXMT upstream, or 8 bit (default BGR10A2)
+#   NEUTRON_SANDBOX_EXTRA_EXEC=<path>  tests only: one more host program the sandbox
+#                               lets Wine start (the tests' native probe)
 #   NEUTRON_NATIVE_DRAWABLE=0   DXMT's own drawable size instead of the view's size
 #                               in screen pixels
 #   NEUTRON_BENCH_NOVSYNC=1     benchmarks only: DXMT draws the present pass offscreen
@@ -180,6 +192,73 @@ fi
 export NEUTRON_STEAMCLIENT_DYLIB
 
 #-------------------------------------------------------------------------------
+#  sandbox
+#-------------------------------------------------------------------------------
+
+# With NEUTRON_SANDBOX=1 every Wine process of the prefix runs under sandbox-exec
+# with neutron.sb (see there). All Wine starts go through run_wine: a wineserver
+# started outside the sandbox would open files for the sandboxed game.
+SANDBOX=()
+
+# Absolute path with symlinks resolved (the sandbox checks real paths: /tmp is
+# /private/tmp). The folder has to exist.
+real_dir() { (cd "$1" 2>/dev/null && pwd -P); }
+
+setup_sandbox() {
+  [ "${NEUTRON_SANDBOX:-0}" = 1 ] || return 0
+  local profile="$TOOL_DIR/neutron.sb" game="${NEUTRON_SANDBOX_GAME_DIR:-${STEAM_COMPAT_INSTALL_PATH:-}}"
+  # Fail closed: a missing profile or sandbox-exec never means "run without".
+  [ -f "$profile" ] || die "NEUTRON_SANDBOX=1 but no profile at $profile"
+  [ -x /usr/bin/sandbox-exec ] || die "NEUTRON_SANDBOX=1 but no /usr/bin/sandbox-exec"
+  # Without STEAM_COMPAT_INSTALL_PATH: the game's folder under steamapps/common
+  # (the exe may sit deeper, Binaries/Win64), else the exe's own folder.
+  if [ -z "$game" ] && [ -f "${1:-}" ]; then
+    case "$1" in
+      */steamapps/common/*/*)
+        local rest="${1#*/steamapps/common/}"
+        game="${1%%/steamapps/common/*}/steamapps/common/${rest%%/*}" ;;
+      *) game="$(dirname "$1")" ;;
+    esac
+  fi
+  [ -n "$game" ] && { game="$(real_dir "$game")" || game=""; }
+  mkdir -p "$WINEPREFIX"
+  local prefix dev ino
+  prefix="$(real_dir "$WINEPREFIX")"
+  # Wine's server dir: /tmp/.wine-<uid>/server-<dev>-<ino> of the prefix, in hex.
+  read -r dev ino < <(stat -f '%d %i' "$prefix")
+  local server_dir cef_port
+  # Steam's CEF debug port: from the Steam start script's environment, else the
+  # file it writes (install.sh), else Steam's default.
+  cef_port="${STEAM_CEF_PORT:-$(cat "$HOME/Library/Application Support/neutron/run/cef-port" 2>/dev/null)}"
+  case "$cef_port" in ''|*[!0-9]*) cef_port=8080 ;; esac
+  server_dir="$(printf '/private/tmp/.wine-%u/server-%x-%x' "$(id -u)" "$dev" "$ino")"
+  SANDBOX=(/usr/bin/sandbox-exec -f "$profile"
+    -D HOME="$(real_dir "$HOME")"
+    -D TOOL_DIR="$(real_dir "$TOOL_DIR")"
+    -D FILES="$(real_dir "$FILES")"
+    -D COMPAT="$(real_dir "$STEAM_COMPAT_DATA_PATH")"
+    -D GAME="$game"
+    -D STEAM_ROOT="$(real_dir "$STEAM_ROOT" || printf '%s' "$STEAM_ROOT")"
+    -D APPID="$APP_ID"
+    -D LOGS="$(real_dir "$LOG_DIR")"
+    -D SERVER_DIR="$server_dir"
+    -D CEF_PORT="$cef_port"
+    -D LOCALHOST="$( [ "${NEUTRON_SANDBOX_LOCALHOST:-1}" = 0 ] && echo deny || echo allow )"
+    -D EXTRA_EXEC="${NEUTRON_SANDBOX_EXTRA_EXEC:-}")
+  log "sandbox on: game dir '${game:-none}', server $server_dir"
+}
+
+# sandbox-exec is a SIP binary, dyld drops DYLD_* for it and its children; env puts
+# the library path back for Wine.
+run_wine() {
+  if [ ${#SANDBOX[@]} -gt 0 ]; then
+    "${SANDBOX[@]}" /usr/bin/env DYLD_FALLBACK_LIBRARY_PATH="$DYLD_FALLBACK_LIBRARY_PATH" "$WINE" "$@"
+  else
+    "$WINE" "$@"
+  fi
+}
+
+#-------------------------------------------------------------------------------
 #  prefix
 #-------------------------------------------------------------------------------
 
@@ -195,7 +274,7 @@ setup_prefix() {
     log "creating prefix $WINEPREFIX"
     mkdir -p "$WINEPREFIX"
     # No Mono/Gecko install prompts: they block on a dialog nobody sees.
-    WINEDLLOVERRIDES="mscoree,mshtml=" "$WINE" wineboot -i >> "$LOG" 2>&1 \
+    WINEDLLOVERRIDES="mscoree,mshtml=" run_wine wineboot -i >> "$LOG" 2>&1 \
       || die "wineboot failed"
     "$WINESERVER" -w
   fi
@@ -206,7 +285,7 @@ setup_prefix() {
   now="$(stat -f '%m %z' "$FILES/share/wine/wine.inf" 2>/dev/null)"
   if [ "$(cat "$stamp" 2>/dev/null)" != "$now" ]; then
     log "updating prefix for the new runtime"
-    WINEDLLOVERRIDES="mscoree,mshtml=" "$WINE" wineboot -u >> "$LOG" 2>&1
+    WINEDLLOVERRIDES="mscoree,mshtml=" run_wine wineboot -u >> "$LOG" 2>&1
     "$WINESERVER" -w
     printf '%s' "$now" > "$stamp"
   fi
@@ -217,6 +296,23 @@ setup_prefix() {
 
   setup_steam_registry
   setup_emulator_registry
+  sandbox_user_dirs
+}
+
+# Wine links the prefix's Documents, Desktop, Downloads, Music, Pictures and Videos
+# to the Mac home folders. The sandbox closes those, so games could not write their
+# saves to My Documents: in sandbox mode they become real folders in the prefix, as
+# in Proton (Steam Cloud uses steamuser/Documents and co. either way). Saves a game
+# wrote through the links stay in ~/Documents (copy them over by hand if needed).
+sandbox_user_dirs() {
+  [ ${#SANDBOX[@]} -gt 0 ] || return 0
+  local link target
+  for link in "$WINEPREFIX/drive_c/users/$USER"/*; do
+    [ -L "$link" ] || continue
+    target="$(readlink "$link")"
+    case "$target" in "$HOME"/*) ;; *) continue ;; esac
+    rm "$link" && mkdir "$link" && log "sandbox: ${link##*/} is a folder in the prefix now, was a link to $target"
+  done
 }
 
 # FEX translates the x86_64 game code (ARM64EC emulator DLL).
@@ -224,7 +320,7 @@ setup_emulator_registry() {
   local marker="$WINEPREFIX/neutron-fex-v1"
   [ -f "$marker" ] && return 0
   log "registering FEX as x64 emulator"
-  "$WINE" reg add 'HKLM\Software\Microsoft\Wow64\amd64' /ve /d libarm64ecfex.dll /f >> "$LOG" 2>&1 \
+  run_wine reg add 'HKLM\Software\Microsoft\Wow64\amd64' /ve /d libarm64ecfex.dll /f >> "$LOG" 2>&1 \
     || die "emulator registry failed"
   "$WINESERVER" -w
   touch "$marker"
@@ -258,7 +354,7 @@ Windows Registry Editor Version 5.00
 "InstallPath"="$steam"
 EOF
   log "importing Steam registry keys"
-  "$WINE" reg import "$reg" >> "$LOG" 2>&1 || die "registry import failed"
+  run_wine reg import "$reg" >> "$LOG" 2>&1 || die "registry import failed"
   "$WINESERVER" -w
   rm -f "$reg"
   touch "$marker"
@@ -327,7 +423,7 @@ run_game() {
   # In the background plus wait, so Steam's Stop (SIGTERM to this script) is handled
   # right away: end the whole Wine session of this prefix, the game included.
   trap 'log "stop requested"; "$WINESERVER" -k; exit 143' TERM INT HUP
-  "$WINE" 'c:\windows\system32\steam.exe' "$@" >> "$LOG" 2>&1 &
+  run_wine 'c:\windows\system32\steam.exe' "$@" >> "$LOG" 2>&1 &
   wait $!
   local rc=$?
   trap - TERM INT HUP
@@ -343,9 +439,15 @@ VERB="${1:-}"
 [ $# -gt 0 ] && shift
 log "verb=$VERB steamclient=$NEUTRON_STEAMCLIENT_DYLIB"
 
+case "$VERB" in destroyprefix) ;; *) setup_sandbox "$@" ;; esac
+
 case "$VERB" in
   run)
     setup_prefix
+    # A wineserver started outside the sandbox (an earlier run without it, or a
+    # Steam call without the setting) would open files for the sandboxed game:
+    # wait until it is gone, like waitforexitandrun, so the game starts its own.
+    [ ${#SANDBOX[@]} -gt 0 ] && "$WINESERVER" -w
     run_game "$@"
     ;;
   waitforexitandrun)
@@ -355,13 +457,13 @@ case "$VERB" in
     ;;
   runinprefix)
     setup_prefix
-    "$WINE" "$@"
+    run_wine "$@"
     ;;
   getcompatpath)
-    "$WINE" winepath -w "$1" 2>> "$LOG"
+    run_wine winepath -w "$1" 2>> "$LOG"
     ;;
   getnativepath)
-    "$WINE" winepath "$1" 2>> "$LOG"
+    run_wine winepath "$1" 2>> "$LOG"
     ;;
   destroyprefix)
     log "destroying prefix $WINEPREFIX"

@@ -1,0 +1,133 @@
+;; neutron: macOS sandbox profile for game processes (NEUTRON_SANDBOX=1).
+;;
+;; tool/neutron runs Wine as
+;;   sandbox-exec -f neutron.sb -D HOME=... -D FILES=... ... /usr/bin/env <dyld vars> wine ...
+;; Every Wine process of the game (wineserver, steam.exe, the game, its children)
+;; inherits the sandbox, macOS gives no way to leave it.
+;;
+;; Model: allow by default (Metal, AppKit, GameController, CoreAudio and Wine use far
+;; more system services than can be listed and tested headless), then take away what
+;; an exploit in a game would want: the user's files, starting host programs, opening
+;; apps and URLs, AppleEvents, launchd jobs, other unix sockets (agents, other Wine
+;; sessions) and the Steam UI's CEF debug port.
+;;
+;; Parameters (all absolute, no trailing slash, symlinks resolved):
+;;   HOME          the user's home
+;;   TOOL_DIR      folder of tool/neutron (read)
+;;   FILES         Wine runtime (read, exec)
+;;   COMPAT        compatdata/<appid> (read, write; Neutron.app inside read only)
+;;   GAME          game install folder (read, write), "" when unknown
+;;   STEAM_ROOT    ~/Library/Application Support/Steam (read, parts write)
+;;   APPID         Steam app id
+;;   LOGS          ~/Library/Logs/neutron (only neutron-<APPID>.log)
+;;   SERVER_DIR    /private/tmp/.wine-<uid>/server-<dev>-<ino> of this prefix
+;;   CEF_PORT      Steam's CEF debug port (default 8080)
+;;   LOCALHOST     "deny": no connections to localhost at all, else "allow"
+;;   EXTRA_EXEC    one more executable allowed to start (tests), "" for none
+
+(version 1)
+(allow default)
+
+;;---------------------------------------------------------------------------
+;; files
+;;---------------------------------------------------------------------------
+
+;; Nothing in the home folder or on other volumes, except the folders below.
+;; Metadata (stat, path lookup) stays allowed, contents and listings do not.
+;; SBPL: a rule for a more specific operation beats a wildcard one regardless of
+;; order, so denies and allows below use the same file-read* / file-write* level.
+(deny file-read* file-write* (subpath (param "HOME")) (subpath "/Volumes"))
+(allow file-read-metadata (subpath (param "HOME")) (subpath "/Volumes"))
+
+;; Runtime and tool: read only.
+(allow file-read* (subpath (param "TOOL_DIR")) (subpath (param "FILES")))
+
+;; Prefix and caches: read and write. Logs: only this game's log (Wine writes to
+;; the stdout/stderr tool/neutron hands it; the folder also holds steam-hook.pid).
+(allow file-read* file-write*
+  (subpath (param "COMPAT"))
+  (literal (string-append (param "LOGS") "/neutron-" (param "APPID") ".log")))
+(if (< 0 (string-length (param "GAME")))
+  (allow file-read* file-write* (subpath (param "GAME"))))
+
+;; The per-game Neutron.app holds the host loader (a Mach-O the tool starts next
+;; time, maybe without sandbox): never writable from inside.
+(deny file-write* (subpath (string-append (param "COMPAT") "/Neutron.app")))
+
+;; Steam: steamclient.dylib and its libraries, registry.vdf (running Steam's pid),
+;; the stats cache and the game's own Steam Cloud folder. Login and account
+;; files stay closed (config/, local.vdf, ssfn*).
+(allow file-read* (subpath (string-append (param "STEAM_ROOT") "/Steam.AppBundle")))
+(allow file-read* (literal (string-append (param "STEAM_ROOT") "/registry.vdf")))
+(allow file-read* (literal (param "STEAM_ROOT")))
+(allow file-read* file-write*
+  (subpath (string-append (param "STEAM_ROOT") "/logs"))
+  (subpath (string-append (param "STEAM_ROOT") "/appcache/stats"))
+  (regex (string-append "^" (regex-quote (param "STEAM_ROOT")) "/userdata/[0-9]+/" (param "APPID") "(/|$)")))
+(allow file-read*
+  (subpath (string-append (param "STEAM_ROOT") "/steamapps"))) ; manifests, other library paths
+
+;; Steam's command pipe: the running steam_osx reads steam:// commands from it
+;; (what a second "steam steam://..." start passes on). Games do not need it, the
+;; game-side steamclient talks to Steam through POSIX shm/semaphores (/Shm/<hex>,
+;; /Evt/<hex>) and the com.valvesoftware.steam.ipctool Mach service.
+(deny file-read* file-write* (literal "/private/tmp/steam.pipe"))
+
+;; AppKit and friends read a few per-user files directly or through cfprefsd,
+;; which checks the caller's sandbox: global and Apple preferences, the game's
+;; own bundle id domain, user fonts and keyboard layouts.
+(allow file-read*
+  (literal (string-append (param "HOME") "/Library/Preferences/.GlobalPreferences.plist"))
+  (regex (string-append "^" (regex-quote (param "HOME")) "/Library/Preferences/ByHost/\\.GlobalPreferences\\."))
+  (regex (string-append "^" (regex-quote (param "HOME")) "/Library/Preferences/com\\.apple\\."))
+  (subpath (string-append (param "HOME") "/Library/Fonts"))
+  (subpath (string-append (param "HOME") "/Library/Keyboard Layouts"))
+  (subpath (string-append (param "HOME") "/Library/Input Methods")))
+(allow file-read* file-write*
+  (regex (string-append "^" (regex-quote (param "HOME")) "/Library/(Preferences|Caches|HTTPStorages|Saved Application State|WebKit)/net\\.lixsl\\.neutron\\.")))
+
+;; Not closed: the keychain through securityd. Wine's crypt32 loads the system root
+;; certificates through it (denying com.apple.SecurityServer breaks every HTTPS
+;; connection). Keychain items stay protected by their ACLs: an item of another app
+;; needs the user's OK in a macOS prompt that names "wine".
+
+;;---------------------------------------------------------------------------
+;; processes
+;;---------------------------------------------------------------------------
+
+;; Only the Wine runtime and the game's loader copy may be started: no /bin/sh,
+;; no open, no osascript, no Mac binaries from the game folder.
+(deny process-exec*)
+(allow process-exec*
+  (subpath (param "FILES"))
+  (literal (string-append (param "COMPAT") "/Neutron.app/Contents/MacOS/wine"))
+  (literal "/usr/bin/env"))           ; tool/neutron puts the DYLD_* vars back through env
+(if (< 0 (string-length (param "EXTRA_EXEC")))
+  (allow process-exec* (literal (param "EXTRA_EXEC"))))
+
+;; No apps or URLs through LaunchServices (winebrowser, ShellExecute, start /unix
+;; end there), no AppleEvents to other apps, no launchd jobs.
+(deny lsopen)
+(deny appleevent-send)
+(deny job-creation)
+
+;;---------------------------------------------------------------------------
+;; network
+;;---------------------------------------------------------------------------
+
+;; Games need the internet and the LAN. Not allowed: Steam's CEF debug port
+;; (JavaScript in the logged-in Steam UI) on 127.0.0.1 and ::1. With LOCALHOST=deny
+;; nothing on localhost at all (breaks games and launchers that talk to themselves
+;; over loopback, e.g. listen servers joined locally).
+;; SBPL only knows "localhost" or "*" as host here, not single addresses.
+(deny network-outbound (remote tcp (string-append "localhost:" (param "CEF_PORT"))))
+(if (equal? (param "LOCALHOST") "deny")
+  (deny network-outbound (remote ip "localhost:*")))
+
+;; Unix domain sockets: only this prefix's wineserver and the system's syslog and
+;; DNS sockets. Other Wine sessions (maybe unsandboxed) and user agents stay out.
+(deny network-outbound (remote unix-socket))
+(allow network-outbound
+  (remote unix-socket (subpath (param "SERVER_DIR")))
+  (remote unix-socket (path-literal "/private/var/run/syslog"))
+  (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))
