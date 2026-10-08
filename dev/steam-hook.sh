@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
 # Runs after Mac Steam started with Steam Play turned on (steam_dev.cfg with platform
-# "linux", CEF debug port): waits for the Steam UI, sets the platform back to macOS
-# so Mac games keep their Mac depots, remaps the games mapped to neutron (Steam
-# marks them "invalid platform" after the switch), maps new games without a Mac
-# version (steam-sync.js) and adds the Compatibility tab with the neutron settings
-# to the game properties.
+# "linux", CEF debug port from STEAM_CEF_PORT): waits for the Steam UI, sets the
+# platform back to macOS so Mac games keep their Mac depots, remaps the games
+# mapped to neutron (Steam marks them "invalid platform" after the switch), maps
+# new games without a Mac version (steam-sync.js) and adds the Compatibility tab
+# with the neutron settings to the game properties (steam-panel.js).
 #
 # Started by the Steam.app start script that install.sh puts in place.
 # Usage: steam-hook.sh [tool name]    (default neutron_proton)
@@ -14,11 +14,10 @@ set -euo pipefail
 
 DEV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOOL="${1:-neutron_proton}"
-CEF_PORT=8080
 CONFIG_VDF="$HOME/Library/Application Support/Steam/config/config.vdf"
 
 say() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
-js()  { STEAM_CEF_PORT=$CEF_PORT node "$DEV_DIR/steamjs.mjs" "$1"; }
+js()  { node "$DEV_DIR/steamjs.mjs" "$1"; }
 # Larger snippets live in files: macOS bash 3.2 garbles long JS inside "$(...)".
 js_file() { js "$(sed -e "s/__TOOL__/$TOOL/g" -e "s/__MAPPED__/${MAPPED:-}/g" "$DEV_DIR/$1")"; }
 
@@ -35,7 +34,7 @@ mapped_apps() {
   ' "$CONFIG_VDF" 2>/dev/null | paste -sd, -
 }
 
-ui_up() { curl -sf "http://127.0.0.1:$CEF_PORT/json" 2>/dev/null | grep -q SharedJSContext; }
+ui_up() { node "$DEV_DIR/steamjs.mjs" 2>/dev/null | grep -q '^SharedJSContext |'; }
 for _ in $(seq 1 150); do ui_up && break; sleep 2; done
 ui_up || { say "Steam UI did not come up"; exit 1; }
 

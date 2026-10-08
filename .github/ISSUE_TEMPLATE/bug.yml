@@ -1,0 +1,69 @@
+name: Bug report
+description: A game or neutron itself does not work as expected
+labels: [bug]
+body:
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      description: "Apple menu > About This Mac, or `sw_vers`"
+      placeholder: "27.0"
+    validations:
+      required: true
+  - type: input
+    id: mac
+    attributes:
+      label: Mac model
+      placeholder: "MacBook Pro 14, M5 Max, 128 GB"
+    validations:
+      required: true
+  - type: input
+    id: steam
+    attributes:
+      label: Steam client version
+      description: "Steam > About Steam"
+    validations:
+      required: true
+  - type: input
+    id: game
+    attributes:
+      label: Game and app id
+      description: The app id is the number in the game's Steam store URL.
+      placeholder: "Abiotic Factor, 427410"
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: neutron commit
+      description: "`git rev-parse --short HEAD` in your neutron checkout"
+    validations:
+      required: true
+  - type: textarea
+    id: settings
+    attributes:
+      label: Settings
+      description: The game's launch options and the content of neutron.env, if you changed anything.
+  - type: textarea
+    id: happened
+    attributes:
+      label: What happened
+      description: Steps to reproduce and what you see.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >
+        Attach `~/Library/Logs/neutron/neutron-<appid>.log` and
+        `~/Library/Logs/neutron/steam-hook.log` (drag the files in here).
+        For more detail, start the game once with `NEUTRON_LOG=1` in its launch options.
+    validations:
+      required: true

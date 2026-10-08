@@ -1,4 +1,8 @@
-# neutron: design and findings
+# neutron reference
+
+How neutron works and why it is built this way. User documentation is in the
+[README](../README.md). Numbers in this document were measured on an M5 Max with
+macOS 27 unless noted.
 
 Goal: the native Mac Steam client runs Windows games like Proton does on Linux.
 No second Windows Steam inside Wine, no Rosetta. Apple Silicon only.
@@ -22,272 +26,337 @@ Wine 11.19, arm64 unix side, ARM64EC + aarch64 Windows side
      steamclient.dylib (Mac Steam)    login, ownership, achievements, cloud
 ```
 
-Everything except the game's own x86_64 code runs as arm64: Wine's system
-DLLs are ARM64EC, so calls from the game into Windows APIs leave the emulator
-right at the DLL boundary.
+Everything except the game's own x86_64 code runs as arm64: Wine's system DLLs
+are ARM64EC, so calls from the game into Windows APIs leave the emulator right
+at the DLL boundary.
 
-## Steam Play in the Mac client
+Steam runs `neutron waitforexitandrun <game exe>` in the game's folder.
+`tool/neutron` sets up the prefix (`compatdata/<appid>/pfx`, FEX registered as
+the x64 emulator, Steam registry keys, `steamclient64.dll`), applies the
+settings and starts the game through Proton's `steam.exe`. Each game gets its
+own prefix and its own app bundle (see Desktop integration).
+
+## Steam integration
+
+### Steam Play in the Mac client
 
 Checked on client 1788652215.
 
 - `steamclient.dylib` is universal and exports 5 of the 7 functions
-  lsteamclient loads (`Steam_IsKnownInterface` and
-  `Steam_NotifyMissingInterface` are optional in our patch).
+  lsteamclient loads. `Steam_IsKnownInterface` and
+  `Steam_NotifyMissingInterface` are optional in the proton patch.
 - Steam Play is compiled in (`CCompatManager`, `compatibilitytools.d`,
-  `CompatToolMapping`, all `STEAM_COMPAT_*` env vars). The settings page is only
+  `CompatToolMapping`, all `STEAM_COMPAT_*` env vars). The settings page is
   hidden in the UI by a `"linux" == PLATFORM` check in the steamui JS.
-- Proton's lsteamclient still has its `__APPLE__` path from 2018.
+- Proton's lsteamclient still has its `__APPLE__` path from 2018. The proton
+  patch makes it build against Wine on macOS, finds `steamclient.dylib` in
+  `Steam.AppBundle` (`NEUTRON_STEAMCLIENT_DYLIB`) and maps Windows virtual keys to
+  macOS key codes.
 
-How it is turned on (Steam.app start script from `install.sh`, then
-`dev/steam-hook.sh`):
+### Turning it on
+
+`install.sh` points Steam.app's `CFBundleExecutable` to a start script
+(`Contents/MacOS/steam_neutron`). Valve's `steam_osx` is bound to the bundle's
+`Info.plist`, so `steam_osx` and the bundle are signed ad hoc afterwards; Valve's
+files are backed up and `install.sh --uninstall` restores them. The start script
+and `dev/steam-hook.sh` do the following at every Steam start:
 
 1. **Compat layer flag.** `CCompatManager` enables the compat layer once in its
    constructor when the ConVar `@sSteamCmdForcePlatformType` is `linux`. Steam
    ignores it on the command line but reads `steam_dev.cfg` from
-   `Steam.AppBundle/Steam/Contents/MacOS/`.
-2. **Back to macos.** After startup `SteamClient.Console.ExecCommand(
-   "@sSteamCmdForcePlatformType macos")` sets the download platform back; the
-   compat flag stays on.
-3. **Tool discovery.** Steam scans `STEAM_EXTRA_COMPAT_TOOLS_PATHS` and
-   `/usr/local/share/steam/compatibilitytools.d`, not the Steam root.
-4. **Manifest.** `to_oslist` must be `linux`, tools are matched against the
-   platform Steam started with (`macos` fails with eAppError 29).
-5. **Mapping.** `SteamClient.Apps.SpecifyCompatTool(appid, "neutron_proton")` over the
-   CEF debug port (`-cef-enable-debugging -devtools-port 8080`). A global tool
-   (`SpecifyGlobalCompatTool`) alone does not unlock installing a Windows-only
-   game, the per-game mapping does.
-6. **Remap after the switch.** After step 2 Steam shows "invalid platform"
+   `Steam.AppBundle/Steam/Contents/MacOS/`. The start script writes that file
+   at every start, so a Steam update that removes it does no harm.
+2. **Tool discovery.** Steam scans `STEAM_EXTRA_COMPAT_TOOLS_PATHS` and
+   `/usr/local/share/steam/compatibilitytools.d`, not the Steam root. The start
+   script sets the first to `~/Library/Application Support/neutron/compatibilitytools.d`.
+3. **CEF debug port.** Steam starts with `-cef-enable-debugging -devtools-port
+   <port>` (8080 unless `install.sh --cef-port` is used; the start script exports
+   it as `STEAM_CEF_PORT`). `dev/steamjs.mjs` evaluates JS in the
+   SharedJSContext over this port.
+4. **Back to macos.** Once the UI is up, the hook runs
+   `SteamClient.Console.ExecCommand("@sSteamCmdForcePlatformType macos")`. The
+   download platform is macOS again, the compat flag stays on.
+5. **Manifest.** `to_oslist` in `toolmanifest.vdf` must be `linux`: tools are
+   matched against the platform Steam started with (`macos` fails with
+   eAppError 29).
+6. **Remap after the switch.** After step 4 Steam shows "invalid platform"
    (display status 14) for every mapped game until its mapping changes; setting
    the same tool again does nothing. `dev/steam-sync.js` maps all games from
    config.vdf's `CompatToolMapping` to a second name of the same tool
-   (`neutron_proton_remap`) and back, about 1 s for 200 games. Never clear the
-   mapping on the way: with no tool, Steam computes the Mac depots, which a
-   Windows-only game does not have, deletes the installed files ("0 mounted
-   depots", "341 deleted files" in `logs/content_log.txt`), and downloads the
-   whole game again once the tool is back. A running download restarts from 0.
+   (`neutron_proton_remap`) and back, about 1 s for 200 games. The switch also
+   marks installed games "Update Required"; the script queues an update, which
+   is a 0-byte check that puts the Windows depot back.
 7. **New games.** The same script maps every library game without a Mac version
    that is not in its seen list (`localStorage` key `neutron.seen` in the
-   SharedJSContext) at start and every 30 s while Steam runs. Games mapped, Mac
-   native, or set to none by the user are in the seen list and stay as they are.
-8. **UI reloads.** Steam reloads its SharedJSContext now and then (new
-   `CLIENT_SESSION`), which drops the injected tab and the watch. `steam-hook.sh`
-   stays running while Steam runs and injects both again (without the remap).
+   SharedJSContext), at start and every 30 s while Steam runs. Mapped games, Mac
+   games and games set to none by the user are in the seen list and stay as
+   they are.
+8. **Compatibility tab.** `dev/steam-panel.js` adds a "Compatibility" tab to the
+   game properties through `g_PopupManager` popup callbacks: the tool for the
+   game (Neutron or none) and the neutron settings. If Steam shows its own
+   Compatibility page, the settings go into that page instead.
+9. **UI reloads.** Steam reloads its SharedJSContext now and then (new
+   `CLIENT_SESSION`), which drops the tab and the new-game watch.
+   `steam-hook.sh` keeps running while Steam runs and injects both again
+   (without the remap). A hook from a newer Steam start takes over.
 
-Steam Cloud works like with Proton: the Mac client resolves the Windows roots
-of a compat tool game (`WinAppDataLocalLow`, `WinMyDocuments` and co.) to
-`compatdata/<appid>/pfx/drive_c/users/steamuser/...`, but only when the tool
-name contains "proton" (`strstr(name, "proton")` in `steamclient.dylib`).
-Otherwise every cloud file is skipped ("Steam Cloud out of sync"). So the
-internal tool name is `neutron_proton` (shown as "Neutron"), the prefix is
-`pfx`, and the tool runs Wine with `USER=steamuser`; older prefixes are
-migrated on start.
+A per-game mapping (`SteamClient.Apps.SpecifyCompatTool`) is required. A global
+tool (`SpecifyGlobalCompatTool`) alone does not unlock installing a Windows-only
+game.
 
-Per-game settings: Mac Steam hides the Compatibility page (the same `"linux"`
-platform check), so `dev/steam.sh` adds its own "Compatibility" tab to a game's
-properties at runtime (`dev/steam-panel.js`, through `g_PopupManager` popup
-callbacks in the SharedJSContext): the tool for the game (Neutron or none) and the
-neutron settings. It writes `NEUTRON_<NAME>=<value>` words
-into the launch options, which Steam appends to the tool's command line, and
-`tool/neutron` takes them out again. The idea of settings in the launch options
-comes from NotProton (github.com/NotProtonNot/NotProton), which patches Steam's
-UI in memory through an injected dylib; neutron changes no Steam file.
+**Never clear a mapping on the way.** With no tool, Steam computes the Mac
+depots, which a Windows-only game does not have, and deletes the installed files
+("0 mounted depots", "341 deleted files" in `logs/content_log.txt`). When the
+tool is back it downloads the whole game again, and a running download restarts
+from 0. For the same reason `install.sh --uninstall` leaves the mappings alone.
 
-Steam then downloads the Windows depots itself and runs
-`neutron waitforexitandrun <game exe>`. Mac Steam does not support
-`VAR=x %command%` launch options (AppError 46), so settings go into
-`neutron.env` next to the tool.
+### Settings in the launch options
+
+Mac Steam does not support `VAR=x %command%` launch options (AppError 46). The
+Compatibility tab writes `NEUTRON_<NAME>=<value>` words into the launch
+options instead. Steam appends them to the tool's command line, and
+`tool/neutron` exports them and removes them before the game starts. Settings
+for all games go into `neutron.env` next to the tool. The idea of settings in
+the launch options comes from
+[NotProton](https://github.com/NotProtonNot/NotProton), which patches Steam's UI
+in memory through an injected dylib; neutron injects JS over the CEF debug port
+instead.
+
+### Steam Cloud
+
+The Mac client resolves the Windows roots of a compat tool game
+(`WinAppDataLocalLow`, `WinMyDocuments` and co.) to
+`compatdata/<appid>/pfx/drive_c/users/steamuser/...`, but only when the tool name
+contains "proton" (`strstr(name, "proton")` in `steamclient.dylib`). Otherwise
+every cloud file is skipped ("Steam Cloud out of sync"). So the internal tool
+name is `neutron_proton` (shown as "Neutron"), the prefix is `pfx`, and the tool
+runs Wine with `USER=steamuser`.
+
+### Stop
+
+Steam's Stop sends TERM to the tool. The tool runs the game in the background
+and waits, so it handles TERM right away and ends the whole Wine session of the
+prefix with `wineserver -k`.
 
 ## macOS findings
 
-These are the problems a Windows-on-ARM64 stack hits on macOS and how neutron
-solves them. Measured on macOS 27, M5 Max.
+The problems a Windows-on-ARM64 stack hits on macOS, and how neutron solves
+them.
 
-- **x18.** Windows ARM64 keeps the TEB in x18, macOS clears x18 on syscalls
-  and on preemption. `NtCurrentTeb()` reads the TEB from a pthread TSD slot via
+- **x18.** Windows ARM64 keeps the TEB in x18, macOS clears x18 on syscalls and
+  on preemption. `NtCurrentTeb()` reads the TEB from a pthread TSD slot via
   `TPIDRRO_EL0` instead (Wine `winnt.h`, the llvm-mingw `winnt.h`, FEX). The
-  prebuilt llvm-mingw CRT startup objects are rebuilt with that header. A fault
-  handler safety net covers the rest (libc++abi exception TLS).
+  prebuilt llvm-mingw CRT startup objects are rebuilt with that header
+  (`build.sh`). A fault handler covers the rest (libc++abi exception TLS).
 - **`__PAGEZERO`.** arm64 macOS kills binaries whose `__PAGEZERO` ends below
-  4 GB, so nothing lives there. `KUSER_SHARED_DATA` moves to `0x7ffffdfe0000`;
-  the page after it holds the TSD slot offset and the PEB pointer for PE code.
+  4 GB, so nothing can live there. `KUSER_SHARED_DATA` moves to
+  `0x7ffffdfe0000`; the page after it holds the TSD slot offset and the PEB
+  pointer for PE code (wine 0001, 0002, 0003).
 - **execve** returns EFAULT for strings just below `0x7ffffe000000` (Wine's
-  thread stacks), exec env strings go to the heap.
+  thread stacks), so exec env strings go to the heap.
 - **JIT memory.** Write+exec needs `MAP_JIT`, which cannot be combined with
   `MAP_FIXED`, and the per-thread write/exec switch does not survive a signal
   handler. Wine maps FEX's code buffers with `MAP_JIT` at a hint address, FEX
   switches to write mode around code emission and patching (`JITWriteScope`).
-  Other RWX requests get RW.
+  Other RWX requests get RW (wine 0003, fex 0001).
 - **`mach_vm_map`** answers `KERN_INVALID_ADDRESS` above 4 GB near the main
   binary; Wine treats that as "in use" and keeps searching.
 - **Free area search.** Wine finds free address space by trying `mach_vm_map`
   at each 64K step while holding `virtual_mutex`. Metal, system libraries and FEX
-  map a lot Wine does not track, so one allocation took thousands of syscalls and
-  every thread needing the lock stalled (Ready or Not: 1.5-1.9 s freezes every few
-  seconds in `RegisterRawInputDevices` device ioctls, 74 s black screen at start).
-  On a collision Wine now asks `mach_vm_region` for the colliding mapping and
-  skips it in one step: first frame after 7.8 s, no periodic freezes.
+  map a lot that Wine does not track, so one allocation took thousands of
+  syscalls and every thread that needed the lock stalled (Ready or Not: 1.5 to
+  1.9 s freezes every few seconds, a 74 s black screen at start). On a collision
+  Wine asks `mach_vm_region` for the colliding mapping and skips it in one step:
+  first frame after 7.8 s, no periodic freezes (wine 0003).
 - **16K pages.** Wine shows Windows 4K pages and gives all 4K pages of a host
-  page the most permissive protection of them. FEX's 4K guard pages never
-  faulted: a call-return stack underflow (Unity/Mono) ran into the next
-  mapping and every exception handler faulted again until the stack overflowed.
-  FEX guard pages are 16K now.
+  page the most permissive protection among them, so FEX's 4K guard pages never
+  faulted: a call-return stack underflow (Unity/Mono) ran into the next mapping
+  and every exception handler faulted again until the stack overflowed. FEX
+  guard pages cover a whole 16K host page (fex 0002).
 - **CPU features.** macOS traps EL0 reads of the ARM ID registers. Wine builds
-  the `CP 40xx` registry values from `hw.optional.arm.FEAT_*`, otherwise FEX
-  hides SSE4.2 and Unreal refuses to start.
+  the `CP 40xx` registry values from `hw.optional.arm.FEAT_*`; without them FEX
+  hides SSE4.2 and Unreal refuses to start (wine 0003).
 - **Hardware TSO** (the x86 memory order Rosetta uses) cannot be enabled for a
-  normal process, FEX emulates it with barriers.
-- **Never `cp` over a loaded Mach-O**, macOS kills the process with "Code
+  normal process, FEX emulates it with barriers (see `NEUTRON_FEX_TSO`).
+- **Display lock deadlock.** The game thread held win32u's non-recursive display
+  lock in `apply_display_settings` while `macdrv_set_display_mode` waited for the
+  main thread and handled a `QUERY_MIN_MAX_INFO` event on the same thread, which
+  called `GetSystemMetrics` and took the lock again. The lock is recursive for
+  its owner (wine 0013). Abiotic Factor hung at startup in 3 of 3 runs before,
+  in 0 of 7 after; Gamble With Your Friends started 20 of 20.
+- **Never `cp` over a loaded Mach-O.** macOS kills the process with "Code
   Signature Invalid". Delete first, then copy.
 - **SIP strips `DYLD_*`** when a system binary like `/usr/bin/perl` is in
-  between. GnuTLS and FreeType are bundled into `files/lib`.
+  between, so Homebrew libraries are not found reliably. GnuTLS and FreeType are
+  bundled into `files/lib`.
 
 ## Desktop integration
 
 - **Game Mode** needs a real app bundle with the games category. Windows
   processes start from `files/lib/wine/aarch64-unix/Neutron.app` (a copy of the
-  loader with `tool/Neutron-Info.plist`), borderless fullscreen windows go into
-  macOS native fullscreen (`NEUTRON_NATIVE_FULLSCREEN`).
-- The menu bar shows the game name from Steam's app manifest
-  (`NEUTRON_APP_NAME`), not "Wine".
-- Each game gets its own app bundle in its prefix folder
+  loader with `tool/Neutron-Info.plist`, wine 0006).
+- **Per-game app bundle.** Each game gets its own bundle in its prefix folder
   (`compatdata/<appid>/Neutron.app`, loader hard-linked from the runtime, own
   bundle ID, the icon from the game's exe via `tool/peicon.py` and `sips`). Wine
-  starts the game's processes from it (`NEUTRON_APP_BUNDLE`, the loader finds
+  starts the game's processes from it (`NEUTRON_APP_BUNDLE`; the loader finds
   ntdll through `NEUTRON_NTDLL`), so the Dock, Cmd+Tab and window switchers show
-  the game's name and icon.
-- Cmd+Tab stays with macOS: games cannot register Alt+Tab as a hotkey (Command
-  is Windows Alt), and windows in native fullscreen keep the normal window level
-  so the switcher and the Dock draw above them.
-- Every click re-activates the app (cause unknown). Wine used to answer each
-  activation with a full display resync (registry rewrite, EDID reads, 100 to
-  170 ms on the game thread); it now skips the resync when the displays did not
-  change.
-- No real display mode switches: DXMT keeps the desktop mode when a game goes
-  exclusive fullscreen at another resolution and the Metal layer scales the
-  backbuffer to the screen (like Proton's fullscreen hack). Before, games made
-  the MacBook display flicker through several modes at start.
-- Notch displays (MacBook Pro): macOS puts native fullscreen windows below the
-  notch and keeps the menu bar next to it, while Windows sees the whole screen;
-  Unreal then fought over the window size (white screen). There games get a plain
-  window over the whole screen and the app hides menu bar and Dock while active.
-  External displays keep native fullscreen.
-- Wine's Retina mode breaks Unreal (white window), so it stays off: on a HiDPI
-  display games see points (MacBook 1285x835 at render scale 0.85). Open point.
-- Steam's Stop: the tool runs the game in the background and ends the whole
-  Wine session of the prefix with `wineserver -k` on TERM.
-
-## Performance
-
-- **Startup hang (display lock).** Abiotic Factor hung at startup after 2-3 FPS lines
-  (found with `dev/bench/hang-watch.sh`, which samples and lldb-dumps a stalled
-  game). GameThread held win32u's non-recursive display lock in
-  `apply_display_settings` while `macdrv_set_display_mode` waited for the main
-  thread and handled a QUERY_MIN_MAX_INFO on the same thread, which called
-  GetSystemMetrics and locked again (self-deadlock). Patch 0013 makes the lock
-  recursive for its owner. AF reaches the game 7 of 7 (was 0 of 3), Gamble 20 of 20.
-- **FEX TSO.** Fast mode is the default. Strict mode (`NEUTRON_FEX_TSO=strict`,
-  vector and memcpy TSO) costs a lot in CPU-bound games (Gamble With Your
-  Friends: 58 FPS strict, 98 FPS fast in the same view) and is set per game
-  where it fixes races (`APP_TSO_427410=strict`: Abiotic Factor deadlocks
-  between GameThread and SlateLoadingThread at startup without it).
-- **FPCR on native calls.** An x64 to ARM64EC call used to cost 25-30 ns because
-  FEX wrote FPCR twice (clear AFP bits on exit, set NEP/AH on re-entry). Now
-  EnterEC leaves AFP alone, ExitFunctionEC and SpillStaticRegs skip the write
-  when the bits are already clear, and every IR block with vector register
-  operands ensures NEP/AH at its start (mrs, tbnz, rare orr+msr). Native calls
-  from integer code cost about 5 ns, d3d11 draw loop +19% FPS (patch
-  `0003-afp-lazy-native-transition`). Do not use `FEX_HOSTFEATURES=disableafp`,
-  it slows scalar float code.
-- **Wineserver QoS and timers.** The wineserver thread runs at
-  QOS_CLASS_USER_INTERACTIVE, normal threads use latency tier 0 (tier 1 doubles
-  timer leeway), and a non-alertable NtDelayExecution waits on a one-shot
-  critical kqueue timer instead of select(). Sleep(1) went from 1.49 ms to
-  1.04 ms; server round trips did not change. `NEUTRON_PRECISE_TIMERS=0`
-  switches the timer part off (patch `0012-server-qos-precise-timers`).
-- **Uncapped Gamble profile (bench only).** The Gamble menu sits at the 160 Hz
-  display cap, also with strict TSO (4.9 ms CPU per frame, still 160 FPS), so FPS
-  hid every gain. `NEUTRON_BENCH_NOVSYNC=1` (patch `0007-bench-novsync`, never set
-  by the tool) makes DXMT draw the present pass into an offscreen texture and skip
-  `nextDrawable`/present, because `Present(0)` and `displaySyncEnabled = NO` do not
-  lift the compositor's drawable pacing. `dev/bench/run.sh` profile `gwyfs`
-  (strict TSO plus this switch) gives `gwyfs.fps` (about 464, spread 6%),
-  `wall_ms_per_frame` (2.16) and `cpu_per_frame_ms` (4.58). Limits: the menu is
-  light, strict only costs about 3% there (464 against 476 FPS fast), so a TSO
-  change is hardly visible; the in-game view is not driveable. New metric
-  `wall_ms_per_frame` is also written for the other game profiles.
-- **Lazy DXGI output description.** `MTLDXGIOutputImpl` queried the ColorSync profile
-  (XPC round trip, about 0.45 ms) in its constructor, and Gamble creates outputs every
-  frame through `GetContainingOutput`. The query now runs once, in `GetDesc1` (patch
-  `0008-lazy-display-desc-cfrelease`), and the unix side releases the ColorSync profiles
-  and tag data it leaked. `EnumOutputs` 0.455 ms to 0.0003 ms; `gwyfs.fps` 480 to 575
-  (+20%), CPU per frame 4.43 to 3.95 ms.
-- **x64 syscall stub.** The ARM64EC x64 syscall stubs (`__ASM_SYSCALL_FUNC`) tested
-  `0x7ffe0308`, which faulted on every direct Nt call since KUSER moved above 4 GB
-  (2.4 us per call, mostly signal handling). The test is now `cmp %eax,%eax` plus a
-  nop of the same size (jne never taken), and `arm64x_check_call` in
-  `signal_arm64ec.c` accepts both forms. Direct x64 `Nt*` calls: 2.4 us to 0.17 us.
-- **LLVM without assertions.** The LLVM 15 behind DXMT airconv is built with
-  `LLVM_ENABLE_ASSERTIONS=Off`. Converting 68 DXBC shaders: 0.525 s to 0.472 s (-10%),
-  winemetal.so 27 MB to 22 MB, output unchanged. No visible effect on game start.
-- **DXMT caches in compatdata.** The shader cache (`shaders_320.db`) and the Metal PSO
-  cache (`com.apple.metal`) live in `compatdata/<appid>/dxmt-cache` (tool sets
-  `DXMT_SHADER_CACHE_PATH`, patch 0006 makes dxgi use it for the Metal cache too)
-  instead of the macOS user cache dir, which the system can purge. The old caches are
-  copied once, never deleted. Durability only, no speed change measured.
+  the game's name and icon. The menu bar shows the game name from Steam's app
+  manifest (`NEUTRON_APP_NAME`, wine 0007).
+- **Native fullscreen.** Borderless fullscreen windows go into macOS native
+  fullscreen, their own Space with Game Mode (`NEUTRON_NATIVE_FULLSCREEN`,
+  wine 0009).
+- **Notch displays.** On a MacBook Pro, macOS puts native fullscreen windows
+  below the notch and keeps the menu bar next to it, while Windows sees the whole
+  screen; Unreal then fought over the window size (white screen). There games get
+  a plain window over the whole screen and the app hides menu bar and Dock while
+  active. External displays keep native fullscreen (wine 0007, 0009).
+- **Cmd+Tab stays with macOS.** Games cannot register Alt+Tab as a hotkey
+  (Command is Windows Alt), and windows in native fullscreen keep the normal
+  window level, so the switcher and the Dock draw above them (wine 0008, 0009).
+- **Activation.** macOS re-activates the app on every click (cause unknown).
+  Wine answered each activation with a full display resync (registry rewrite,
+  EDID reads, 100 to 170 ms on the game thread). It skips the resync when the
+  displays did not change (wine 0007).
+- **No display mode switches.** DXMT keeps the desktop mode when a game goes
+  exclusive fullscreen at another resolution, and the Metal layer scales the
+  backbuffer to the screen, like Proton's fullscreen hack. Real mode switches
+  made the display flicker through several modes at start (dxmt 0009).
+- **Retina mode** in Wine breaks Unreal (white window), so it stays off. On a
+  HiDPI display games see points (a MacBook display is 1285x835 at render scale
+  0.85).
 - **Render scale.** `NEUTRON_RENDER_SCALE` (default 0.85) scales all Windows
-  coordinates in winemac.drv the way Retina mode does with factor 2, so games
-  see a 2924x1224 desktop on a 3440x1440 display. The tool sets the DXMT MetalFX
-  factor to 1/scale (D3D11 and D3D12), and the output is native size again.
-  Only the desktop display mode is scaled; real mode switches are not.
-- **Raw mouse.** Wine took the game's raw input (`WM_INPUT`, mouse look in Unity
-  and Unreal) from the NSEvent deltas, which carry the macOS pointer acceleration
-  and the render scale (mouse look 15% slower at 0.85). Patch 0014 reads the device
+  coordinates in winemac.drv the way Retina mode does with factor 2, so games see
+  a 2924x1224 desktop on a 3440x1440 display. The tool sets the DXMT MetalFX
+  factor to 1/scale (D3D11, and D3D12 through dxmt 0005), so the output is native
+  size again. Only the desktop display mode is scaled (wine 0010).
+- **Raw mouse.** Games read mouse look from raw input (`WM_INPUT`). Wine took it
+  from the NSEvent deltas, which carry the macOS pointer acceleration and the
+  render scale (mouse look 15% slower at 0.85). winemac.drv reads the device
   deltas from GameController `GCMouse` (`cocoa_rawmouse.m`, covers mice and the
   internal trackpad) and sends them as raw input only (`SEND_HWMSG_RAWINPUT`, as
   winewayland does); the cursor still follows the macOS cursor. GameController
   counts y up. `NEUTRON_RAW_MOUSE=0` turns it off, `WINEDEBUG=+rawmouse` logs the
-  devices.
-- **Direct presentation.** A fullscreen game is shown "Direct" (no compositor pass,
-  Metal HUD top right) or "Composited". Changes for Direct, not yet verified on
-  screen (`dev/direct-test.sh` shows each case with the HUD): 10-bit RGB backbuffers
-  (Unreal's default) get a BGR10A2 layer, the display's own order (DXMT patch 0010,
-  `NEUTRON_LAYER_FORMAT=keep|bgra8` for comparison); the drawable always has the
-  view's size in screen pixels, which winemac.drv puts on the layer, and the present
-  pass scales the backbuffer into it (patch 0011, `NEUTRON_NATIVE_DRAWABLE=0` turns it
-  off). With `WINEDEBUG=warn+macdrv` winemac.drv logs the windows visible when a
-  window enters fullscreen and every window shown over it (Unreal helper windows on
-  top force compositing).
-- **Measuring.** `NEUTRON_FPS_LOG=1` writes FPS and the slowest frame per
-  second to the game log, `NEUTRON_HUD=2` shows the Metal HUD with DXMT's
-  per-frame statistics.
-- **HUD off for measuring.** `NEUTRON_HUD=2` (Metal HUD plus DXMT per-frame
-  statistics, loads libMetalMetricsInterpose) costs about 11% game CPU per frame in
-  the Gamble menu (4.56 ms without, 5.09 ms with, 3 runs each, FPS stays at the
-  display cap). `dev/bench/run.sh` unsets `NEUTRON_HUD`/`MTL_HUD_*` and records
-  them as `meta.hud_unset`; `BENCH_KEEP_HUD=1` keeps them. No runtime change.
+  devices (wine 0014).
+- **Direct presentation.** macOS shows a fullscreen game either "Direct" (no
+  compositor pass) or "Composited"; the Metal HUD shows which in its top right.
+  Two changes aim at Direct:
+  10-bit RGB backbuffers (Unreal's default) get a BGR10A2 layer, the display's own
+  order (dxmt 0010, `NEUTRON_LAYER_FORMAT=keep|bgra8` for comparison), and the
+  drawable always has the view's size in screen pixels, which winemac.drv puts
+  on the layer, with the present pass scaling the backbuffer into it (dxmt 0011,
+  `NEUTRON_NATIVE_DRAWABLE=0` turns it off). With `WINEDEBUG=warn+macdrv`
+  winemac.drv logs the windows visible when a window enters fullscreen and every
+  window shown over it (Unreal helper windows on top force compositing).
+  `dev/direct-test.sh` runs each case with the HUD.
+
+## Performance work
+
+Benchmarks and their conditions: [dev/bench/README.md](../dev/bench/README.md).
+`NEUTRON_FPS_LOG=1` writes FPS and the slowest frame per second to the game
+log, `NEUTRON_HUD=2` shows the Metal HUD with DXMT's per-frame statistics.
+
+- **FEX TSO.** Fast mode is the default. Strict mode (`NEUTRON_FEX_TSO=strict`,
+  vector and memcpy TSO) costs a lot in CPU-bound games (Gamble With Your
+  Friends: 58 FPS strict, 98 FPS fast in the same view) and is set per game
+  where it fixes races (`APP_TSO_427410=strict`: Abiotic Factor deadlocks between
+  GameThread and SlateLoadingThread at startup without it).
+- **FPCR on native calls.** An x64 to ARM64EC call cost 25 to 30 ns because FEX
+  wrote FPCR twice (clear the AFP bits on exit, set NEP/AH on re-entry). EnterEC
+  leaves AFP alone, ExitFunctionEC and SpillStaticRegs skip the write when the
+  bits are already clear, and every IR block with vector register operands
+  ensures NEP/AH at its start (mrs, tbnz, rarely orr+msr). Native calls from
+  integer code cost about 5 ns, the d3d11 draw loop gained 19% FPS (fex 0003).
+  `FEX_HOSTFEATURES=disableafp` is no alternative, it slows scalar float code.
+- **x64 syscall stubs.** The ARM64EC x64 syscall stubs (`__ASM_SYSCALL_FUNC`)
+  tested `0x7ffe0308`, which faults since KUSER lives above 4 GB, on every
+  direct Nt call (2.4 us per call, mostly signal handling). The test is
+  `cmp %eax,%eax` plus a nop of the same size (the jne is never taken), and
+  `arm64x_check_call` in `signal_arm64ec.c` accepts both forms. Direct x64 `Nt*`
+  calls: 0.17 us (wine 0002, 0003).
+- **Wineserver QoS and timers.** The wineserver thread runs at
+  `QOS_CLASS_USER_INTERACTIVE`, normal threads use latency tier 0 (tier 1
+  doubles timer leeway), and a non-alertable `NtDelayExecution` waits on a
+  one-shot critical kqueue timer instead of `select()`. `Sleep(1)` takes 1.04 ms
+  instead of 1.49 ms; server round trips do not change.
+  `NEUTRON_PRECISE_TIMERS=0` switches the timer part off (wine 0012).
+- **Lazy DXGI output description.** `MTLDXGIOutputImpl` queried the ColorSync
+  profile (an XPC round trip, about 0.45 ms) in its constructor, and Gamble
+  creates outputs every frame through `GetContainingOutput`. The query runs once,
+  in `GetDesc1`, and the unix side releases the ColorSync profiles and tag data it
+  leaked. `EnumOutputs`: 0.455 ms to 0.0003 ms. Gamble uncapped (`gwyfs`): 480 to
+  575 FPS, CPU per frame 4.43 to 3.95 ms (dxmt 0008).
+- **LLVM without assertions.** The LLVM 15 behind DXMT's airconv is built with
+  `LLVM_ENABLE_ASSERTIONS=Off`. Converting 68 DXBC shaders: 0.525 s to 0.472 s
+  (-10%), winemetal.so 27 MB to 22 MB, same output.
+- **DXMT caches in compatdata.** The shader cache (`shaders_320.db`) and the
+  Metal PSO cache (`com.apple.metal`) live in `compatdata/<appid>/dxmt-cache`
+  (the tool sets `DXMT_SHADER_CACHE_PATH`, dxmt 0006 uses it for the Metal cache
+  too) instead of the macOS user cache dir, which the system can purge. This is
+  for durability; no speed change was measured.
+- **HUD cost.** `NEUTRON_HUD=2` loads libMetalMetricsInterpose and costs about
+  11% game CPU per frame in the Gamble menu. Benchmarks run without it.
 
 ## Patches
 
-All third-party code is fetched at build time and patched (`build.sh`).
+All third-party code is fetched at build time at a pinned version and patched
+by `build.sh`. Wine and llvm-mingw patches are applied with `patch -p1`, FEX and
+DXMT patches with `git apply`, all in file name order.
 
-| Folder | Upstream | What |
-|---|---|---|
-| `patches/wine` | Wine 11.19 | configure for arm64 macOS, KUSER above 4 GB, ntdll TEB/JIT/exec/ID registers, winemac for DXMT, makedep, Game Mode loader, app name, Cmd+Tab, native fullscreen, render scale |
-| `patches/proton` | Proton lsteamclient, steam_helper | lsteamclient on macOS (optional exports, libc++, key map, `NEUTRON_STEAMCLIENT_DYLIB`), libc++ link, `steam://` URLs via `open` |
-| `patches/llvm-mingw` | llvm-mingw 20260908 | `NtCurrentTeb()` via TSD in `winnt.h` |
-| `patches/fex` | FEX 2610 | TEB via TSD, `MAP_JIT` write scopes, macOS UnixLib, 16K guard pages |
-| `patches/dxmt` | DXMT main | D3D12 clock calibration, no `thread_local`, neutron HUD lines, FPS log, D3D12 MetalFX |
+| Upstream | Version |
+|---|---|
+| Wine | 11.19 |
+| Proton (lsteamclient, steam_helper) | `proton_11.0`, 5b89db9 |
+| FEX | FEX-2610, 14c9268 |
+| DXMT | e94c312 (2026-10-06) |
+| LLVM (for DXMT airconv) | 15.0.7 |
+| llvm-mingw | 20260908, CRT startup objects rebuilt from mingw-w64 9f55f4a |
+| Wine Mono | 11.3.0 |
+
+| Patch | What |
+|---|---|
+| `wine/0001-configure-native-macos` | configure: loader link flags for arm64 macOS (`__PAGEZERO` above 4 GB, 16K segments) |
+| `wine/0002-kuser-shared-data-above-4g` | `KUSER_SHARED_DATA` at `0x7ffffdfe0000`, x64 syscall stub test |
+| `wine/0003-ntdll-darwin-arm64` | ntdll: TEB via TSD, `MAP_JIT`, exec env strings, free area search, CPU feature registry values |
+| `wine/0004-winemac-dxmt-metal-view` | Metal view helpers for DXMT's winemetal.so |
+| `wine/0005-makedep-version-res-arm64ec` | makedep: version resources for arm64ec-only modules |
+| `wine/0006-loader-game-mode` | Loader in an app bundle (games category, per-game bundle) |
+| `wine/0007-winemac-app-name` | Game name in menu bar and Dock, notch handling, no display resync on activation |
+| `wine/0008-winemac-keep-cmd-tab` | Cmd+Tab stays with macOS |
+| `wine/0009-winemac-native-fullscreen` | Borderless fullscreen windows in macOS native fullscreen |
+| `wine/0010-winemac-render-scale` | `NEUTRON_RENDER_SCALE` |
+| `wine/0011-appwiz-no-addon-dialog` | No Mono/Gecko download dialog |
+| `wine/0012-server-qos-precise-timers` | Wineserver QoS, latency tier, kqueue sleep timers |
+| `wine/0013-win32u-recursive-display-lock` | Display lock recursive for its owner |
+| `wine/0014-winemac-raw-mouse` | Raw mouse input from GameController `GCMouse` |
+| `proton/0001-lsteamclient-macos` | lsteamclient on macOS: optional exports, libc++, key map, `NEUTRON_STEAMCLIENT_DYLIB` |
+| `proton/0002-lsteamclient-link-libcxx` | Links lsteamclient.so against libc++ |
+| `proton/0003-steam-helper-macos` | steam.exe opens `steam://` URLs with `open` |
+| `fex/0001-macos-teb-tsd-and-map-jit` | TEB via TSD, `MAP_JIT` write scopes, macOS UnixLib |
+| `fex/0002-host-page-guards` | Guard pages cover a whole host page |
+| `fex/0003-afp-lazy-native-transition` | Fewer FPCR writes on x64 to ARM64EC calls |
+| `llvm-mingw/0001-ntcurrentteb-tsd` | `NtCurrentTeb()` via TSD in `winnt.h` |
+| `dxmt/0001-d3d12-clock-calibration` | D3D12 timestamp frequency and clock calibration |
+| `dxmt/0002-no-thread-local` | No `thread_local` in the occlusion query code |
+| `dxmt/0003-neutron-hud-line` | neutron lines in the Metal HUD, statistics with `NEUTRON_HUD=2` |
+| `dxmt/0004-neutron-fps-log` | `NEUTRON_FPS_LOG` |
+| `dxmt/0005-d3d12-metalfx-spatial` | MetalFX spatial upscaling for D3D12 swapchains |
+| `dxmt/0006-cache-in-compatdata` | Metal cache in `DXMT_SHADER_CACHE_PATH` |
+| `dxmt/0007-bench-novsync` | `NEUTRON_BENCH_NOVSYNC` (benchmarks only) |
+| `dxmt/0008-lazy-display-desc-cfrelease` | ColorSync query once per output, leaks fixed |
+| `dxmt/0009-no-display-mode-switch` | No real display mode switches |
+| `dxmt/0010-display-layer-format` | BGR10A2 layer for 10-bit backbuffers, `NEUTRON_LAYER_FORMAT` |
+| `dxmt/0011-native-drawable-size` | Drawable in screen pixels, `NEUTRON_NATIVE_DRAWABLE` |
 
 ## Open points
 
-- Black loading screen in Abiotic Factor: `LoadMap` stalls up to 60 s while the
-  GPU runs compute work.
-- 32-bit games do not run and are out of scope: their image must load below 4 GB,
-  which arm64 macOS does not allow (BO2 `t6mp.exe`: `map_free_area` in
-  0x10000-0x7fff0001 fails, c0000017). Only a Rosetta x86_64 Wine could run them.
-- Allocations below 4 GB fail (seen once, relocated fine).
-- Overlay and anti-cheat (EAC, BattlEye) will not work.
-- Whether a Steam client update removes `steam_dev.cfg`.
-- License: the lsteamclient folder is under the Steamworks SDK license, not
-  open source. The repo only holds patches and fetches Valve's code at build
-  time; check this before publishing binaries.
+- Abiotic Factor shows a black screen while loading a map: `LoadMap` stalls up to
+  60 s while the GPU runs compute work.
+- 32-bit games do not run and are out of scope: their image must load below
+  4 GB, which arm64 macOS does not allow (BO2 `t6mp.exe`: `map_free_area` in
+  0x10000-0x7fff0001 fails with c0000017). Only a Rosetta x86_64 Wine could run
+  them.
+- Allocations below 4 GB fail (seen once, the image relocated fine).
+- The Steam overlay and anti-cheat (EAC, BattlEye) do not work.
+- Direct presentation: the changes in dxmt 0010 and 0011 still need to be
+  verified on screen with `dev/direct-test.sh`.
+- D3D12 support is being worked on; a section on it will follow.

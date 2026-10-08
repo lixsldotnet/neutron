@@ -8,7 +8,8 @@
 #     Steam's own restart) comes up with Steam Play for neutron: Steam.app's
 #     CFBundleExecutable points to Contents/MacOS/steam_neutron, which turns Steam
 #     Play on, starts dev/steam-hook.sh (platform back to macOS, games remapped and
-#     new games mapped, Compatibility tab) and runs Valve's unchanged steam_osx with the CEF debug port.
+#     new games mapped, Compatibility tab) and runs Valve's unchanged steam_osx with
+#     the CEF debug port (localhost).
 #     Valve's steam_osx is bound to Info.plist, so it and the bundle are signed ad hoc
 #     afterwards (like NotProton does); steam_osx, Info.plist and _CodeSignature are
 #     backed up first and --uninstall puts Valve's originals back.
@@ -16,9 +17,16 @@
 #
 # A Steam client update can replace Steam.app: run ./install.sh again.
 #
-# Usage: ./install.sh [--dist <dist/neutron>] [--dev] [--no-start]
+# Usage: ./install.sh [--dist <dist/neutron>] [--dev] [--no-start] [--cef-port <port>]
 #        ./install.sh --uninstall      (puts Steam.app back, removes neutron, keeps game prefixes)
-# Default build: .native-build/dist/neutron (./build.sh)
+#   --dist      tool folder from build.sh (default .native-build/dist/neutron)
+#   --dev       links tool/neutron from this repo instead of copying it (see below)
+#   --cef-port  CEF debug port of Steam (default 8080), the helper scripts read it
+#               from the start script
+#
+# --uninstall leaves the games mapped to neutron_proton in Steam's config on
+# purpose: setting an installed Windows-only game to no tool makes Steam delete
+# its files.
 #
 set -euo pipefail
 
@@ -30,11 +38,9 @@ BACKUP="$HOME_DIR/steam-app-backup"
 LOGS="$HOME/Library/Logs/neutron"
 STEAM_APP="/Applications/Steam.app"
 STEAM_BIN="$HOME/Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/MacOS"
-# from earlier versions of this script
-OLD_APP="$HOME/Applications/Steam (Neutron).app"
-OLD_AGENT="$HOME/Library/LaunchAgents/net.lixsl.neutron.steam.plist"
 
 DIST="$ROOT/.native-build/dist/neutron"
+CEF_PORT=8080
 DEV=0 START=1 UNINSTALL=0
 
 say() { printf '\033[36m> %s\033[0m\n' "$*"; }
@@ -45,17 +51,21 @@ while [ $# -gt 0 ]; do
     --dist) DIST="$2"; shift 2 ;;
     --dev) DEV=1; shift ;;
     --no-start) START=0; shift ;;
+    --cef-port) CEF_PORT="$2"; shift 2 ;;
     --uninstall) UNINSTALL=1; shift ;;
     *) die "unknown option $1" ;;
   esac
 done
+case "$CEF_PORT" in ''|*[!0-9]*) die "--cef-port needs a port number" ;; esac
 
+# Both Valve binaries are called steam_osx: the bootstrapper in Steam.app and the
+# client in Steam.AppBundle. Neither may run while Steam.app is changed.
 quit_steam() {
-  pgrep -f "Steam.AppBundle/Steam/Contents/MacOS/steam_osx" >/dev/null || return 0
+  pgrep -x steam_osx >/dev/null || return 0
   say "Quitting Steam"
   osascript -e 'quit app "Steam"' >/dev/null 2>&1 || true
   for _ in $(seq 1 30); do
-    pgrep -f "Steam.AppBundle/Steam/Contents/MacOS/steam_osx" >/dev/null || return 0
+    pgrep -x steam_osx >/dev/null || return 0
     sleep 1
   done
   die "Steam did not quit, quit it and run this again"
@@ -63,14 +73,6 @@ quit_steam() {
 
 lsregister() {
   /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$STEAM_APP"
-}
-
-remove_old() {
-  rm -rf "$OLD_APP"
-  if [ -f "$OLD_AGENT" ]; then
-    launchctl bootout "gui/$(id -u)" "$OLD_AGENT" 2>/dev/null || true
-    rm -f "$OLD_AGENT"
-  fi
 }
 
 unpatch_steam() {
@@ -104,14 +106,16 @@ patch_steam() {
   node_dir="$(dirname "$(command -v node)")"
   cat > "$STEAM_APP/Contents/MacOS/steam_neutron" <<EOF
 #!/bin/bash
-# neutron: starts Valve's steam_osx with Steam Play for neutron turned on. Installed by
-# neutron's install.sh; './install.sh --uninstall' puts Steam.app back.
+# Start script from neutron's install.sh: starts Valve's steam_osx with Steam Play for
+# neutron turned on. './install.sh --uninstall' puts Steam.app back.
 N="\$HOME/Library/Application Support/neutron"
 export STEAM_EXTRA_COMPAT_TOOLS_PATHS="\$N/compatibilitytools.d"
+# CEF debug port, read by the helper scripts (steamjs.mjs)
+export STEAM_CEF_PORT=$CEF_PORT
 printf '@sSteamCmdForcePlatformType linux\\n' > "\$HOME/Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/MacOS/steam_dev.cfg" 2>/dev/null
 mkdir -p "\$HOME/Library/Logs/neutron"
 PATH="$node_dir:/usr/bin:/bin:/usr/sbin:/sbin" "\$N/bin/steam-hook.sh" >> "\$HOME/Library/Logs/neutron/steam-hook.log" 2>&1 &
-exec "\$(dirname "\$0")/steam_osx" -cef-enable-debugging -devtools-port 8080 "\$@"
+exec "\$(dirname "\$0")/steam_osx" -cef-enable-debugging -devtools-port "\$STEAM_CEF_PORT" "\$@"
 EOF
   chmod +x "$STEAM_APP/Contents/MacOS/steam_neutron"
   plutil -replace CFBundleExecutable -string steam_neutron "$plist"
@@ -124,10 +128,10 @@ EOF
 if [ "$UNINSTALL" = 1 ]; then
   quit_steam
   unpatch_steam
-  remove_old
   rm -rf "$BIN" "$TOOL_DIR"
   rm -f "$STEAM_BIN/steam_dev.cfg"
   say "Removed. Game prefixes stay in steamapps/compatdata/<appid>/pfx."
+  say "Games stay mapped to neutron_proton: setting an installed Windows-only game to no tool makes Steam delete its files."
   exit 0
 fi
 
@@ -136,11 +140,16 @@ command -v node >/dev/null || die "node is needed (brew install node)"
 
 say "Installing the compat tool"
 mkdir -p "$TOOL_DIR" "$LOGS"
-for f in neutron files compatibilitytool.vdf toolmanifest.vdf; do rm -rf "${TOOL_DIR:?}/$f"; done
+for f in neutron peicon.py files compatibilitytool.vdf toolmanifest.vdf; do rm -rf "${TOOL_DIR:?}/$f"; done
 if [ "$DEV" = 1 ]; then
-  [ -d "$ROOT/.native-build/wine-install/lib/wine/aarch64-windows" ] || die "no dev runtime in .native-build/wine-install"
+  # Dev install: links tool/neutron from this repo, so script changes apply at the next
+  # game start, and links the runtime of the build (.native-build/dist/neutron/files),
+  # or, without one, a hand-built Wine install in .native-build/wine-install.
+  runtime="$ROOT/.native-build/dist/neutron/files"
+  [ -d "$runtime" ] || runtime="$ROOT/.native-build/wine-install"
+  [ -d "$runtime/lib/wine/aarch64-windows" ] || die "no runtime in $runtime (run ./build.sh)"
   ln -s "$ROOT/tool/neutron" "$TOOL_DIR/neutron"
-  ln -s "$ROOT/.native-build/wine-install" "$TOOL_DIR/files"
+  ln -s "$runtime" "$TOOL_DIR/files"
   cp "$ROOT/tool/compatibilitytool.vdf" "$ROOT/tool/toolmanifest.vdf" "$TOOL_DIR/"
 else
   [ -x "$DIST/neutron" ] && [ -d "$DIST/files" ] || die "no build at $DIST (run ./build.sh, or --dev)"
@@ -156,7 +165,6 @@ cp "$ROOT/dev/steam.sh" "$ROOT/dev/steam-hook.sh" "$ROOT/dev/steamjs.mjs" "$ROOT
 chmod +x "$BIN/steam.sh" "$BIN/steam-hook.sh"
 
 quit_steam
-remove_old
 patch_steam
 
 if [ "$START" = 1 ]; then

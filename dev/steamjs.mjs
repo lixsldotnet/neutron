@@ -1,6 +1,18 @@
 // Evaluate a JS expression in Steam's SharedJSContext over CEF remote debugging.
 // Usage: node steamjs.mjs '<expression>'   (awaits promises, prints JSON)
-const port = process.env.STEAM_CEF_PORT || 8080;
+//        node steamjs.mjs                  (lists the CEF targets)
+// Needs Node 22 or newer (global WebSocket). The port comes from STEAM_CEF_PORT, which
+// the Steam.app start script from install.sh sets, or from that start script itself.
+import { readFileSync } from 'node:fs';
+const START_SCRIPT = '/Applications/Steam.app/Contents/MacOS/steam_neutron';
+// Start scripts from older installs only have the -devtools-port argument.
+const port = process.env.STEAM_CEF_PORT || (() => {
+  try {
+    const m = readFileSync(START_SCRIPT, 'utf8').match(/^export STEAM_CEF_PORT=(\d+)$|-devtools-port (\d+)/m);
+    return m && (m[1] || m[2]);
+  } catch { return undefined; }
+})();
+if (!port) { console.error(`no CEF port: set STEAM_CEF_PORT or run ./install.sh (${START_SCRIPT})`); process.exit(1); }
 const expr = process.argv[2];
 const targets = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
 if (!expr) { for (const t of targets) console.log(t.title, '|', t.url); process.exit(0); }

@@ -7,6 +7,8 @@
 # Do not take screenshots meanwhile (that switches to Composited).
 #
 # Usage: dev/direct-test.sh [variant...]   (default: all)
+# Env: NEUTRON_FILES (runtime, default: the installed tool's files),
+#      BENCH_CC (x86_64 mingw clang, default: llvm-mingw from ./build.sh)
 #   bgra8         8-bit backbuffer, the normal case (Unity games)
 #   rgb10a2       10-bit backbuffer (Unreal default), layer BGR10A2 (neutron default)
 #   rgb10a2-keep  10-bit backbuffer, layer RGB10A2 like DXMT upstream
@@ -19,8 +21,15 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NB="$REPO/.native-build"
 WORK="$NB/opt/present"
-CC="$NB/toolchains/llvm-mingw-20260908-ucrt-macos-universal/bin/x86_64-w64-mingw32-clang"
+FILES="${NEUTRON_FILES:-$HOME/Library/Application Support/neutron/compatibilitytools.d/neutron_proton/files}"
 EXE="$WORK/d3d11_present.exe"
+
+CC="${BENCH_CC:-}"
+if [ -z "$CC" ]; then
+  for c in "$NB"/toolchains/llvm-mingw-*/bin/x86_64-w64-mingw32-clang; do CC="$c"; done
+fi
+[ -x "$CC" ] || { echo "no x86_64-w64-mingw32-clang (run ./build.sh or set BENCH_CC)" >&2; exit 1; }
+[ -x "$FILES/bin/wine" ] || { echo "no neutron runtime at $FILES (run ./install.sh or set NEUTRON_FILES)" >&2; exit 1; }
 
 mkdir -p "$WORK" "$NB/opt/presentdata"
 if [ ! -f "$EXE" ] || [ "$REPO/tests/d3d11_present.c" -nt "$EXE" ]; then
@@ -31,7 +40,7 @@ run() {  # run <name> <format> <scale%> [VAR=value...]
   local name="$1" format="$2" scale="$3"; shift 3
   printf '%-14s %s\n' "$name" "(8 s)"
   env SteamAppId=present STEAM_COMPAT_DATA_PATH="$NB/opt/presentdata" \
-    NEUTRON_FILES="${NEUTRON_FILES:-$NB/wine-install}" NEUTRON_HUD=1 NEUTRON_HUD_NOTE="Test $name" "$@" \
+    NEUTRON_FILES="$FILES" NEUTRON_HUD=1 NEUTRON_HUD_NOTE="Test $name" "$@" \
     "$REPO/tool/neutron" runinprefix "$EXE" "$format" 8 "$scale" > /dev/null 2>&1 || echo "  failed"
 }
 

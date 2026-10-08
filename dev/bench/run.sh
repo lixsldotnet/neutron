@@ -30,7 +30,7 @@
 #               --game X runs only that game (and no micro benches)
 #   -k N        runs per micro bench (default 5, median is taken)
 #   --compare   prints the change of every metric against a baseline from bench.py baseline
-# Env: NEUTRON_FILES (runtime, default .native-build/wine-install), BENCH_CC (x86_64 mingw clang).
+# Env: NEUTRON_FILES (runtime, default: the installed tool's files), BENCH_CC (x86_64 mingw clang).
 # Games are skipped when one of them already runs (another session); the result says so.
 # Make a baseline from full runs: dev/bench/bench.py baseline run1.json run2.json > baseline.json
 #
@@ -43,7 +43,7 @@ OPT="$NB/opt"
 WORK="$OPT/bench"
 TOOL="$REPO/tool/neutron"
 PY="$BENCH_DIR/bench.py"
-FILES="${NEUTRON_FILES:-$NB/wine-install}"
+FILES="${NEUTRON_FILES:-$HOME/Library/Application Support/neutron/compatibilitytools.d/neutron_proton/files}"
 STEAM_ROOT="$HOME/Library/Application Support/Steam"
 HISTORY="$OPT/bench-history.jsonl"
 
@@ -81,7 +81,8 @@ CC="${BENCH_CC:-}"
 if [ -z "$CC" ]; then
   for c in "$NB"/toolchains/llvm-mingw-*/bin/x86_64-w64-mingw32-clang; do CC="$c"; done
 fi
-[ -x "$CC" ] || { echo "no x86_64-w64-mingw32-clang (set BENCH_CC)" >&2; exit 1; }
+[ -x "$CC" ] || { echo "no x86_64-w64-mingw32-clang (run ./build.sh or set BENCH_CC)" >&2; exit 1; }
+[ -x "$FILES/bin/wine" ] || { echo "no neutron runtime at $FILES (run ./install.sh or set NEUTRON_FILES)" >&2; exit 1; }
 
 build() {
   local src="$1" exe="$2"; shift 2
@@ -97,7 +98,7 @@ build "$BENCH_DIR/d3d11.c" "$WORK/d3d11.exe" -ld3d11 -ld3dcompiler -lgdi32 -luse
 #  meta
 #-------------------------------------------------------------------------------
 
-# neutron: the HUD (NEUTRON_HUD, MTL_HUD_ENABLED) costs frame time, so benchmarks run without it.
+# The HUD (NEUTRON_HUD, MTL_HUD_ENABLED) costs frame time, so benchmarks run without it.
 # BENCH_KEEP_HUD=1 keeps it (only to measure the HUD itself). The removed values are recorded.
 HUD_REMOVED=""
 if [ "${BENCH_KEEP_HUD:-0}" != 1 ]; then
@@ -206,7 +207,7 @@ game() {
     cd "$game_dir"
     export STEAM_COMPAT_DATA_PATH="$compat" STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT" \
       STEAM_COMPAT_APP_ID="$appid" NEUTRON_FILES="$FILES" NEUTRON_FPS_LOG=1
-    # neutron: GAME_ENV = extra "VAR=value" words for this profile (gwyfs: strict TSO)
+    # GAME_ENV: extra "VAR=value" words for this profile (gwyfs: strict TSO)
     # shellcheck disable=SC2086
     [ -z "${GAME_ENV:-}" ] || export $GAME_ENV
     exec "$TOOL" waitforexitandrun "$game_dir/$exe" "$@"

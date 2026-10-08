@@ -2,6 +2,9 @@
 /.native-build*/
 /.native-build*.log
 
+# Python
+__pycache__/
+
 # macOS
 .DS_Store
 
@@ -10,4 +13,4 @@
 .vscode/
 
 # local Claude Code settings
-.claude/settings.local.json
+.claude/

@@ -1,11 +1,12 @@
 // neutron settings in Mac Steam, evaluated in Steam's SharedJSContext over the CEF
-// debug port (dev/steam.sh). Mac Steam hides the Compatibility page of a game's
-// properties, so this adds its own "Compatibility" tab there: the compat tool for
-// the game (Neutron or none) and the neutron settings. When Steam shows its own
+// debug port (injected by dev/steam-hook.sh at every Steam start and UI reload).
+// Mac Steam hides the Compatibility page of a game's properties, so this adds its
+// own "Compatibility" tab there: the compat tool for the game (Neutron or none)
+// and the neutron settings. When Steam shows its own
 // Compatibility page, the settings go into that page instead.
 // The settings are stored as NEUTRON_<NAME>=<value> words in the game's launch
 // options; tool/neutron takes them out of the command line and exports them.
-// Lives in the running Steam UI only, no Steam file is changed.
+// Lives in the running Steam UI only, it changes no Steam file.
 (() => {
   if (window.__neutronPanel) return 'already installed';
 

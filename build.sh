@@ -5,12 +5,15 @@
 # on Metal and Proton's lsteamclient bridged to the Mac steamclient.dylib.
 # Nothing runs under Rosetta; only the game's own x86_64 code is translated.
 #
-# Output: <work>/dist/neutron, a compat tool folder (dev/steam.sh --dist).
+# Output: <work>/dist/neutron, a compat tool folder. Install it with ./install.sh
+# (or ./install.sh --dist <work>/dist/neutron for another work dir).
 # Steps are skipped when their output exists; delete a folder to redo a step.
 # Takes a while on the first run (Wine, LLVM 15 for DXMT, FEX).
 #
-# Usage: ./build.sh [work-dir]     (default: ./.native-build)
-# Needs: Xcode, Homebrew: bison flex autoconf cmake ninja meson pkgconf gnutls freetype
+# Usage: ./build.sh [work-dir]     (default: .native-build in the repo)
+# Needs: full Xcode with the Metal toolchain (xcodebuild -downloadComponent MetalToolchain),
+#        Homebrew: bison flex autoconf cmake ninja meson pkgconf gnutls freetype node
+#        (node 22 or newer runs the Steam hook, install.sh checks it as well)
 #
 set -euo pipefail
 
@@ -32,7 +35,7 @@ export MACOSX_DEPLOYMENT_TARGET="15.0"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATCHES="$ROOT/patches"
-WORK="${1:-$PWD/.native-build}"
+WORK="${1:-$ROOT/.native-build}"
 T="$WORK/toolchains"
 SRC="$WORK/src"
 JOBS="$(sysctl -n hw.ncpu)"
@@ -41,13 +44,19 @@ LM="$T/$LLVM_MINGW_DIR"
 say() { printf '\033[36m> %s\033[0m\n' "$*"; }
 die() { printf '\033[31mx %s\033[0m\n' "$*" >&2; exit 1; }
 
+BREW_PKGS="bison flex autoconf cmake ninja meson pkgconf gnutls freetype node"
 [ "$(uname -m)" = "arm64" ] || die "Apple Silicon only."
-for tool in autoreconf cmake ninja meson pkgconf git curl; do
-  command -v "$tool" >/dev/null || die "missing $tool (brew install autoconf cmake ninja meson pkgconf)"
+command -v brew >/dev/null || die "Homebrew is needed (https://brew.sh)"
+for tool in autoreconf cmake ninja meson pkgconf node git curl; do
+  command -v "$tool" >/dev/null || die "missing $tool (brew install $BREW_PKGS)"
 done
-for lib in gnutls freetype; do
-  [ -d "$(brew --prefix "$lib" 2>/dev/null)/lib" ] || die "missing $lib (brew install $lib)"
+for pkg in bison flex gnutls freetype; do
+  [ -d "$(brew --prefix "$pkg" 2>/dev/null)/bin" ] || [ -d "$(brew --prefix "$pkg" 2>/dev/null)/lib" ] \
+    || die "missing $pkg (brew install $BREW_PKGS)"
 done
+[ "$(node -p 'process.versions.node.split(".")[0]')" -ge 22 ] || die "node 22 or newer is needed (brew upgrade node)"
+xcrun -sdk macosx metal --version >/dev/null 2>&1 \
+  || die "no Metal compiler: install full Xcode, then run xcodebuild -downloadComponent MetalToolchain"
 
 mkdir -p "$T" "$SRC"
 export PATH="$LM/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
@@ -144,7 +153,7 @@ make -C "$B" -j"$JOBS" > "$B/make.log" 2>&1 || die "Wine build failed, see $B/ma
 SDK="$WORK/wine-sdk"
 if [ ! -x "$SDK/bin/winebuild" ]; then
   say "Installing the Wine SDK for DXMT"
-  make -C "$B" install prefix="$SDK" -j8 > "$WORK/wine-sdk.log" 2>&1 || die "make install failed"
+  make -C "$B" install prefix="$SDK" -j"$JOBS" > "$WORK/wine-sdk.log" 2>&1 || die "make install failed"
 fi
 
 #-------------------------------------------------------------------------------
@@ -206,7 +215,7 @@ FILES="$DIST/files"
 say "Assembling $DIST"
 rm -rf "$DIST"
 mkdir -p "$DIST"
-make -C "$B" install prefix="$FILES" -j8 > "$WORK/dist-install.log" 2>&1 || die "make install failed"
+make -C "$B" install prefix="$FILES" -j"$JOBS" > "$WORK/dist-install.log" 2>&1 || die "make install failed"
 rm -rf "$FILES/include" "$FILES/share/man"
 
 PE="$FILES/lib/wine/aarch64-windows"
@@ -253,4 +262,4 @@ cp "$ROOT/tool/neutron" "$ROOT/tool/peicon.py" "$ROOT/tool/toolmanifest.vdf" "$R
 chmod +x "$DIST/neutron"
 
 say "Done: $DIST ($(du -sh "$DIST" | cut -f1))"
-say "Install: dev/steam.sh --dist $DIST"
+say "Install: ./install.sh --dist $DIST"

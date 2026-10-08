@@ -11,12 +11,13 @@
 #   --tool    compat tool name for --map (default neutron_proton)
 #   --global  default compat tool for all Windows games (none removes it). This alone
 #             does not unlock installing a Windows-only game, the per-game mapping does.
-#   --launch  per-game launch options (Mac Steam ignores "VAR=x %command%", use neutron.env)
+#   --launch  per-game launch options. NEUTRON_<NAME>=<value> words there are neutron
+#             settings for that game (Mac Steam does not support "VAR=x %command%");
+#             neutron.env next to the tool holds settings for all games.
 #
 set -euo pipefail
 
 DEV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CEF_PORT=8080
 MAP_APPS=()
 LAUNCH_OPTS=()
 TOOL="neutron_proton"
@@ -24,7 +25,7 @@ GLOBAL_TOOL=""
 
 say() { printf '\033[36m> %s\033[0m\n' "$*"; }
 die() { printf '\033[31mx %s\033[0m\n' "$*" >&2; exit 1; }
-js()  { STEAM_CEF_PORT=$CEF_PORT node "$DEV_DIR/steamjs.mjs" "$1"; }
+js()  { node "$DEV_DIR/steamjs.mjs" "$1"; }   # CEF port: see steamjs.mjs
 
 while [ $# -gt 0 ]; do
   case "$1" in
