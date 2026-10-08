@@ -1,0 +1,136 @@
+diff --git a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
+--- a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
++++ b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
+@@ -160,6 +160,10 @@
+     // with certain canned values that accelerate some operations. Will (obviously)
+     // not load predicates, even if set to true, on host systems that do not support SVE.
+     bool SetPredRegs {};
++
++    /* neutron: do not touch FPCR (leave AFP bits as they are). Used when entering from native
++       ARM64EC code, JIT blocks that need NEP/AH ensure them in their entry point. */
++    bool SkipAFP {};
+   };
+   void FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Register TmpReg2, const FillSpecialRegsOptions& Options);
+ 
+diff --git a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+--- a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
++++ b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+@@ -636,7 +636,7 @@
+ 
+ void Arm64Emitter::FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Register TmpReg2, const FillSpecialRegsOptions& Options) {
+ #ifndef VIXL_SIMULATOR
+-  if (EmitterCTX->HostFeatures.SupportsAFP) {
++  if (EmitterCTX->HostFeatures.SupportsAFP && !Options.SkipAFP) {
+     // Enable AFP features when filling JIT state.
+     mrs(TmpReg, ARMEmitter::SystemRegister::FPCR);
+ 
+@@ -690,12 +690,19 @@
+     //
+     // Additional interesting AFP bits:
+     // FIZ(0): Flush Inputs to Zero
++    /* neutron: skip the (expensive) FPCR write when the bits are already clear. Flags must stay
++       untouched (NZCV is spilled below), so no tst/cmp here. */
++    ARMEmitter::ForwardLabel AFPAlreadyClear;
+     mrs(TmpReg, ARMEmitter::SystemRegister::FPCR);
++    and_(ARMEmitter::Size::i64Bit, TmpReg, TmpReg, 7);
++    (void)cbz(ARMEmitter::Size::i64Bit, TmpReg, &AFPAlreadyClear);
++    mrs(TmpReg, ARMEmitter::SystemRegister::FPCR);
+     bic(ARMEmitter::Size::i64Bit, TmpReg, TmpReg,
+         (1U << 2) |   // NEP
+           (1U << 1) | // AH
+           (1U << 0)); // FIZ
+     msr(ARMEmitter::SystemRegister::FPCR, TmpReg);
++    (void)Bind(&AFPAlreadyClear);
+   }
+ #endif
+ 
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -123,7 +123,8 @@
+ 
+   ldr(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
+ 
+-  FillSpecialRegs(TMP1, TMP2, {.SetFIZ = false, .SetPredRegs = true});
++  /* neutron: AFP is ensured lazily by JIT entry points that need it */
++  FillSpecialRegs(TMP1, TMP2, {.SetFIZ = false, .SetPredRegs = true, .SkipAFP = true});
+ 
+   // As ARM64EC uses this as an entrypoint for both guest calls and host returns, opportunistically try to return
+   // using the call-ret stack to avoid unbalancing it.
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -884,6 +884,22 @@
+   return AllocatedInfo;
+ }
+ 
++bool Arm64JITCore::BlockUsesFPR(IR::Ref BlockNode) const {
++  const auto IsFPRClass = [](IR::RegClass C) { return C == IR::RegClass::FPR || C == IR::RegClass::FPRFixed; };
++  for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
++    if (IR::GetHasDest(IROp->Op) && IsFPRClass(IR::PhysicalRegister(CodeNode).AsRegClass())) {
++      return true;
++    }
++    const int NumRAArgs = IR::GetRAArgs(IROp->Op);
++    for (int i = 0; i < NumRAArgs; ++i) {
++      if (IROp->Args[i].IsImmediate() && IsFPRClass(IR::PhysicalRegister(IROp->Args[i]).AsRegClass())) {
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
+ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size, bool SingleInst, const FEXCore::IR::IRListView* IR,
+                                                    FEXCore::Core::DebugData* DebugData, bool CheckTF) {
+   FEXCore::Utils::JITWriteScope WriteScope;
+@@ -1021,7 +1037,20 @@
+       PendingTargetLabel = nullptr;
+ 
+       BindOrRestart(Target);
++    }
++
++#ifdef ARCHITECTURE_arm64ec
++    /* neutron: FPCR.NEP/AH are not set when entering JIT code from native code (saves two FPCR writes per native
++       call). A block that uses vector registers ensures them at its start, a mid-block spill/fill restores them. */
++    if (HostSupportsAFP && BlockUsesFPR(BlockNode)) {
++      ARMEmitter::ForwardLabel AFPOn;
++      mrs(TMP1, ARMEmitter::SystemRegister::FPCR);
++      (void)tbnz(TMP1, 2, &AFPOn);
++      orr(ARMEmitter::Size::i64Bit, TMP1, TMP1, (1U << 2) | (1U << 1));
++      msr(ARMEmitter::SystemRegister::FPCR, TMP1);
++      (void)Bind(&AFPOn);
+     }
++#endif
+ 
+     for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+       switch (IROp->Op) {
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -69,6 +69,8 @@
+   const bool HostSupportsAVX256 {};
+   const bool HostSupportsRPRES {};
+   const bool HostSupportsAFP {};
++  /* neutron: true if an IR block has vector register operands (needs FPCR.NEP/AH) */
++  bool BlockUsesFPR(IR::Ref BlockNode) const;
+ 
+   struct RestartOptions {
+     enum class Control : uint64_t {
+diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
+--- a/Source/Windows/ARM64EC/Module.S
++++ b/Source/Windows/ARM64EC/Module.S
+@@ -74,9 +74,14 @@
+ .global ExitFunctionEC
+ ExitFunctionEC:
+   // Clear any the AFP NEP and AH bits in FPCR as native code won't expect their behaviour.
++  // neutron: skip the FPCR write when the bits are already clear (the JIT spill before us normally cleared them).
++  mrs x16, fpcr
++  and x16, x16, #6 // NEP + AH
++  cbz x16, 1f
+   mrs x17, fpcr
+   and x17, x17, #~6 // NEP + AH
+   msr fpcr, x17
++1:
+   LOAD_TEB x17, x16
+   ldr x17, [x17, #0x1788] // TEB->ChpeV2CpuAreaInfo
+   strb wzr, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation

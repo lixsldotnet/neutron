@@ -132,6 +132,14 @@ solves them. Measured on macOS 27, M5 Max.
   Friends: 58 FPS strict, 98 FPS fast in the same view) and is set per game
   where it fixes races (`APP_TSO_427410=strict`: Abiotic Factor deadlocks
   between GameThread and SlateLoadingThread at startup without it).
+- **FPCR on native calls.** An x64 to ARM64EC call used to cost 25-30 ns because
+  FEX wrote FPCR twice (clear AFP bits on exit, set NEP/AH on re-entry). Now
+  EnterEC leaves AFP alone, ExitFunctionEC and SpillStaticRegs skip the write
+  when the bits are already clear, and every IR block with vector register
+  operands ensures NEP/AH at its start (mrs, tbnz, rare orr+msr). Native calls
+  from integer code cost about 5 ns, d3d11 draw loop +19% FPS (patch
+  `0003-afp-lazy-native-transition`). Do not use `FEX_HOSTFEATURES=disableafp`,
+  it slows scalar float code.
 - **Render scale.** `NEUTRON_RENDER_SCALE` (default 0.85) scales all Windows
   coordinates in winemac.drv the way Retina mode does with factor 2, so games
   see a 2924x1224 desktop on a 3440x1440 display. The tool sets the DXMT MetalFX
