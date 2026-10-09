@@ -26,6 +26,8 @@
 #   NEUTRON_RAW_MOUSE=0         raw input (mouse look) from the accelerated macOS
 #                               cursor deltas instead of the GCMouse device deltas
 #   NEUTRON_PRECISE_TIMERS=0    Sleep() through select() again instead of a kqueue timer
+#   NEUTRON_FAST_QPC=0          QueryPerformanceCounter through the NT syscall again instead
+#                               of reading the counter in the game process
 #   NEUTRON_DXMT_WRITE_COMBINED=1  dynamic D3D11 buffers write-combined again (DXMT
 #                               patch 0019 turned it off, it stalled the game thread)
 #   NEUTRON_D3D12_SM6=1         D3D12 with shader model 6.6 / feature level 12_0 (DXIL shaders,
@@ -283,11 +285,18 @@ run_wine() {
 #  prefix
 #-------------------------------------------------------------------------------
 
-# Copies src to dst only when the content differs (keeps mtimes stable).
+# Copies src to dst only when the content differs. A synced copy has the size and mtime
+# of its source, so the byte compare (45 ms for the 58 MB lsteamclient.dll, every start)
+# only runs after a runtime update.
 sync_file() {
   local src="$1" dst="$2"
+  [ "$(stat -f '%z %m' "$src" 2>/dev/null)" = "$(stat -f '%z %m' "$dst" 2>/dev/null)" ] && return 0
   mkdir -p "$(dirname "$dst")"
-  cmp -s "$src" "$dst" 2>/dev/null || cp "$src" "$dst"
+  if cmp -s "$src" "$dst" 2>/dev/null; then
+    touch -r "$src" "$dst"
+  else
+    cp -p "$src" "$dst"
+  fi
 }
 
 setup_prefix() {

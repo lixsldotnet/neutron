@@ -488,8 +488,127 @@ app-thread time per frame 45 to 80% lower, FPS 2 to 6 times, images identical.
   Unix calls (`__wine_unix_call_arm64ec`) save only q8-q15. NT syscalls read FPSR
   in `__wine_syscall_dispatcher` (5 ns after an FP op): storing 0 instead makes
   `QueryPerformanceCounter` 20.6 to 16.4 ns but no D3D11 benchmark moved, so it
-  stays (contexts keep the real flags). Next step there: QPC without a syscall
-  (CNTVCT plus the continuous-time offset in PE code).
+  stays (contexts keep the real flags). QPC no longer makes the syscall, see
+  QueryPerformanceCounter below.
+
+## QueryPerformanceCounter
+
+Wine's QPC is `mach_continuous_time()` in 100 ns units (10 MHz), and
+`NtQueryPerformanceCounter` was a full NT syscall into the unix side. On macOS
+`mach_continuous_time` itself needs no kernel call: libsystem reads the commpage
+(`0xfffffc000`). `_COMM_PAGE_CONT_HWCLOCK` (`+0x91`) says the user-mode path exists,
+`_COMM_PAGE_USER_TIMEBASE` (`+0x90`) names the counter register (3: Apple's
+`ACNTVCT_EL0` = `S3_4_C15_C10_6`, 2: `CNTVCTSS_EL0`, 1: `isb` + `CNTVCT_EL0`), and
+`_COMM_PAGE_CONT_HW_TIMEBASE` (`+0xa8`) is added. On the M5 Max (macOS 27) the type is
+3, the timebase 125/3 (24 MHz) and the offset 0, also after the Mac had slept (6.8 h of
+sleep since boot): `ACNTVCT` keeps counting while the Mac sleeps, `mach_absolute_time`
+subtracts the sleep through `_COMM_PAGE_TIMEBASE_OFFSET` instead. `CNTVCT_EL0` is not the mach timebase there (`CNTFRQ_EL0` reads 1 GHz).
+
+The pending Wine diff (`patches/wine/pending-qpc.diff`) does the same in PE code:
+`RtlQueryPerformanceCounter` (which `QueryPerformanceCounter` and `timeGetTime` call)
+reads the three commpage fields on every call and computes
+`ticks * numer / denom / 100` exactly like the unix side. The unix side enables it per
+process (page after `KUSER_SHARED_DATA`, `+0x10`) after 100 reads between two
+`mach_continuous_time()` calls agreed, so an unknown commpage layout or type falls back to
+the syscall; `NEUTRON_FAST_QPC=0` turns it off. Sleep and wake need no bias update: the
+same fields libsystem uses are read on every call, so the values are identical to
+`NtQueryPerformanceCounter`, wineserver timers and `KUSER_SHARED_DATA` at any time. A
+real sleep was not tested (no way headless).
+
+`tests/qpc.c` (x64 and ARM64EC builds): frequency, monotonic in one thread (10M reads)
+and across 8 threads mixed with the syscall, QPC between two `NtQueryPerformanceCounter`
+calls and the other way round (1M each), rates against `GetTickCount64` (within 17 ms,
+the 16 ms KUSER update), `timeGetTime` and the system time. Cost per call (M5 Max,
+best of 3):
+
+| | before | after |
+|---|---|---|
+| `QueryPerformanceCounter` from x64 (FEX) | 19.2 ns | 12.8 ns |
+| `QueryPerformanceCounter` from ARM64EC | 17.2 ns | 10.7 ns |
+| `RtlQueryPerformanceCounter` from ARM64EC | 16.0 ns | 8.6 ns |
+| `timeGetTime` from x64 | 21.2 ns | 14.3 ns |
+
+The rest is the x64 to ARM64EC transition (about 5 ns) and `mrs ACNTVCT` (3.8 ns
+natively, `mach_continuous_time` 5.3 ns). `NtQueryPerformanceCounter` called directly is
+unchanged (15.5 ns from ARM64EC, 164 ns through the x64 syscall stub).
+
+## Start time
+
+What a game start costs besides the game. `waitforexitandrun` waits for the prefix's
+wineserver to exit, so every start from Steam is a cold start: a new wineserver, then the
+first process runs `wineboot --init` and waits for it. Measured with
+`dev/bench/cpu.c` (`--nop`, `--user32`) through `tool/neutron runinprefix` (M5 Max,
+median of 5, interleaved with the old runtime; `start.*` in `dev/bench/run.sh`):
+
+| | before | after |
+|---|---|---|
+| no-op exe, cold wineserver | 573 ms | 376 ms |
+| no-op exe, warm wineserver | 131 ms | 71 ms |
+| cold start of a process that loads user32 and needs the desktop | 1443 ms | 632 ms |
+| loading user32.dll in a process | 68 ms | 29 ms |
+
+- **Desktop.** The first window (or `GetSystemMetrics`) starts `explorer.exe /desktop`,
+  which rebuilds the display cache. win32u asked for OpenGL GPUs there, which loaded the
+  macOS OpenGL driver (about 0.5 s) only to list EGL devices, and without EGL there are
+  none. Skipped when Wine is built without EGL (`SONAME_LIBEGL`, never on macOS).
+- **Fonts.** Every process that loads user32 enumerated the system fonts with
+  `CTFontCollectionCreateMatchingFontDescriptors` (45 ms for 640 descriptors).
+  `CTFontManagerCopyAvailableFontURLs` gives the same 306 files in about 10 ms; the font
+  list is identical (`WINEDEBUG=+font` dump). wineboot's chain alone loads user32 in
+  plugplay, winedevice (winebus) and wineboot, one after the other.
+- **Tool.** `sync_file` compared the 58 MB `lsteamclient.dll` with the prefix copy byte by
+  byte (45 ms) on every call; it now compares size and mtime first.
+- Left in a cold start (376 ms): about 250 ms waiting for `wineboot --init` (services.exe
+  starts winedevice/mountmgr, plugplay, svchost/eventlog and winedevice/winebus one after
+  the other, then wineboot loads shell32, ole32 and wininet). user32 still costs 29 ms
+  per process (Cocoa and raw mouse setup in winemac). Native x86 DLLs (FileAlignment
+  0x200) cannot be mmapped with 16K pages and are read with `pread`; Wine's builtin DLLs
+  are 64K aligned and mapped.
+
+### FEX JIT and its code cache
+
+`dev/bench/bigcode.py` generates an x86_64 program with 20000 different functions
+(28000 FEX blocks, 6.6 MB exe) and calls each once: the first pass takes 250 to 290 ms,
+the second pass 8 to 9 ms, so FEX translates about 10 us per block. A second start of the
+process costs the same again: FEX keeps nothing between runs.
+
+FEX-2610 has a work-in-progress offline code cache that also covers ARM64EC:
+
+- `FEX_ENABLECODECACHINGWIP=1` writes a code map of the executed blocks per main
+  executable to `%LOCALAPPDATA%\fex-emu\codemap\new\` and loads caches from
+  `%LOCALAPPDATA%\fex-emu\cache\<name>-<fileid>-<config id>` when an image is mapped
+  (`Windows/Common/ImageTracker.cpp`). The config id is a TODO (always 0), so a cache
+  does not know the TSO or other code-generating settings it was built with.
+- `FEXOfflineCompiler64.exe process-all` (built in `fex-arm64ec/Bin`, an ARM64EC exe
+  that runs in the prefix) merges the code maps and compiles each image in a child
+  process: it maps the image, compiles the listed blocks and writes code, block list and
+  relocations (bigcode: 1.15 s, 25 MB).
+- On ARM64EC loading is eager: the whole code is copied into an EC code buffer and
+  relocated at image load (no lazy per-page mapping on Windows).
+
+On macOS fex patch 0005 was needed to get that far: the compiler crashed on a null config
+layer (it called `Logging::Init` before loading the config), it had no `MAP_JIT` write
+switch (endless write fault when emitting code), and relocating or copying cached code
+wrote to `MAP_JIT` memory outside a `JITWriteScope`. With it, code maps, cache generation
+and cache loading work, but running the cached code does not:
+
+- An image the compiler maps at another address than the game (every exe with the
+  default base 0x140000000, where `FEXOfflineCompiler64.exe` itself sits) keeps
+  RIP-relative data addresses of the compiler's mapping: the first cached block read
+  `generator base + 0x4d4020`.
+- With a different image base (`-Wl,--image-base=0x150000000`) the first cached block
+  jumps outside every code buffer (illegal instruction at a non-JIT address).
+- The ARM64EC exception handler only treats faults in `CTX` code buffers as JIT faults
+  (`IsAddressInCodeBuffer`), not in loaded cache buffers, so self-modifying-code and
+  unaligned-atomic handling would not work in cached code.
+- `FEX_ENABLECODECACHEVALIDATION=1` crashes in the IR emitter (validation thread).
+
+So the cache is not usable yet; what it would save is the JIT time of the blocks a
+game runs at every start (about 10 us each). Needed: relocations that work when the
+compiler maps the image elsewhere, the jump target bug above, the cache buffers in the
+exception handler, a config id from the code-generating settings (TSO mode, AFP), and a
+place in the tool to run the compiler (after a game exits) and keep the cache in
+`compatdata/<appid>`.
 
 ## GPU passes
 
@@ -557,6 +676,7 @@ DXMT patches with `git apply`, all in file name order.
 | `wine/0012-server-qos-precise-timers` | Wineserver QoS, latency tier, kqueue sleep timers |
 | `wine/0013-win32u-recursive-display-lock` | Display lock recursive for its owner |
 | `wine/0014-winemac-raw-mouse` | Raw mouse input from GameController `GCMouse` |
+| `wine/pending-qpc.diff` | QPC in PE code from the commpage, no OpenGL load for the GPU list, faster font enumeration (to be split into the series) |
 | `proton/0001-lsteamclient-macos` | lsteamclient on macOS: optional exports, libc++, key map, `NEUTRON_STEAMCLIENT_DYLIB` |
 | `proton/0002-lsteamclient-link-libcxx` | Links lsteamclient.so against libc++ |
 | `proton/0003-steam-helper-macos` | steam.exe opens `steam://` URLs with `open` |
@@ -564,6 +684,7 @@ DXMT patches with `git apply`, all in file name order.
 | `fex/0002-host-page-guards` | Guard pages cover a whole host page |
 | `fex/0003-afp-lazy-native-transition` | Fewer FPCR writes on x64 to ARM64EC calls |
 | `fex/0004-afp-only-for-float-blocks` | x86 float mode (FPCR.NEP/AH) only in blocks that need it, NaN lanes before a native call fixed in software |
+| `fex/0005-code-cache-map-jit` | FEX code cache tools on Apple Silicon (offline compiler config and `MAP_JIT`), not usable yet |
 | `llvm-mingw/0001-ntcurrentteb-tsd` | `NtCurrentTeb()` via TSD in `winnt.h` |
 | `dxmt/0001-d3d12-clock-calibration` | D3D12 timestamp frequency and clock calibration |
 | `dxmt/0002-no-thread-local` | No `thread_local` in the occlusion query code |

@@ -7,7 +7,8 @@ start from Steam.
 | File | What |
 |---|---|
 | `run.sh` | Runs the suite and prints one JSON result, appended to `.native-build/opt/bench-history.jsonl` |
-| `cpu.c` | CPU and Windows API micro benchmarks (x86 code in FEX, memory, atomics, wineserver round trips, clocks, virtual memory, heap, threads, calls into ARM64EC DLLs) |
+| `cpu.c` | CPU and Windows API micro benchmarks (x86 code in FEX, memory, atomics, wineserver round trips, clocks, virtual memory, heap, threads, calls into ARM64EC DLLs); `--nop` and `--user32` for start times |
+| `bigcode.py` | Generates an x86_64 program with many different functions, each run once: FEX JIT cost of a first pass against a second one (see "FEX JIT and its code cache" in docs/neutron.md) |
 | `d3d11.c` | D3D11 CPU overhead: many small draws per frame like an engine, no vsync |
 | `bench.py` | Helper: wraps program output, follows game logs, summarizes, makes baselines, compares |
 | `hang-watch.sh` | Starts a game and dumps it (sample, vmmap, lldb backtraces) when its FPS log stalls |
@@ -35,7 +36,10 @@ spread in `spread_pct`.
 - `cpu.*`: ns per operation, FEX fast TSO. `cpu_strict.*`: the TSO-sensitive
   tests again with `NEUTRON_FEX_TSO=strict`.
 - `start.nop_exe_ms`: wall time to start a no-op exe through the tool, warm
-  wineserver.
+  wineserver. `start.nop_exe_cold_ms`: the same with a new wineserver (wineboot
+  `--init` runs first), like every start from Steam. `start.user32_load_ms` and
+  `start.user32_desktop_ms`: loading user32 and the first call that needs the desktop
+  (`explorer.exe /desktop`) in a cold start, from `cpu.exe --user32`.
 - `d3d11_5k.*`: 5000 draws per frame, draw loop time and process CPU time per
   frame. Its FPS sits at the display refresh and is left out.
 - `d3d11_20k.*`: 20000 draws per frame, CPU bound, so its FPS is a CPU number too.

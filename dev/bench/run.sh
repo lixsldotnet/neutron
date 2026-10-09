@@ -7,7 +7,9 @@
 #
 #   cpu.*         dev/bench/cpu.c, K runs, ns per op (FEX fast TSO, the tool default)
 #   cpu_strict.*  the TSO-sensitive cpu tests again with NEUTRON_FEX_TSO=strict
-#   start.*       wall time of starting a no-op exe through the tool (warm wineserver)
+#   start.*       wall time of starting a no-op exe through the tool, warm (nop_exe_ms) and
+#                 cold wineserver (nop_exe_cold_ms); user32_load_ms and user32_desktop_ms
+#                 (cold) from cpu.exe --user32
 #   d3d11_5k.*    dev/bench/d3d11.c, 5000 draws per frame: draw loop time and process CPU
 #                 time per frame (its FPS sits at the display refresh, so it is left out)
 #   d3d11_20k.*   20000 draws per frame, CPU bound, so its fps is a CPU number too
@@ -152,6 +154,20 @@ if [ "$MICRO" = 1 ]; then
     in_prefix "$TOOL" runinprefix "$WORK/cpu.exe" --nop > /dev/null 2>&1
     t1="$(now_ms)"
     printf '{"group":"start","values":{"nop_exe_ms":%s}}\n' "$((t1 - t0))" >> "$RAW"
+  done
+  # Cold starts like every start from Steam (waitforexitandrun waits for the old
+  # wineserver): new wineserver and wineboot --init, then the exe. --user32 loads user32
+  # and asks for the desktop (explorer.exe), like the first window of a game.
+  for i in $(seq "$K"); do
+    WINEPREFIX="$BENCH_DATA/pfx" "$FILES/bin/wineserver" -k 2>/dev/null || true
+    WINEPREFIX="$BENCH_DATA/pfx" "$FILES/bin/wineserver" -w 2>/dev/null || true
+    t0="$(now_ms)"
+    in_prefix "$TOOL" runinprefix "$WORK/cpu.exe" --nop > /dev/null 2>&1
+    t1="$(now_ms)"
+    printf '{"group":"start","values":{"nop_exe_cold_ms":%s}}\n' "$((t1 - t0))" >> "$RAW"
+    WINEPREFIX="$BENCH_DATA/pfx" "$FILES/bin/wineserver" -k 2>/dev/null || true
+    WINEPREFIX="$BENCH_DATA/pfx" "$FILES/bin/wineserver" -w 2>/dev/null || true
+    in_prefix "$TOOL" runinprefix "$WORK/cpu.exe" --user32 2>/dev/null | python3 "$PY" wrap start >> "$RAW" || true
   done
   # A game in front (fullscreen) makes macOS run the bench window's process 2 to 3 times
   # slower (background app), so the D3D11 numbers would be wrong: skip them then.
