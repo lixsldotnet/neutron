@@ -768,6 +768,16 @@ dlls/ntdll/unix/sync.c in 0012.
 +
 +#endif /* __APPLE__ */
 +#endif /* __WINE_WINE_MSYNC_H */
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -1135,6 +1135,7 @@
+ 	wine/mfinternal.idl \
+ 	wine/mmsystem16.h \
+ 	wine/mscvpdb.h \
++	wine/msync.h \
+ 	wine/mssign.h \
+ 	wine/nsi.h \
+ 	wine/opengl_driver.h \
 --- a/include/wine/server_protocol.h
 +++ b/include/wine/server_protocol.h
 @@ -6068,6 +6068,8 @@
