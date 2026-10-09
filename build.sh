@@ -230,10 +230,14 @@ if [ ! -d "$T/llvm-darwin-arm64" ]; then
 fi
 
 fetch_git "$SRC/dxmt" https://github.com/3Shain/dxmt.git "$DXMT_REF" "$PATCHES"/dxmt/*.patch
-if [ ! -f "$WORK/dxmt-install/aarch64-unix/winemetal.so" ]; then
+# nvapi64.dll and nvngx.dll (NGX core: DLSS on the MetalFX temporal scaler) for NEUTRON_DLSS=1.
+if [ ! -f "$WORK/dxmt-install/aarch64-unix/winemetal.so" ] || [ ! -f "$WORK/dxmt-install/aarch64-windows/nvngx.dll" ]; then
   say "Building DXMT arm64ec (log: $WORK/dxmt-build.log)"
-  (cd "$SRC/dxmt" && meson setup --cross-file build-arm64ec.txt -Dnative_llvm_path="$T/llvm-darwin-arm64" \
-     -Dwine_install_path="$SDK" -Denable_d3d12=true build-arm64ec --buildtype release \
+  reconfigure=()
+  [ -d "$SRC/dxmt/build-arm64ec" ] && reconfigure=(--reconfigure)
+  (cd "$SRC/dxmt" && meson setup ${reconfigure[@]+"${reconfigure[@]}"} --cross-file build-arm64ec.txt \
+     -Dnative_llvm_path="$T/llvm-darwin-arm64" -Dwine_install_path="$SDK" -Denable_d3d12=true \
+     -Denable_nvapi=true -Denable_nvngx=true build-arm64ec --buildtype release \
      --prefix "$WORK/dxmt-install" --strip) > "$WORK/dxmt-build.log" 2>&1
   { meson compile -C "$SRC/dxmt/build-arm64ec" && meson install -C "$SRC/dxmt/build-arm64ec"; } \
     >> "$WORK/dxmt-build.log" 2>&1 || die "DXMT build failed, see $WORK/dxmt-build.log"
@@ -255,6 +259,9 @@ PE="$FILES/lib/wine/aarch64-windows"
 UNIX="$FILES/lib/wine/aarch64-unix"
 for d in d3d11 dxgi d3d10core d3d12 winemetal; do cp "$WORK/dxmt-install/aarch64-windows/$d.dll" "$PE/"; done
 cp "$WORK/dxmt-install/aarch64-unix/winemetal.so" "$UNIX/"
+# Not in Wine's DLL folders: tool/neutron copies them into the prefix only with NEUTRON_DLSS=1.
+mkdir -p "$FILES/lib/neutron/dlss"
+for d in nvapi64 nvngx; do cp "$WORK/dxmt-install/aarch64-windows/$d.dll" "$FILES/lib/neutron/dlss/"; done
 cp "$WORK/fex-arm64ec/Bin/libarm64ecfex.dll" "$PE/"
 cp "$WORK/fex-unixlib/libarm64ecfex.so" "$UNIX/"
 

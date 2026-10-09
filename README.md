@@ -134,6 +134,7 @@ For one game use the Compatibility tab or put `NEUTRON_<NAME>=<value>` words int
 | `NEUTRON_PAD_HIDRAW` | off | `1`: PlayStation and Switch pads reach the game as raw HID devices (like Proton without Steam Input), for games with own support for them (light bar, touchpad, gyro, adaptive triggers, PlayStation buttons in the UI). Then they are no XInput pad anymore, so games that only know XInput dont see them. Off: every pad is a XInput pad. |
 | `NEUTRON_PAD_SYSTEM_GESTURES` | off | `1`: the Home/PS and Share button of a pad do what macOS wants again (Launchpad, Game Overlay, screenshot) while the game is in front. Off: the game gets these buttons. |
 | `NEUTRON_PRECISE_TIMERS` | `1` | Precise `Sleep()` through kqueue timers. `0` turns it off. |
+| `NEUTRON_DLSS` | off | `1`: games see an NVIDIA GPU and can turn on DLSS, which then runs on the MetalFX temporal upscaler (D3D11 and D3D12). Turns the render scale off, DLSS renders smaller itself. Experimental: on an NVIDIA GPU games can take other code paths. In the tab. |
 | `NEUTRON_D3D12_SM6` | off | `1`: D3D12 reports shader model 6.6 and feature level 12_0 and DXIL shaders get translated (Unreal 5 games with `-dx12`). Also removes a forced `-dx11` of a game. Experimental. In the tab. |
 | `NEUTRON_MSYNC` | off | `1`: Windows events, semaphores and mutexes work inside the game process instead of going through wineserver (30 to 290 times faster). Experimental, set it in `neutron.env`. |
 | `NEUTRON_METALFX` | from render scale | MetalFX upscale factor, normally `1 / NEUTRON_RENDER_SCALE`. |

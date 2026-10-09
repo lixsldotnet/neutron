@@ -718,6 +718,84 @@ policy. Real pads: `gamepad_list.exe`, `watch` and `rumble`. (sdl2-compat 2.32.7
 passes the SDL2 return value of a virtual pad's rumble callback to SDL3 as a bool, so
 the hook returns 1 for success.)
 
+## DLSS
+
+`NEUTRON_DLSS=1` lets games turn on DLSS (super resolution), which then runs on the
+MetalFX temporal scaler. The game gives DLSS its color, depth, motion vectors, jitter
+and exposure every frame, which is what the temporal scaler needs, so the result is
+much better than the spatial upscaling of the render scale. Opt-in per game: the game
+sees an NVIDIA GPU.
+
+What DXMT already has (built with `-Denable_nvapi=true -Denable_nvngx=true`):
+
+- `dxgi.dll` with `DXMT_ENABLE_NVEXT=1` reports vendor 0x10DE and writes
+  `HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore` `FullPath` = `C:\Windows\System32`
+  (plus two keys games look at for an NVIDIA driver). Without the variable it deletes
+  the values again.
+- `nvapi64.dll`: the NvAPI calls games make for GPU detection (an "NVIDIA GeForce RTX
+  4090", Ada AD102, driver 999.99, display and HDR queries, Reflex calls as no-ops,
+  all shader extension op codes unsupported). `NvAPI_Initialize` fails without NVEXT.
+  No D3D12 NvAPI calls.
+- `nvngx.dll`: an NGX core. The NGX loader linked into the game loads `_nvngx.dll`
+  from the `FullPath` folder and calls its D3D11 entry points; DLSS create and
+  evaluate become a MetalFX temporal scaler run (`IMTLD3D11ContextExt::TemporalUpscale`,
+  motion vectors at display resolution are scaled down first). The quality modes have
+  fixed ratios (ultra performance 1/3, performance 1/2, balanced 0.58, quality 1/1.5,
+  ultra quality 1/1.3, DLAA 1). The game's `nvngx_dlss.dll` is never loaded. No frame
+  generation and no ray reconstruction.
+
+neutron:
+
+- `build.sh` builds both DLLs and puts them into `files/lib/neutron/dlss`, outside
+  Wine's DLL folders.
+- `tool/neutron` with `NEUTRON_DLSS=1` exports `DXMT_ENABLE_NVEXT=1`, copies
+  `nvapi64.dll` and `nvngx.dll` (as `_nvngx.dll` and `nvngx.dll`) into the prefix's
+  `system32` and sets the render scale to 1: Windows sees the native display size and
+  DLSS renders at the lower resolution itself (with the render scale on, DLSS output
+  would be scaled a second time). Without the setting the files are removed again
+  (marker `neutron-dlss-files` in the prefix) and dxgi deletes the registry values, so
+  the game sees the Apple GPU as before. The HUD shows "DLSS MetalFX temporal".
+- dxmt 0040:
+  - Games call the NGX parameter object through the vtable MSVC builds for
+    `NVSDK_NGX_Parameter`: overloads grouped, each group in reverse declaration order
+    (checked with `clang -target x86_64-pc-windows-msvc`). DXMT had the `Get` group
+    partly in another order, `Get(ID3D11Resource **)` and `Get(double *)` hit each
+    other's slots.
+  - A render subrect of 0 (older SDKs, or games that leave it out) means the whole
+    color input instead of a 0x0 MetalFX input; the size is clamped to the scaler's
+    range (at most 3x below the output).
+  - `EnableSignatureOverride` = 1 in both NGXCore keys: the NGX loader checks the
+    NVIDIA signature of the core unless this is set, DXMT's core is not signed.
+  - D3D12: the `NVSDK_NGX_D3D12_*` entry points. Evaluate records the upscale into the
+    game's command list (`IMTLD3D12CommandListExt`, a new `TemporalUpscale` encoder
+    type that waits for and updates the queue fence like the other passes). Motion
+    vectors must be at render resolution (the `MVLowRes` flag, what Unreal and most
+    engines use); display resolution ones are refused on D3D12.
+  - A log line `NGX: DLSS on MetalFX temporal, <in> -> <out>, quality, flags` per
+    created feature.
+
+Findings:
+
+- On macOS 26 and later the MetalFX temporal scaler runs a network on the Neural
+  Engine (MPSGraph `ANERegion` in the backtrace). More than about 20 scaler encodes in
+  one Metal command buffer end in a GPU timeout, also in a native Metal program. Games
+  run DLSS once per frame and DXMT commits per Present, so only tests without Present
+  hit it (`tests/dlss_ngx.c` flushes after every frame).
+- Conventions, checked with the test: jitter as the offset applied to the projection
+  (the sample sits at pixel center minus jitter, in render pixels) and motion vectors
+  from the current to the previous position in render pixels go to MetalFX unchanged.
+  Negating the jitter or the motion vectors makes the output worse than bilinear.
+- `tests/dlss_ngx.c`, performance mode, 256x256 to 512x512, analytic scene (zone
+  plate, checkerboard, thin lines), mean error against the exact picture (0..255):
+  bilinear 37.6, DLSS after 32 still frames 18.7, after 32 scrolling frames 30.4;
+  D3D11 and D3D12 the same. Render subrect 0 and no auto exposure work too.
+
+Not tested with a game yet. Risks of the NVIDIA identity: games pick other presets
+and code paths on an "RTX 4090" (ray tracing options, NVIDIA-only effects, vendor
+specific workarounds), and an NVIDIA path that needs a real NVIDIA driver or NvAPI
+call that is not implemented can fail. Depth as D24S8 (Depth32Float_Stencil8 in
+Metal) and R11G11B10 color or output have not been tried with the scaler.
+
 ## Patches
 
 All third-party code is fetched at build time at a pinned version and patched
@@ -773,6 +851,7 @@ DXMT patches with `git apply`, all in file name order.
 | `dxmt/0009-no-display-mode-switch` | No real display mode switches |
 | `dxmt/0010-display-layer-format` | BGR10A2 layer for 10-bit backbuffers, `NEUTRON_LAYER_FORMAT` |
 | `dxmt/0011-native-drawable-size` | Drawable in screen pixels, `NEUTRON_NATIVE_DRAWABLE` |
+| `dxmt/0040-dlss-ngx-metalfx` | DLSS on MetalFX temporal: NGX parameter vtable, render subrect 0, signature override, D3D12 NGX |
 
 ## Open points
 
@@ -793,3 +872,4 @@ DXMT patches with `git apply`, all in file name order.
   disabled Home button gesture holds in native fullscreen, DualSense and Switch Pro
   rumble through SDL's HIDAPI drivers, `NEUTRON_PAD_HIDRAW=1` with a game that has own
   PlayStation support.
+- DLSS (`NEUTRON_DLSS=1`) still needs a test with a real game; see DLSS.
