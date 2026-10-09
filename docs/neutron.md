@@ -423,10 +423,17 @@ app-thread time per frame 45 to 80% lower, FPS 2 to 6 times, images identical.
 - 0025, 0026: unchanged input layout, depth-stencil state and blend factor emit no
   command; state setters use `static_cast` instead of a QueryInterface.
 - Left: FEX's FPCR toggling on every x64 to ARM64EC call after float code (26.7 ns
-  against 4.7 ns from integer code, 14-20% of the app thread); Wine's
-  `arm64x_check_call` on every indirect call in ARM64EC DLLs (4-7%); the syscall
-  dispatcher saving q0-q31 on every unix call; DXMT's encoder thread at about
-  120 ns per draw, half of it in the AGX driver.
+  against 4.7 ns from integer code, 14-20% of the app thread); DXMT's encoder
+  thread at about 120 ns per draw, half of it in the AGX driver.
+- Measured and not worth changing: Wine's `arm64x_check_call` costs about 0.67 ns
+  per indirect call in ARM64EC code (1.33 ns against 0.66 ns for plain ARM64),
+  which is the call and return the compiler emits around the check, not the TEB
+  and PEB loads; caching the EC bitmap pointer moved samples but not CPU time.
+  Unix calls (`__wine_unix_call_arm64ec`) save only q8-q15. NT syscalls read FPSR
+  in `__wine_syscall_dispatcher` (5 ns after an FP op): storing 0 instead makes
+  `QueryPerformanceCounter` 20.6 to 16.4 ns but no D3D11 benchmark moved, so it
+  stays (contexts keep the real flags). Next step there: QPC without a syscall
+  (CNTVCT plus the continuous-time offset in PE code).
 
 ## GPU passes
 
