@@ -111,7 +111,7 @@ In the sandbox Documents, Desktop and the other user folders of the game become 
 
 ## Usage
 
-Games without a Mac version get mapped to neutron automatically, at every Steam start and every 30 seconds while Steam runs. If you set a game back to none it stays none. Mac games are not touched.
+Games without a Mac version get mapped to neutron automatically, at every Steam start and every 30 seconds while Steam runs. If you set a game back to none it stays none. Mac games are not touched. Installed neutron games get the Steam setting "only update this game when I launch it", because Steam would otherwise delete and download them again at every start (see docs). They still get their updates at every Steam start, the hook starts them.
 
 The Properties dialog of every game has a Compatibility tab (the hook adds it) where you pick the compat tool for the game (Neutron or none) and the neutron settings.
 

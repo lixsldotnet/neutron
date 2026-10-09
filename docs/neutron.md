@@ -85,7 +85,17 @@ and `dev/steam-hook.sh` do the following at every Steam start:
    config.vdf's `CompatToolMapping` to a second name of the same tool
    (`neutron_proton_remap`) and back, about 1 s for 200 games. The switch also
    marks installed games "Update Required"; the script queues an update, which
-   is a 0-byte check that puts the Windows depot back.
+   is a 0-byte check that puts the Windows depot back. At the same moment Steam
+   starts its automatic update of recently played games while their mapping is
+   still invalid: it finds no Mac depots ("1 active, 0 target"), deletes the
+   installed files and downloads them all again after the remap (seen for a game
+   played 20 minutes before every Steam start). So the script sets installed
+   neutron games to "only update when launched" (`SetAppAutoUpdateBehavior(id, 1)`,
+   also for games installed later, by the 30 s watch); the queued check above is a
+   user-started update and still brings real game updates at every Steam start.
+   Pausing all downloads (`EnableAllDownloads(false)`) over the switch does not stop
+   it, and holding the updates in a step before the switch delayed the switch so
+   much that the remap ran in the wrong platform state and cleared the mappings.
 7. **New games.** The same script maps every library game without a Mac version
    that is not in its seen list (`localStorage` key `neutron.seen` in the
    SharedJSContext), at start and every 30 s while Steam runs. Mapped games, Mac

@@ -9,6 +9,11 @@
 //     marks them "Update Required" (Steam delays that update for games not played
 //     recently). A user-started update after the remap is a 0-byte check ("has no
 //     changes") that puts the depot back.
+//     Installed neutron games are set to "only update when launched": at the platform
+//     switch Steam starts the automatic update of recently played games while their
+//     mapping is briefly invalid, finds no Mac depots, deletes the installed files
+//     and downloads everything again. The 0-byte check above is a user-started
+//     update, it still brings real game updates at every Steam start.
 //  2. Map new games: every library game without a Mac version that neutron has not
 //     seen yet gets the tool, at start and while Steam runs. Seen games (mapped, Mac
 //     native, or set to none by the user) are kept in localStorage, so a game set
@@ -35,13 +40,27 @@
     SteamClient.Downloads.ResumeAppUpdate(id);
   }
 
-  if (window.__neutronSync) return `remapped ${mapped.length}, checked ${installed.length} installed, watch already running`;
-
   const details = id => new Promise(resolve => {
     let done = false;
     const h = SteamClient.Apps.RegisterForAppDetails(id, d => { if (done) return; done = true; h.unregister(); resolve(d); });
     setTimeout(() => { if (!done) { done = true; h.unregister(); resolve(null); } }, 3000);
   });
+  // eAutoUpdateValue 1: "only update this game when I launch it"
+  const holdUpdates = async () => {
+    let n = 0;
+    for (const app of games()) {
+      if (!app.installed) continue;
+      const d = await details(app.appid);
+      if (!d || !(d.strCompatToolName || '').startsWith(TOOL) || d.eAutoUpdateValue === 1) continue;
+      SteamClient.Apps.SetAppAutoUpdateBehavior(app.appid, 1);
+      n++;
+    }
+    return n;
+  };
+  const held = await holdUpdates();
+
+  if (window.__neutronSync) return `remapped ${mapped.length}, checked ${installed.length} installed, updates held for ${held}, watch already running`;
+
   let seen;
   try { seen = new Set(JSON.parse(localStorage.getItem(KEY) || '[]')); } catch { seen = new Set(); }
   for (const id of mapped) seen.add(id);
@@ -66,6 +85,7 @@
         seen.add(id);
       }
       localStorage.setItem(KEY, JSON.stringify([...seen]));
+      await holdUpdates();
     } finally {
       busy = false;
     }
@@ -74,5 +94,5 @@
 
   const added = await check();
   window.__neutronSync = setInterval(check, 30000);
-  return `remapped ${mapped.length}, checked ${installed.length} installed, mapped ${added} new, seen ${seen.size}`;
+  return `remapped ${mapped.length}, checked ${installed.length} installed, updates held for ${held}, mapped ${added} new, seen ${seen.size}`;
 })()
