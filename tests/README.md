@@ -20,6 +20,7 @@ as x86_64 Windows executables, like games, so they also run through FEX.
 | `d3d12_dxil_atomic64.c` | 64-bit InterlockedMax/Min like Nanite | no | `-ld3d12` |
 | `d3d12_dxil_pso.c` | pipeline creation for 12 pixel shaders (derivatives, LOD, MSAA, coverage, UAV, wave) | no | `-ld3d12` |
 | `d3d11_typeless_views.c` | typeless render targets written through one view type and read through another (lossless compression check) | no | `-ld3d11 -ld3dcompiler` |
+| `fex_float.c` | 748 checks of x86 SSE float results under FEX, alone, after and right before a call into ARM64EC code (NaN sign and propagation, min/max, DAZ/FTZ, compares, conversions, rcp/rsqrt, upper lanes of scalar ops); `bench` also prints the cost of such a call after integer, float and vector code | no | |
 | `sync_semantics.c` | 56 checks of Windows sync semantics (wait any/all, APCs, abandoned mutexes, cross-process), with and without `NEUTRON_MSYNC=1` | no | |
 | `sandbox/sbtest.sh` | the game sandbox (`NEUTRON_SANDBOX=1`): 35 checks of what is denied and allowed, D3D11, audio and controllers inside it | no | builds its own |
 

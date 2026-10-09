@@ -303,6 +303,9 @@ log, `NEUTRON_HUD=2` shows the Metal HUD with DXMT's per-frame statistics.
   bits are already clear, and every IR block with vector register operands
   ensures NEP/AH at its start (mrs, tbnz, rarely orr+msr). Native calls from
   integer code cost about 5 ns, the d3d11 draw loop gained 19% FPS (fex 0003).
+  Blocks without float math, with compares or with a few add/sub/mul/div before a
+  native call skip the FPCR write too: about 5 ns after float code (fex 0004, see
+  D3D11 CPU cost).
   `FEX_HOSTFEATURES=disableafp` is no alternative, it slows scalar float code.
 - **x64 syscall stubs.** The ARM64EC x64 syscall stubs (`__ASM_SYSCALL_FUNC`)
   tested `0x7ffe0308`, which faults since KUSER lives above 4 GB, on every
@@ -422,20 +425,31 @@ app-thread time per frame 45 to 80% lower, FPS 2 to 6 times, images identical.
 - 0024: command data comes from a 64 KB span per chunk.
 - 0025, 0026: unchanged input layout, depth-stencil state and blend factor emit no
   command; state setters use `static_cast` instead of a QueryInterface.
-- Left: FEX's FPCR toggling on every x64 to ARM64EC call after float code (26.7 ns
-  against 4.7 ns from integer code, 14-20% of the app thread); DXMT's encoder
-  thread at about 120 ns per draw, half of it in the AGX driver.
-- FPCR, measured on M5 Max: reading costs 0.3 ns, writing the same value 2.7 ns,
-  writing a changed bit about 9 ns (any bit) and the write serializes. Under FEX
-  patch 0003 a call into ARM64EC code costs 4.3 ns after integer code and 25-27 ns
-  after any block that touched an xmm register. A prototype (not in the series,
-  needs game tests and a re-audit on every FEX update: it classifies FEX's IR ops)
-  sets the x86 float mode only for blocks that need it and checks small float
-  blocks for NaN instead: 25 ns to 5 ns per call, x86 NaN/denormal/DAZ/FTZ results
-  exact. It does not speed up `d3d11_headless` yet, because clang divides junk
-  vector lanes (0/0), so the NaN path runs every draw; fixing NaN lanes in software
-  instead of switching FPCR is the next step. `FEX_HOSTFEATURES=disableafp` makes
-  every call cheap but scalar float chains 85% slower and x86 NaN results wrong.
+- fex 0004: FPCR, measured on M5 Max: reading costs 0.3 ns, writing the same value
+  2.7 ns, writing a changed bit about 9 ns (any bit) and the write serializes. Under
+  0003 a call into ARM64EC code cost 4.5 ns after integer code and 26 ns after any
+  block that touched an xmm register (14-20% of the app thread). 0004 sets NEP/AH only
+  in blocks that need them: data moves and int to float never, compares and float to
+  int only under FTZ, and up to 8 add/sub/mul/div in a block that ends in a call that
+  may reach ARM64EC code run without AH. Only NaN lanes can differ there, so each
+  result is checked for NaN and a NaN lane is rebuilt with the x86 rules (first source
+  if NaN, else second, else the negative default NaN) by a few vector ops and FMINNM,
+  without an FPCR write (with DAZ set FMINNM would flush denormals, then AH is set and
+  the op redone). The prototype set AH on a NaN instead, which clang's `fill_cb` in
+  `d3d11_headless` hits every draw (it divides junk vector lanes, 0/0).
+  `tests/fex_float.c bench`: call after scalar, vector, double float code, compares,
+  moves and 0/0 lanes 26.5 to 4.6-5.2 ns, after sqrtss (still AFP) unchanged, pure
+  float code (`cpu.exe float_sse_16k`) unchanged. `d3d11_headless` submit_ms (median
+  of 7 interleaved runs): base 0.55 to 0.37, state 0.89 to 0.71, indexed, update,
+  inst and deferred 17-31% lower, same images. `bind` does not gain and its FPS drops
+  about 10% in most runs: the app thread then waits in its `GetData` poll and app and
+  encoder thread most likely slow each other down (bistable, some runs are 5% faster;
+  with a busy loop of a few ns per draw `bind` is 5% faster in every run). All 748 checks of
+  `tests/fex_float.c` pass. Needs a re-audit on every FEX update: it classifies FEX's
+  IR ops by name, and a new float op that is not listed runs without AH.
+  `FEX_HOSTFEATURES=disableafp` makes every call cheap but scalar float chains 85%
+  slower and x86 NaN results wrong.
+- Left: DXMT's encoder thread at about 120 ns per draw, half of it in the AGX driver.
 - Measured and not worth changing: Wine's `arm64x_check_call` costs about 0.67 ns
   per indirect call in ARM64EC code (1.33 ns against 0.66 ns for plain ARM64),
   which is the call and return the compiler emits around the check, not the TEB
@@ -518,6 +532,7 @@ DXMT patches with `git apply`, all in file name order.
 | `fex/0001-macos-teb-tsd-and-map-jit` | TEB via TSD, `MAP_JIT` write scopes, macOS UnixLib |
 | `fex/0002-host-page-guards` | Guard pages cover a whole host page |
 | `fex/0003-afp-lazy-native-transition` | Fewer FPCR writes on x64 to ARM64EC calls |
+| `fex/0004-afp-only-for-float-blocks` | x86 float mode (FPCR.NEP/AH) only in blocks that need it, NaN lanes before a native call fixed in software |
 | `llvm-mingw/0001-ntcurrentteb-tsd` | `NtCurrentTeb()` via TSD in `winnt.h` |
 | `dxmt/0001-d3d12-clock-calibration` | D3D12 timestamp frequency and clock calibration |
 | `dxmt/0002-no-thread-local` | No `thread_local` in the occlusion query code |
