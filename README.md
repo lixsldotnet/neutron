@@ -167,6 +167,7 @@ For bug reports please use the issue template and attach both logs.
 | `dev/steam-panel.js` | The Compatibility tab in the game properties |
 | `dev/steamjs.mjs` | Runs JavaScript in the Steam UI over the CEF debug port |
 | `dev/steam.sh` | Restarts Steam and waits for the hook, manual mapping |
+| `dev/gametest.sh` | Starts the installed games one after another and measures first frame, FPS and the slowest frame |
 | `dev/direct-test.sh` | Shows which swapchain variants macOS presents without compositing |
 | `dev/bench/` | Benchmarks and hang watcher ([README](dev/bench/README.md)) |
 | `tests/` | Small Windows test programs: Steam bridge, D3D11, D3D12, sync, sandbox ([README](tests/README.md)) |
