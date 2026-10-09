@@ -1,6 +1,6 @@
 wineserver at the top QoS class and latency tier 0, per-thread kqueue timers for
 precise sleeps (NEUTRON_PRECISE_TIMERS=0 disables). Also the msync parts (0015) of
-server/thread.c and dlls/ntdll/unix/sync.c.
+server/thread.c and dlls/ntdll/unix/sync.c, and the fast QPC parts (0016) of sync.c.
 --- a/server/main.c
 +++ b/server/main.c
 @@ -35,6 +35,11 @@
@@ -92,8 +92,8 @@ server/thread.c and dlls/ntdll/unix/sync.c.
 +        if (pending & 2) pthread_kill( pthread_self(), SIGQUIT );
 +        if (pending & 1) pthread_kill( pthread_self(), SIGUSR1 );
 +    }
-+}
-+
+ }
+ 
 +void msync_init_client(void)
 +{
 +    const char *env = getenv( "NEUTRON_MSYNC_SPIN" );
@@ -231,8 +231,8 @@ server/thread.c and dlls/ntdll/unix/sync.c.
 +     * cache entries stay busy and reused handle values are never cached again */
 +    msync_release_held( data );
 +    msync_unblock( NULL );
- }
- 
++}
++
 +static NTSTATUS linux_wait_objs( int device, DWORD count, const int *objs, WAIT_TYPE type,
 +                                 int alert_fd, const LARGE_INTEGER *timeout )
 +{
@@ -391,10 +391,13 @@ server/thread.c and dlls/ntdll/unix/sync.c.
      }
  
      release_inproc_sync( wait_sync );
-@@ -2416,6 +2685,31 @@
- }
- 
- 
+@@ -2413,8 +2682,33 @@
+ #else
+     return STATUS_NO_YIELD_PERFORMED;
+ #endif
++}
++
++
 +#ifdef __APPLE__
 +/* neutron: per-thread kqueue for precise sleeps, NEUTRON_PRECISE_TIMERS=0 disables */
 +static int precise_timers_enabled(void)
@@ -406,8 +409,8 @@ server/thread.c and dlls/ntdll/unix/sync.c.
 +        enabled = !(e && e[0] == '0');
 +    }
 +    return enabled;
-+}
-+
+ }
+ 
 +static __thread int precise_kq = -2;
 +static int precise_timer_kq(void)
 +{
@@ -419,10 +422,9 @@ server/thread.c and dlls/ntdll/unix/sync.c.
 +    return precise_kq;
 +}
 +#endif
-+
+ 
  /******************************************************************
   *		NtDelayExecution (NTDLL.@)
-  */
 @@ -2459,6 +2753,28 @@
              NtQuerySystemTime( &now );
              diff = (when - now.QuadPart + 9) / 10;
@@ -452,3 +454,46 @@ server/thread.c and dlls/ntdll/unix/sync.c.
              tv.tv_sec  = diff / 1000000;
              tv.tv_usec = diff % 1000000;
              if (select( 0, NULL, NULL, NULL, &tv ) != -1) break;
+@@ -2468,7 +2784,42 @@
+ }
+ 
+ 
++#if defined(WINE_TEB_IN_TSD) && defined(__APPLE__) && defined(__aarch64__)
+ /******************************************************************************
++ *              init_qpc_info
++ *
++ * neutron: lets RtlQueryPerformanceCounter read the counter in PE code when the
++ * commpage has the user-mode path and gives the same values as mach_continuous_time.
++ */
++void init_qpc_info(void)
++{
++    volatile struct neutron_qpc_info *info = NEUTRON_QPC_INFO;
++    mach_timebase_info_data_t timebase;
++    const char *env = getenv( "NEUTRON_FAST_QPC" );
++    unsigned long long before, ticks, after;
++    int i;
++
++    if (env && !strcmp( env, "0" )) return;
++    if (mach_timebase_info( &timebase ) || !timebase.numer || !timebase.denom) return;
++    for (i = 0; i < 100; i++)
++    {
++        before = mach_continuous_time();
++        if (!darwin_continuous_time( &ticks )) return;
++        after = mach_continuous_time();
++        if (ticks < before || ticks > after)
++        {
++            WARN( "commpage time %llu outside %llu-%llu, using the syscall\n", ticks, before, after );
++            return;
++        }
++    }
++    info->numer = timebase.numer;
++    info->denom = timebase.denom;
++    info->enabled = 1;
++}
++#endif
++
++
++/******************************************************************************
+  *              NtQueryPerformanceCounter (NTDLL.@)
+  */
+ NTSTATUS WINAPI NtQueryPerformanceCounter( LARGE_INTEGER *counter, LARGE_INTEGER *frequency )

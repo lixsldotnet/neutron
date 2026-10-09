@@ -2,6 +2,7 @@ QueryPerformanceCounter without a syscall: RtlQueryPerformanceCounter reads the 
 code from the macOS commpage, like libsystem's mach_continuous_time (ntdll). Faster process
 starts: no OpenGL driver load for the GPU list without EGL (win32u opengl.c), font files from
 CTFontManagerCopyAvailableFontURLs instead of font descriptors (win32u freetype.c).
+The parts in ntdll's unix_private.h and virtual.c are in 0003, unix/sync.c in 0012.
 --- a/dlls/ntdll/unixlib.h
 +++ b/dlls/ntdll/unixlib.h
 @@ -78,6 +78,46 @@
@@ -75,77 +76,6 @@ CTFontManagerCopyAvailableFontURLs instead of font descriptors (win32u freetype.
      NtQueryPerformanceCounter( counter, NULL );
      return TRUE;
  }
---- a/dlls/ntdll/unix/unix_private.h
-+++ b/dlls/ntdll/unix/unix_private.h
-@@ -140,7 +140,10 @@
- #ifdef WINE_TEB_IN_TSD
- extern unsigned long long __wine_teb_tsd_offset;
- extern void set_teb_tsd( TEB *teb );
-+#ifdef __APPLE__
-+extern void init_qpc_info(void);
- #endif
-+#endif
- 
- static inline struct thread_data *get_thread_data(void)
- {
---- a/dlls/ntdll/unix/sync.c
-+++ b/dlls/ntdll/unix/sync.c
-@@ -2784,7 +2784,42 @@
- }
- 
- 
-+#if defined(WINE_TEB_IN_TSD) && defined(__APPLE__) && defined(__aarch64__)
- /******************************************************************************
-+ *              init_qpc_info
-+ *
-+ * neutron: lets RtlQueryPerformanceCounter read the counter in PE code when the
-+ * commpage has the user-mode path and gives the same values as mach_continuous_time.
-+ */
-+void init_qpc_info(void)
-+{
-+    volatile struct neutron_qpc_info *info = NEUTRON_QPC_INFO;
-+    mach_timebase_info_data_t timebase;
-+    const char *env = getenv( "NEUTRON_FAST_QPC" );
-+    unsigned long long before, ticks, after;
-+    int i;
-+
-+    if (env && !strcmp( env, "0" )) return;
-+    if (mach_timebase_info( &timebase ) || !timebase.numer || !timebase.denom) return;
-+    for (i = 0; i < 100; i++)
-+    {
-+        before = mach_continuous_time();
-+        if (!darwin_continuous_time( &ticks )) return;
-+        after = mach_continuous_time();
-+        if (ticks < before || ticks > after)
-+        {
-+            WARN( "commpage time %llu outside %llu-%llu, using the syscall\n", ticks, before, after );
-+            return;
-+        }
-+    }
-+    info->numer = timebase.numer;
-+    info->denom = timebase.denom;
-+    info->enabled = 1;
-+}
-+#endif
-+
-+
-+/******************************************************************************
-  *              NtQueryPerformanceCounter (NTDLL.@)
-  */
- NTSTATUS WINAPI NtQueryPerformanceCounter( LARGE_INTEGER *counter, LARGE_INTEGER *frequency )
---- a/dlls/ntdll/unix/virtual.c
-+++ b/dlls/ntdll/unix/virtual.c
-@@ -4228,7 +4228,10 @@
-         exit(1);
-     }
-     *(volatile unsigned long long *)view->base = __wine_teb_tsd_offset;
-+#ifdef __APPLE__
-+    init_qpc_info();  /* neutron: QPC in PE code, info at +0x10 */
- #endif
-+#endif
- 
-     status = map_view( &view, NULL, signal_stack_mask + 1 + kernel_stack_size, MEM_TOP_DOWN,
-                        VPROT_READ | VPROT_WRITE | VPROT_COMMITTED, 4 * limit_4g, 0, 0 );
 --- a/dlls/win32u/opengl.c
 +++ b/dlls/win32u/opengl.c
 @@ -3527,6 +3527,12 @@
