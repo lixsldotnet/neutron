@@ -202,8 +202,13 @@ find_steamclient() {
   return 1
 }
 
-if [ -z "${NEUTRON_STEAMCLIENT_DYLIB:-}" ]; then
-  NEUTRON_STEAMCLIENT_DYLIB="$(find_steamclient)" || die "steamclient.dylib not found under $STEAM_ROOT"
+# Games need Steam's client library for the Steam API. The other verbs (runinprefix
+# for tests and tools, the get*path helpers) also work without it, e.g. in CI without Steam.
+if [ -z "${NEUTRON_STEAMCLIENT_DYLIB:-}" ] && ! NEUTRON_STEAMCLIENT_DYLIB="$(find_steamclient)"; then
+  case "${1:-}" in
+    run|waitforexitandrun) die "steamclient.dylib not found under $STEAM_ROOT" ;;
+  esac
+  NEUTRON_STEAMCLIENT_DYLIB=""
 fi
 export NEUTRON_STEAMCLIENT_DYLIB
 
