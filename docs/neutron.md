@@ -101,6 +101,12 @@ and `dev/steam-hook.sh` do the following at every Steam start:
    SharedJSContext), at start and every 30 s while Steam runs. Mapped games, Mac
    games and games set to none by the user are in the seen list and stay as
    they are.
+   Native games are never translated. With a tool mapped, Steam's app details list
+   `osx` for every game, so the Mac check uses Steam's app info cache instead
+   (`appcache/appinfo.vdf`, `common/oslist`, read by `dev/steam-native.mjs`). A
+   mapped game with a Mac version loses the mapping at the next Steam start if it
+   is not installed. An installed one keeps it, clearing it would make Steam swap
+   the Windows files for the Mac depots; the hook log counts it.
 8. **Compatibility tab.** `dev/steam-panel.js` adds a "Compatibility" tab to the
    game properties through `g_PopupManager` popup callbacks: the tool for the
    game (Neutron or none) and the neutron settings. If Steam shows its own
