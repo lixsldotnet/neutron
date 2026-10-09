@@ -1,0 +1,74 @@
+# Full build from scratch on a macOS arm64 runner (build.sh), then the CPU-only
+# Windows tests that do not need a GPU (the runners have no Metal acceleration).
+# Runs for changes to the build, the patches or the tool, weekly, and by hand.
+# Nothing built here is uploaded: lsteamclient's license does not allow binaries.
+name: build
+
+on:
+  pull_request:
+    paths: ['build.sh', 'patches/**', 'tool/**', 'tests/sync_semantics.c', '.github/workflows/build.yml']
+  push:
+    branches: [main]
+    paths: ['build.sh', 'patches/**', 'tool/**', 'tests/sync_semantics.c', '.github/workflows/build.yml']
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Newest Xcode and the Metal toolchain
+        run: |
+          xcode="$(find /Applications -maxdepth 1 -name 'Xcode_*.app' | sort -V | tail -1)"
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+          xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
+      - name: Homebrew packages
+        run: brew install bison flex autoconf cmake ninja meson pkgconf gnutls freetype
+      - name: Disk and CPUs
+        run: df -h . && sysctl -n hw.ncpu hw.memsize
+      - name: LLVM cache key
+        id: llvm
+        run: echo "key=llvm-$(sed -n '/LLVM_VERSION=/p;/llvm-darwin-arm64" \]; then/,/^fi/p' build.sh | shasum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: .native-build/toolchains/llvm-darwin-arm64
+          key: ${{ steps.llvm.outputs.key }}
+      - name: build.sh
+        run: ./build.sh
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            .native-build/**/*.log
+          if-no-files-found: ignore
+      - name: Wine sync semantics with and without msync
+        run: |
+          set -euo pipefail
+          dist="$PWD/.native-build/dist/neutron"
+          cc="$(find .native-build/toolchains -maxdepth 3 -path '*/bin/x86_64-w64-mingw32-clang' | head -1)"
+          "$cc" -O2 -o sync_semantics.exe tests/sync_semantics.c
+          for msync in 0 1; do
+            data="$RUNNER_TEMP/data-$msync"
+            mkdir -p "$data"
+            env SteamAppId=ci STEAM_COMPAT_DATA_PATH="$data" NEUTRON_FILES="$dist/files" NEUTRON_MSYNC=$msync \
+              "$dist/neutron" runinprefix "$PWD/sync_semantics.exe" | tr -d '\r' | tee "sync-$msync.txt"
+            # "sync_semantics: <passed>/<total> passed"
+            awk '/^sync_semantics:/ { split($2, n, "/"); ok = (n[1] == n[2]) } END { exit !ok }' "sync-$msync.txt"
+            WINEPREFIX="$data/pfx" "$dist/files/bin/wineserver" -k || true
+          done

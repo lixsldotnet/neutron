@@ -119,6 +119,7 @@ export WINEPREFIX="$STEAM_COMPAT_DATA_PATH/pfx"
 export USER=steamuser   # Wine names the Windows profile after $USER
 # FEX memory ordering: fast by default (Unity game 58 to 98 FPS against strict),
 # strict for games with threading races under fast (APP_TSO_<appid>, below).
+# shellcheck disable=SC2034  # read through ${!tso_var}
 APP_TSO_427410=strict   # Abiotic Factor: GameThread vs SlateLoadingThread deadlock
 tso_var="APP_TSO_$APP_ID"
 NEUTRON_FEX_TSO="${NEUTRON_FEX_TSO:-${!tso_var:-fast}}"
@@ -380,6 +381,7 @@ EOF
 # Example: APP_ARGS_<appid>="-dx11"
 # With -dx11 in APP_ARGS, a -dx12/-d3d12 from the game's launch entry is dropped
 # (DXMT's D3D12 is not enough for these games yet).
+# shellcheck disable=SC2034  # read through ${!var} in app_args
 APP_ARGS_1144200="-dx11"   # Ready or Not: "DirectX 12 is not supported" with -dx12
 # NEUTRON_D3D12_SM6=1 lifts the forced -dx11 (to test DX12 with the DXIL front end).
 if [ "${NEUTRON_D3D12_SM6:-0}" = 1 ]; then

@@ -59,8 +59,9 @@ xcrun -sdk macosx metal --version >/dev/null 2>&1 \
   || die "no Metal compiler: install full Xcode, then run xcodebuild -downloadComponent MetalToolchain"
 
 mkdir -p "$T" "$SRC"
-export PATH="$LM/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
-export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig"
+PATH="$LM/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig"
+export PATH PKG_CONFIG_PATH
 
 # git checkout of one commit, plus patches
 fetch_git() {  # fetch_git <dir> <url> <ref> [patch...]
