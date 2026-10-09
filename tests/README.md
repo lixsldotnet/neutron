@@ -19,6 +19,8 @@ as x86_64 Windows executables, like games, so they also run through FEX.
 | `d3d12_dxil_heap.c` | SM 6.6 descriptor heap indexing | no | `-ld3d12` |
 | `d3d12_dxil_atomic64.c` | 64-bit InterlockedMax/Min like Nanite | no | `-ld3d12` |
 | `d3d12_dxil_pso.c` | pipeline creation for 12 pixel shaders (derivatives, LOD, MSAA, coverage, UAV, wave) | no | `-ld3d12` |
+| `d3d12_dxil_gs.c` | DXIL geometry shaders: the `d3d12_gs.c` cases plus GS instancing (`[instance(2)]`, SV_GSInstanceID) | no | `-ld3d12` |
+| `d3d12_dxil_tess.c` | DXIL hull and domain shaders: the `d3d12_tess.c` cases, the patch constant function reads an output control point | no | `-ld3d12` |
 | `d3d12_gs.c` | geometry shaders (DXBC): point to quad, strips, indexed 16/32-bit with base vertex, instancing, line input with an SRV, render target array index, root parameters visible to the GS only, mixed with ordinary draws | no | `-ld3d12 -ld3dcompiler` |
 | `d3d12_tess.c` | tessellation (DXBC): tri and quad domains, patch constants, a displaced edge that only shows when the patch is tessellated, factors from root constants, indexed and instanced patches | no | `-ld3d12 -ld3dcompiler` |
 | `d3d11_typeless_views.c` | typeless render targets written through one view type and read through another (lossless compression check) | no | `-ld3d11 -ld3dcompiler` |

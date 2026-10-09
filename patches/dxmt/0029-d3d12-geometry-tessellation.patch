@@ -413,7 +413,7 @@ index c2e99a3..0eac8be 100644
  
    virtual void AddRefPrivate() = 0;
 diff --git a/src/d3d12/d3d12_pipeline_graphics.cpp b/src/d3d12/d3d12_pipeline_graphics.cpp
-index 826a4ee..efd9153 100644
+index 826a4ee..c56f320 100644
 --- a/src/d3d12/d3d12_pipeline_graphics.cpp
 +++ b/src/d3d12/d3d12_pipeline_graphics.cpp
 @@ -25,6 +25,8 @@
@@ -425,16 +425,22 @@ index 826a4ee..efd9153 100644
  
  namespace dxmt {
  
-@@ -241,7 +243,7 @@ MTLD3D12PipelineState::InitializeShader(
-   if (FAILED(hr = Parser.ReadDXBC(Bytecode.pShaderBytecode, Bytecode.BytecodeLength)))
+@@ -238,10 +240,12 @@ MTLD3D12PipelineState::InitializeShader(
+   using namespace microsoft;
+   HRESULT hr;
+   CDXBCParser Parser;
+-  if (FAILED(hr = Parser.ReadDXBC(Bytecode.pShaderBytecode, Bytecode.BytecodeLength)))
++  if (FAILED(hr = Parser.ReadDXBC(Bytecode.pShaderBytecode, Bytecode.BytecodeLength))) {
++    ERR("CreatePipelineState: invalid shader container (", Bytecode.BytecodeLength, " bytes)"); /* neutron */
      return hr;
++  }
  
 -  /* neutron: DXIL goes to airconv's experimental DXIL front end (compute only for now) */
 +  /* neutron: DXIL goes to airconv's experimental DXIL front end */
  
    SM50Error error;
    if (SM50Initialize(Bytecode.pShaderBytecode, Bytecode.BytecodeLength, ppShader, pRefl, &error)) {
-@@ -463,6 +465,168 @@ public:
+@@ -463,6 +467,171 @@ public:
      forced_sample_count = pDesc->RasterizerState.ForcedSampleCount;
    }
  
@@ -489,7 +495,10 @@ index 826a4ee..efd9153 100644
 +      ERR("Failed to load ", name, ": ", err.description().getUTF8String());
 +      return {};
 +    }
-+    return lib.newFunction(name);
++    WMT::Reference<WMT::Function> func = lib.newFunction(name);
++    if (!func)
++      ERR("Failed to load ", name, ": function not in library");
++    return func;
 +  }
 +
 +  WMT::Reference<WMT::Function>
@@ -593,7 +602,7 @@ index 826a4ee..efd9153 100644
 +        state = device_->GetMTLDevice().newRenderPipelineState(info, err);
 +      }
 +      if (!state)
-+        ERR("Failed to create mesh PSO: ", err.description().getUTF8String());
++        ERR("Failed to create mesh PSO: ", err ? err.description().getUTF8String() : "no error from Metal");
 +    }
 +    if (!state)
 +      mesh_pso_failed_[IndexFormat][Strip] = true;
@@ -603,7 +612,7 @@ index 826a4ee..efd9153 100644
    virtual HRESULT
    Initialize(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc) {
      if (pDesc->StreamOutput.NumEntries) {
-@@ -470,81 +634,137 @@ public:
+@@ -470,81 +639,137 @@ public:
        return E_NOTIMPL;
      }
  
@@ -729,14 +738,14 @@ index 826a4ee..efd9153 100644
 +          tess_factor_config >= 4 && tess_factor_config <= 64) {
 +        expected_tess_factor = tess_factor_config;
 +        max_potential_factor = std::min(tess_factor_config, max_potential_factor);
-       }
--      rootsig.next = &data_ia_layout;
++      }
 +      if ((float)max_potential_factor < expected_tess_factor) {
 +        WARN(
 +            "maxtessfactor(", expected_tess_factor, ") is too large for a mesh pipeline. Clamping to ",
 +            max_potential_factor
 +        );
-+      }
+       }
+-      rootsig.next = &data_ia_layout;
 +      max_potential_tess_factor_ = max_potential_factor;
 +    } else if (has_gs && gs_passthrough_ == ~0u) {
 +      kind = Kind::Geometry;
@@ -785,7 +794,7 @@ index 826a4ee..efd9153 100644
      }
  
      WMTRenderPipelineInfo info;
-@@ -552,8 +772,23 @@ public:
+@@ -552,8 +777,23 @@ public:
  
      bool dual_source_blending = false;
  
@@ -811,7 +820,7 @@ index 826a4ee..efd9153 100644
  
      if (pDesc->PS.pShaderBytecode) {
        auto sha1 = Sha1HashState::compute(pDesc->PS.pShaderBytecode, pDesc->PS.BytecodeLength);
-@@ -568,11 +803,13 @@ public:
+@@ -568,11 +808,13 @@ public:
        data_ps.unorm_output_reg_mask = 0;
        data_ps.sample_mask = pDesc->SampleMask;
        data_ps.type = SM50_SHADER_PSO_PIXEL_SHADER;
@@ -826,7 +835,7 @@ index 826a4ee..efd9153 100644
        }
  
        SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
-@@ -593,17 +830,13 @@ public:
+@@ -593,17 +835,13 @@ public:
          ERR("Failed to compile ps shader: ", SM50GetErrorMessageString(sm50_err));
          return E_FAIL;
        }
@@ -847,7 +856,7 @@ index 826a4ee..efd9153 100644
  
        pso = metal.newRenderPipelineState(info, err);
  
-@@ -611,6 +844,11 @@ public:
+@@ -611,6 +849,11 @@ public:
          ERR("Failed to create PSO: ", err.description().getUTF8String());
          return E_FAIL;
        }

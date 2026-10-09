@@ -1,8 +1,22 @@
 airconv: hull shaders from vkd3d-shader (Wine's D3DCompile, used by games that compile HLSL at run
 time) index the input control points with vOutputControlPointID directly, not with a temp register.
 The relative index decoder only knew temps and crashed the converter (D3D11 and D3D12 tessellation).
-Pipeline compile errors that are not UnsupportedFeature keep their message.
+Compile errors keep their message (other LLVM error types, no trailing NUL that cut the log line).
 
+diff --git a/src/airconv/airconv_public.h b/src/airconv/airconv_public.h
+index e167ae4..a1e6d95 100644
+--- a/src/airconv/airconv_public.h
++++ b/src/airconv/airconv_public.h
+@@ -362,6 +362,9 @@ inline std::string SM50GetErrorMessageString(sm50_error_t pError) {
+   str.resize(256);
+   auto size = SM50GetErrorMessage(pError, str.data(), str.size());
+   str.resize(size);
++  /* neutron: some messages end in a NUL, which cut the log line (it never got its newline) */
++  if (auto nul = str.find('\0'); nul != std::string::npos)
++    str.resize(nul);
+   return str;
+ };
+ 
 diff --git a/src/airconv/dxbc_converter.cpp b/src/airconv/dxbc_converter.cpp
 index 5b8cd99..ff71014 100644
 --- a/src/airconv/dxbc_converter.cpp

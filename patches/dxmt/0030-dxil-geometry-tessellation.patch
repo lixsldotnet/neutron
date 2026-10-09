@@ -1,0 +1,608 @@
+DXIL geometry, hull and domain shaders in the DXIL front end (0014), on the same mesh pipeline emulation as
+DXBC: GS state and emit/cut/instance/primitive ops, HS state with the control point function on the patch
+threads and the patch constant function on thread 0 (then the control points go to the payload), DS domain
+location and patch constants. Signatures go through the DXBC handlers. Stream 0 only, no isolines.
+
+diff --git a/src/airconv/dxbc_converter.cpp b/src/airconv/dxbc_converter.cpp
+index ff71014..ca738a3 100644
+--- a/src/airconv/dxbc_converter.cpp
++++ b/src/airconv/dxbc_converter.cpp
+@@ -317,7 +317,7 @@ component_type_from_pixel_format(air::MTLPixelFormat format) {
+ }
+ 
+ /* neutron: the shader body comes from DXBC instructions or from a DXIL module */
+-static llvm::Expected<llvm::BasicBlock *>
++llvm::Expected<llvm::BasicBlock *>
+ convert_body(SM50ShaderInternal *pShaderInternal, context &ctx, llvm::BasicBlock *epilogue_bb) {
+   if (pShaderInternal->is_dxil)
+     return dxmt::dxil::EmitBody(pShaderInternal, ctx, epilogue_bb);
+@@ -1318,8 +1318,9 @@ AIRCONV_API int SM50Initialize(
+       pRefl->PostTessellator = {.MaxPotentialTessFactor = max_potential_tess_factor};
+     }
+     if (sm50_shader->shader_type == microsoft::D3D10_SB_GEOMETRY_SHADER) {
+-      if (binding_cbuffer_mask || binding_sampler_mask || binding_uav_mask || binding_srv_hi_mask ||
+-          binding_srv_lo_mask ||
++      /* neutron: DXIL geometry shaders have no DXBC basic blocks to check */
++      if (sm50_shader->is_dxil || binding_cbuffer_mask || binding_sampler_mask || binding_uav_mask ||
++          binding_srv_hi_mask || binding_srv_lo_mask ||
+           !(CheckGSBBIsPassThrough(sm50_shader->entry()) &&
+             CheckGSSignatureIsPassThrough(inputParser, outputParser, pRefl->GeometryShader.Data))) {
+         pRefl->GeometryShader.GSPassThrough = ~0u;
+diff --git a/src/airconv/dxbc_converter.hpp b/src/airconv/dxbc_converter.hpp
+index 726110e..e80c537 100644
+--- a/src/airconv/dxbc_converter.hpp
++++ b/src/airconv/dxbc_converter.hpp
+@@ -453,6 +453,7 @@ public:
+   std::vector<char> dxil_bitcode;
+   std::vector<char> dxil_container;
+   std::string dxil_entry;
++  std::string dxil_patch_constant_entry; /* neutron: DXIL hull shaders */
+   uint32_t dxil_lane_arg = ~0u;
+   uint32_t dxil_lanes_arg = ~0u;
+   uint32_t dxil_sample_index_arg = ~0u;
+@@ -480,6 +481,10 @@ size_t estimate_payload_size(SM50ShaderInternal *pHullStage, float factor, uint3
+ 
+ size_t estimate_mesh_size(SM50ShaderInternal *pDomainStage, uint32_t max_potential_factor_int);
+ 
++/* neutron: DXBC basic blocks or the DXIL body (dxil_converter.cpp) */
++llvm::Expected<llvm::BasicBlock *>
++convert_body(SM50ShaderInternal *pShaderInternal, context &ctx, llvm::BasicBlock *epilogue_bb);
++
+ std::unique_ptr<BindingMap> setup_binding_table2(
+     const ShaderInfo *shader_info, air::FunctionSignatureBuilder &func_signature, llvm::Module &module,
+     uint32_t argbuffer_constant_slot = SM50_BINDING_INDEX_CONSTANT_BUFFER, uint32_t argbuffer_slot = SM50_BINDING_INDEX_ARGUMENT_TABLE
+diff --git a/src/airconv/dxbc_converter_gs.cpp b/src/airconv/dxbc_converter_gs.cpp
+index d237b9d..a792a6a 100644
+--- a/src/airconv/dxbc_converter_gs.cpp
++++ b/src/airconv/dxbc_converter_gs.cpp
+@@ -496,7 +496,7 @@ convert_dxbc_geometry_shader(
+     return err;
+   }
+ 
+-  auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
++  auto real_entry = convert_body(pShaderInternal, ctx, epilogue_bb); /* neutron: or DXIL */
+   if (auto err = real_entry.takeError()) {
+     return err;
+   }
+@@ -778,7 +778,7 @@ convert_dxbc_vertex_for_geometry_shader(
+     return err;
+   }
+ 
+-  auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
++  auto real_entry = convert_body(const_cast<SM50ShaderInternal *>(pShaderInternal), ctx, epilogue_bb); /* neutron: or DXIL */
+   if (auto err = real_entry.takeError()) {
+     return err;
+   }
+diff --git a/src/airconv/dxbc_converter_ts.cpp b/src/airconv/dxbc_converter_ts.cpp
+index fc907cb..c6d09dd 100644
+--- a/src/airconv/dxbc_converter_ts.cpp
++++ b/src/airconv/dxbc_converter_ts.cpp
+@@ -471,7 +471,7 @@ convert_dxbc_vertex_hull_shader(
+     if (auto err = prologue.build(ctx).takeError()) {
+       return err;
+     }
+-    auto real_entry = convert_basicblocks(pVertexStage->entry(), ctx, epilogue_bb);
++    auto real_entry = convert_body(pVertexStage, ctx, epilogue_bb); /* neutron: or DXIL */
+     if (auto err = real_entry.takeError()) {
+       return err;
+     }
+@@ -615,7 +615,7 @@ convert_dxbc_vertex_hull_shader(
+     if (auto err = prologue.build(ctx).takeError()) {
+       return err;
+     }
+-    auto real_entry = convert_basicblocks(pHullStage->entry(), ctx, epilogue_bb);
++    auto real_entry = convert_body(pHullStage, ctx, epilogue_bb); /* neutron: or DXIL */
+     if (auto err = real_entry.takeError()) {
+       return err;
+     }
+@@ -985,7 +985,7 @@ convert_dxbc_tesselator_domain_shader(
+     resource_map.domain = domain_bary;
+   }
+ 
+-  auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, vertex_emit);
++  auto real_entry = convert_body(pShaderInternal, ctx, vertex_emit); /* neutron: or DXIL */
+   if (auto err = real_entry.takeError()) {
+     return err;
+   }
+diff --git a/src/airconv/dxil_converter.cpp b/src/airconv/dxil_converter.cpp
+index 0736ac7..5c715ad 100644
+--- a/src/airconv/dxil_converter.cpp
++++ b/src/airconv/dxil_converter.cpp
+@@ -159,6 +159,16 @@ enum : uint32_t {
+   DerivCoarseY = 84,
+   DerivFineX = 85,
+   DerivFineY = 86,
++  LoadOutputControlPoint = 103,
++  LoadPatchConstant = 104,
++  DomainLocation = 105,
++  StorePatchConstant = 106,
++  OutputControlPointID = 107,
++  EmitStream = 97,
++  CutStream = 98,
++  EmitThenCutStream = 99,
++  GSInstanceID = 100,
++  PrimitiveID = 108,
+   ThreadId = 93,
+   GroupId = 94,
+   ThreadIdInGroup = 95,
+@@ -550,6 +560,8 @@ enum : uint32_t {
+   ViewPortArrayIndex = 5,
+   ClipDistance = 6,
+   CullDistance = 7,
++  OutputControlPointID = 8,
++  DomainLocation = 9,
+   PrimitiveID = 10,
+   SampleIndex = 12,
+   IsFrontFace = 13,
+@@ -560,6 +572,8 @@ enum : uint32_t {
+   DepthLessEqual = 18,
+   DepthGreaterEqual = 19,
+   StencilRef = 20,
++  TessFactor = 25,
++  InsideTessFactor = 26,
+ };
+ }
+ 
+@@ -610,14 +624,107 @@ row_mask(const SigElement &e) {
+ static llvm::Error
+ synthesize_signature(
+     SM50ShaderInternal *shader, microsoft::CSignatureParser &in, microsoft::CSignatureParser5 &out,
+-    const std::vector<SigElement> &inputs, const std::vector<SigElement> &outputs
++    const std::vector<SigElement> &inputs, const std::vector<SigElement> &outputs,
++    const std::vector<SigElement> &patch_constants
+ ) {
+   using namespace microsoft;
+   auto emit = [&](D3D10ShaderBinary::CInstruction inst) { handle_signature(in, out, inst, shader, 0); };
++
++  /* neutron: hull and domain shaders. Control points are plain registers; the patch
++     constants become the tess factor and patch constant declarations of the fork phase
++     (hull, phase 0) or the patch constant inputs (domain) */
++  if (shader->shader_type == D3D11_SB_HULL_SHADER || shader->shader_type == D3D11_SB_DOMAIN_SHADER) {
++    bool hs = shader->shader_type == D3D11_SB_HULL_SHADER;
++    bool quad = shader->tessellation_domain == D3D11_SB_TESSELLATOR_DOMAIN_QUAD;
++    bool tri = shader->tessellation_domain == D3D11_SB_TESSELLATOR_DOMAIN_TRI;
++    for (auto &e : inputs) {
++      if (e.kind == sk::PrimitiveID || e.kind == sk::OutputControlPointID || e.kind == sk::DomainLocation)
++        continue;
++      if (e.start_row < 0)
++        return unsupported("tessellation input semantic kind " + llvm::Twine(e.kind) + " without register");
++    }
++    for (auto &e : outputs) {
++      if (e.start_row < 0)
++        return unsupported("tessellation output semantic kind " + llvm::Twine(e.kind) + " without register");
++      for (uint32_t r = 0; r < e.rows; r++) {
++        uint32_t reg = e.start_row + r, mask = row_mask(e);
++        if (hs) {
++          /* control point outputs (phase ~0) */
++          auto inst = make_decl(D3D10_SB_OPCODE_DCL_OUTPUT, D3D10_SB_OPERAND_TYPE_OUTPUT, reg, mask);
++          handle_signature(in, out, inst, shader, ~0u);
++          continue;
++        }
++        switch (e.kind) {
++        case sk::Arbitrary:
++          emit(make_decl(D3D10_SB_OPCODE_DCL_OUTPUT, D3D10_SB_OPERAND_TYPE_OUTPUT, reg, mask));
++          break;
++        case sk::Position:
++        case sk::RenderTargetArrayIndex:
++        case sk::ViewPortArrayIndex:
++        case sk::ClipDistance:
++        case sk::CullDistance: {
++          auto inst = make_decl(D3D10_SB_OPCODE_DCL_OUTPUT_SIV, D3D10_SB_OPERAND_TYPE_OUTPUT, reg, mask);
++          inst.m_OutputDeclSIV.Name = e.kind == sk::Position                 ? D3D10_SB_NAME_POSITION
++                                      : e.kind == sk::RenderTargetArrayIndex ? D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX
++                                      : e.kind == sk::ViewPortArrayIndex     ? D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX
++                                      : e.kind == sk::ClipDistance           ? D3D10_SB_NAME_CLIP_DISTANCE
++                                                                             : D3D10_SB_NAME_CULL_DISTANCE;
++          emit(inst);
++          break;
++        }
++        default:
++          return unsupported("domain output semantic kind " + llvm::Twine(e.kind));
++        }
++      }
++    }
++    for (auto &e : patch_constants) {
++      if (e.start_row < 0)
++        return unsupported("patch constant semantic kind " + llvm::Twine(e.kind) + " without register");
++      for (uint32_t r = 0; r < e.rows; r++) {
++        uint32_t reg = e.start_row + r, mask = row_mask(e);
++        if (e.kind == sk::TessFactor || e.kind == sk::InsideTessFactor) {
++          uint32_t name;
++          if (quad)
++            name = (e.kind == sk::TessFactor ? D3D11_SB_NAME_FINAL_QUAD_U_EQ_0_EDGE_TESSFACTOR
++                                             : D3D11_SB_NAME_FINAL_QUAD_U_INSIDE_TESSFACTOR) + r;
++          else if (tri)
++            name = (e.kind == sk::TessFactor ? D3D11_SB_NAME_FINAL_TRI_U_EQ_0_EDGE_TESSFACTOR
++                                             : D3D11_SB_NAME_FINAL_TRI_INSIDE_TESSFACTOR) + r;
++          else
++            return unsupported("isoline tessellation");
++          auto inst = make_decl(
++              hs ? D3D10_SB_OPCODE_DCL_OUTPUT_SIV : D3D10_SB_OPCODE_DCL_INPUT_SIV,
++              hs ? D3D10_SB_OPERAND_TYPE_OUTPUT : D3D11_SB_OPERAND_TYPE_INPUT_PATCH_CONSTANT, reg, mask
++          );
++          inst.m_OutputDeclSIV.Name = (D3D10_SB_NAME)name;
++          emit(inst);
++          continue;
++        }
++        if (e.kind != sk::Arbitrary)
++          return unsupported("patch constant semantic kind " + llvm::Twine(e.kind));
++        emit(make_decl(
++            hs ? D3D10_SB_OPCODE_DCL_OUTPUT : D3D10_SB_OPCODE_DCL_INPUT,
++            hs ? D3D10_SB_OPERAND_TYPE_OUTPUT : D3D11_SB_OPERAND_TYPE_INPUT_PATCH_CONSTANT, reg, mask
++        ));
++      }
++    }
++    return llvm::Error::success();
++  }
+   bool vs = shader->shader_type == D3D10_SB_VERTEX_SHADER;
+   bool ps = shader->shader_type == D3D10_SB_PIXEL_SHADER;
++  /* neutron: GS inputs come from the payload of the VS object function; outputs are
++     declared like VS outputs (handle_signature_gs turns them into mesh outputs) */
++  bool gs = shader->shader_type == D3D10_SB_GEOMETRY_SHADER;
+ 
+   for (auto &e : inputs) {
++    if (gs) {
++      if (e.kind == sk::PrimitiveID)
++        continue; /* dx.op.primitiveID */
++      if (e.kind != sk::Arbitrary && e.kind != sk::Position && e.kind != sk::ClipDistance &&
++          e.kind != sk::CullDistance)
++        return unsupported("geometry input semantic kind " + llvm::Twine(e.kind));
++      continue;
++    }
+     if (e.start_row < 0) {
+       if (ps && e.kind == sk::Coverage) {
+         emit(make_decl(D3D10_SB_OPCODE_DCL_INPUT, D3D11_SB_OPERAND_TYPE_INPUT_COVERAGE_MASK, 0, 1));
+@@ -712,7 +819,7 @@ synthesize_signature(
+       return unsupported("output semantic kind " + llvm::Twine(e.kind) + " without register");
+     for (uint32_t r = 0; r < e.rows; r++) {
+       uint32_t reg = e.start_row + r, mask = row_mask(e);
+-      if (vs) {
++      if (vs || gs) {
+         switch (e.kind) {
+         case sk::Arbitrary:
+           emit(make_decl(D3D10_SB_OPCODE_DCL_OUTPUT, D3D10_SB_OPERAND_TYPE_OUTPUT, reg, mask));
+@@ -775,6 +882,15 @@ InitializeShader(
+   case 1:
+     shader->shader_type = D3D10_SB_VERTEX_SHADER;
+     break;
++  case 2: /* neutron: geometry, emulated with the DXBC GS mesh pipeline */
++    shader->shader_type = D3D10_SB_GEOMETRY_SHADER;
++    break;
++  case 3: /* neutron: hull and domain, emulated with the DXBC tessellation mesh pipeline */
++    shader->shader_type = D3D11_SB_HULL_SHADER;
++    break;
++  case 4:
++    shader->shader_type = D3D11_SB_DOMAIN_SHADER;
++    break;
+   case 5:
+     shader->shader_type = D3D11_SB_COMPUTE_SHADER;
+     break;
+@@ -806,6 +922,49 @@ InitializeShader(
+         for (unsigned d = 0; d < 3; d++)
+           shader->threadgroup_size[d] = md_uint(nt->getOperand(d));
+       }
++      /* neutron: DSState {domain, input control points} */
++      if (tag == 2 /* DSState */) {
++        auto ds = llvm::cast<llvm::MDNode>(props->getOperand(i + 1).get());
++        shader->tessellation_domain = (microsoft::D3D11_SB_TESSELLATOR_DOMAIN)md_uint(ds->getOperand(0));
++        shader->input_control_point_count = md_uint(ds->getOperand(1));
++      }
++      /* neutron: HSState {patch constant function, input control points, output control
++         points, domain, partitioning, output primitive, max tess factor}; the patch constant
++         function runs on the first thread of each patch after the control point phase */
++      if (tag == 3 /* HSState */) {
++        auto hs = llvm::cast<llvm::MDNode>(props->getOperand(i + 1).get());
++        auto pcf = llvm::mdconst::dyn_extract_or_null<llvm::Function>(hs->getOperand(0));
++        if (!pcf) {
++          errorOut << "DXIL: hull shader without patch constant function";
++          return 1;
++        }
++        shader->dxil_patch_constant_entry = pcf->getName().str();
++        shader->input_control_point_count = md_uint(hs->getOperand(1));
++        shader->output_control_point_count = md_uint(hs->getOperand(2));
++        shader->tessellation_domain = (microsoft::D3D11_SB_TESSELLATOR_DOMAIN)md_uint(hs->getOperand(3));
++        shader->tessellation_partition = (microsoft::D3D11_SB_TESSELLATOR_PARTITIONING)md_uint(hs->getOperand(4));
++        shader->tessellator_output_primitive =
++            (microsoft::D3D11_SB_TESSELLATOR_OUTPUT_PRIMITIVE)md_uint(hs->getOperand(5));
++        if (auto f = llvm::mdconst::dyn_extract_or_null<llvm::ConstantFP>(hs->getOperand(6)))
++          shader->max_tesselation_factor = f->getValueAPF().convertToFloat();
++        shader->hull_maximum_threads_per_patch =
++            std::max(shader->input_control_point_count, shader->output_control_point_count);
++        shader->shader_info.no_control_point_phase_passthrough = true;
++        shader->shader_info.output_control_point_read = true;
++      }
++      /* neutron: GSState {input primitive, max vertex count, stream mask, output topology,
++         instance count}; the enums match the DXBC declarations */
++      if (tag == 1 /* GSState */) {
++        auto gs = llvm::cast<llvm::MDNode>(props->getOperand(i + 1).get());
++        shader->gs_input_primitive = (microsoft::D3D10_SB_PRIMITIVE)md_uint(gs->getOperand(0));
++        shader->gs_max_vertex_output = md_uint(gs->getOperand(1));
++        if (md_uint(gs->getOperand(2)) & ~1u) {
++          errorOut << "DXIL: geometry shader output streams other than 0 are not supported";
++          return 1;
++        }
++        shader->gs_output_topology = (microsoft::D3D10_SB_PRIMITIVE_TOPOLOGY)md_uint(gs->getOperand(3));
++        shader->gs_instance_count = std::max(1u, md_uint(gs->getOperand(4)));
++      }
+     }
+   }
+ 
+@@ -827,12 +986,14 @@ InitializeShader(
+     }
+   } else {
+     auto sigs = llvm::dyn_cast_or_null<llvm::MDNode>(entry->getOperand(2).get());
+-    std::vector<SigElement> inputs, outputs;
++    std::vector<SigElement> inputs, outputs, patch_constants;
+     if (sigs) {
+       inputs = read_signature(sigs->getOperand(0));
+       outputs = read_signature(sigs->getOperand(1));
++      if (sigs->getNumOperands() > 2)
++        patch_constants = read_signature(sigs->getOperand(2));
+     }
+-    if (auto err = synthesize_signature(shader, inputParser, outputParser, inputs, outputs)) {
++    if (auto err = synthesize_signature(shader, inputParser, outputParser, inputs, outputs, patch_constants)) {
+       errorOut << llvm::toString(std::move(err));
+       return 1;
+     }
+@@ -896,6 +1057,7 @@ public:
+ 
+   struct dxbc::context *ctx = nullptr;
+   const std::vector<SigElement> *inputs = nullptr, *outputs = nullptr;
++  const std::vector<SigElement> *patch_constants = nullptr; /* neutron: hull/domain */
+   llvm::Value *lane = nullptr, *lanes = nullptr;
+   uint32_t shader_sample_index_arg = ~0u;
+   bool needs_air_2_9 = false; /* 64-bit atomics */
+@@ -1177,6 +1339,47 @@ public:
+       return load_input(call, result);
+     case op::StoreOutput:
+       return store_output(call);
++    /* neutron: geometry shader operations, same as DXBC emit/cut (stream 0 only) */
++    case op::EmitStream:
++    case op::CutStream:
++    case op::EmitThenCutStream: {
++      if (ctx->shader_type != microsoft::D3D10_SB_GEOMETRY_SHADER || !ctx->resource.call_emit)
++        return unsupported("emit/cut outside a geometry shader");
++      if (opc != op::CutStream)
++        if (auto err = ctx->resource.call_emit().build(*ctx).takeError())
++          return err;
++      if (opc != op::EmitStream)
++        if (auto err = ctx->resource.call_cut().build(*ctx).takeError())
++          return err;
++      return llvm::Error::success();
++    }
++    /* neutron: hull and domain shader operations */
++    case op::OutputControlPointID:
++      if (!ctx->resource.thread_id_in_patch)
++        return unsupported("SV_OutputControlPointID outside a hull shader");
++      result = ctx->resource.thread_id_in_patch;
++      return llvm::Error::success();
++    case op::LoadOutputControlPoint:
++      return load_register(call, outputs, ctx->resource.output.ptr_int4, arg(4), result);
++    case op::LoadPatchConstant:
++      return load_register(call, patch_constants, ctx->resource.patch_constant_output.ptr_int4, nullptr, result);
++    case op::StorePatchConstant:
++      return store_patch_constant(call);
++    case op::DomainLocation:
++      if (!ctx->resource.domain)
++        return unsupported("SV_DomainLocation outside a domain shader");
++      result = B.CreateExtractElement(ctx->resource.domain, (uint64_t)cint(1));
++      return llvm::Error::success();
++    case op::GSInstanceID:
++      if (!ctx->resource.gs_instance_id)
++        return unsupported("SV_GSInstanceID outside a geometry shader");
++      result = ctx->resource.gs_instance_id;
++      return llvm::Error::success();
++    case op::PrimitiveID:
++      if (!ctx->resource.patch_id)
++        return unsupported("SV_PrimitiveID not available");
++      result = ctx->resource.patch_id;
++      return llvm::Error::success();
+     case op::Discard: {
+       auto cond = arg(1);
+       if (auto c = llvm::dyn_cast<llvm::ConstantInt>(cond)) {
+@@ -1913,7 +2116,12 @@ private:
+       auto reg = B.CreateAdd(B.getInt32(e->start_row), call->getArgOperand(2));
+       auto col = B.CreateAdd(B.getInt32(e->start_col), B.CreateZExt(call->getArgOperand(3), B.getInt32Ty()));
+       auto file_ty = ctx->resource.input.ptr_int4->getType()->getNonOpaquePointerElementType();
+-      auto ptr = B.CreateGEP(file_ty, ctx->resource.input.ptr_int4, {B.getInt32(0), reg, col});
++      llvm::Value *ptr;
++      /* neutron: GS inputs are [vertex][register] */
++      if (llvm::cast<llvm::ArrayType>(file_ty)->getElementType()->isArrayTy())
++        ptr = B.CreateGEP(file_ty, ctx->resource.input.ptr_int4, {B.getInt32(0), call->getArgOperand(4), reg, col});
++      else
++        ptr = B.CreateGEP(file_ty, ctx->resource.input.ptr_int4, {B.getInt32(0), reg, col});
+       v = B.CreateLoad(B.getInt32Ty(), ptr);
+     }
+     if (ty->isFloatTy())
+@@ -1973,7 +2181,69 @@ private:
+     auto reg = B.CreateAdd(B.getInt32(e->start_row), call->getArgOperand(2));
+     auto col = B.CreateAdd(B.getInt32(e->start_col), B.CreateZExt(call->getArgOperand(3), B.getInt32Ty()));
+     auto file_ty = ctx->resource.output.ptr_int4->getType()->getNonOpaquePointerElementType();
+-    B.CreateStore(v, B.CreateGEP(file_ty, ctx->resource.output.ptr_int4, {B.getInt32(0), reg, col}));
++    /* neutron: hull control point outputs are [control point][register] */
++    if (llvm::cast<llvm::ArrayType>(file_ty)->getElementType()->isArrayTy())
++      B.CreateStore(
++          v, B.CreateGEP(file_ty, ctx->resource.output.ptr_int4, {B.getInt32(0), ctx->resource.thread_id_in_patch, reg, col})
++      );
++    else
++      B.CreateStore(v, B.CreateGEP(file_ty, ctx->resource.output.ptr_int4, {B.getInt32(0), reg, col}));
++    return llvm::Error::success();
++  }
++
++  /* neutron: hull/domain register files: loadOutputControlPoint, loadPatchConstant and
++     storePatchConstant address them like loadInput/storeOutput */
++  const SigElement *
++  find_element(const std::vector<SigElement> *list, uint32_t id) {
++    if (list)
++      for (auto &x : *list)
++        if (x.id == id)
++          return &x;
++    return nullptr;
++  }
++
++  llvm::Error
++  load_register(
++      llvm::CallInst *call, const std::vector<SigElement> *list, llvm::Value *file, llvm::Value *cp, llvm::Value *&result
++  ) {
++    auto e = find_element(list, (uint32_t)llvm::cast<llvm::ConstantInt>(call->getArgOperand(1))->getZExtValue());
++    if (!e || e->start_row < 0 || !file)
++      return unsupported("operation " + llvm::Twine(dx_opcode(call)) + ": unknown signature element");
++    auto reg = B.CreateAdd(B.getInt32(e->start_row), call->getArgOperand(2));
++    auto col = B.CreateAdd(B.getInt32(e->start_col), B.CreateZExt(call->getArgOperand(3), B.getInt32Ty()));
++    auto file_ty = file->getType()->getNonOpaquePointerElementType();
++    auto ptr = cp ? B.CreateGEP(file_ty, file, {B.getInt32(0), cp, reg, col}) : B.CreateGEP(file_ty, file, {B.getInt32(0), reg, col});
++    llvm::Value *v = B.CreateLoad(B.getInt32Ty(), ptr);
++    auto ty = call->getType();
++    if (ty->isFloatTy())
++      v = B.CreateBitCast(v, ty);
++    else if (ty->isHalfTy())
++      v = B.CreateFPTrunc(B.CreateBitCast(v, B.getFloatTy()), ty);
++    else if (ty->isIntegerTy(16))
++      v = B.CreateTrunc(v, ty);
++    else if (!ty->isIntegerTy(32))
++      return unsupported("register load type");
++    result = v;
++    return llvm::Error::success();
++  }
++
++  llvm::Error
++  store_patch_constant(llvm::CallInst *call) {
++    auto e = find_element(patch_constants, (uint32_t)llvm::cast<llvm::ConstantInt>(call->getArgOperand(1))->getZExtValue());
++    auto file = ctx->resource.patch_constant_output.ptr_int4;
++    if (!e || e->start_row < 0 || !file)
++      return unsupported("storePatchConstant: unknown signature element");
++    llvm::Value *v = call->getArgOperand(4);
++    if (v->getType()->isHalfTy())
++      v = B.CreateFPExt(v, B.getFloatTy());
++    else if (v->getType()->isIntegerTy(16))
++      v = B.CreateZExt(v, B.getInt32Ty());
++    if (v->getType()->isFloatTy())
++      v = B.CreateBitCast(v, B.getInt32Ty());
++    auto reg = B.CreateAdd(B.getInt32(e->start_row), call->getArgOperand(2));
++    auto col = B.CreateAdd(B.getInt32(e->start_col), B.CreateZExt(call->getArgOperand(3), B.getInt32Ty()));
++    auto file_ty = file->getType()->getNonOpaquePointerElementType();
++    B.CreateStore(v, B.CreateGEP(file_ty, file, {B.getInt32(0), reg, col}));
+     return llvm::Error::success();
+   }
+ 
+@@ -2661,11 +2931,13 @@ EmitBody(SM50ShaderInternal *shader, struct dxbc::context &ctx, llvm::BasicBlock
+     if (auto err = read_resources(dmod, &scratch, table))
+       return std::move(err);
+   }
+-  std::vector<SigElement> inputs, outputs;
++  std::vector<SigElement> inputs, outputs, patch_constants;
+   if (auto entries = dmod.getNamedMetadata("dx.entryPoints")) {
+     if (auto sigs = llvm::dyn_cast_or_null<llvm::MDNode>(entries->getOperand(0)->getOperand(2).get())) {
+       inputs = read_signature(sigs->getOperand(0));
+       outputs = read_signature(sigs->getOperand(1));
++      if (sigs->getNumOperands() > 2)
++        patch_constants = read_signature(sigs->getOperand(2));
+     }
+   }
+ 
+@@ -2685,32 +2957,76 @@ EmitBody(SM50ShaderInternal *shader, struct dxbc::context &ctx, llvm::BasicBlock
+     gv.replaceAllUsesWith(ngv);
+   }
+ 
+-  /* move the body, returns go to the epilogue */
+-  llvm::BasicBlock *body_entry = &main->getEntryBlock();
+-  function->getBasicBlockList().splice(function->end(), main->getBasicBlockList());
+-  std::vector<llvm::ReturnInst *> rets;
+-  for (auto &I : llvm::instructions(*function)) {
+-    llvm::SmallVector<std::pair<unsigned, llvm::MDNode *>> mds;
+-    I.getAllMetadata(mds);
+-    for (auto &[kind, _] : mds)
+-      I.setMetadata(kind, nullptr);
+-    if (auto ret = llvm::dyn_cast<llvm::ReturnInst>(&I))
+-      rets.push_back(ret);
+-  }
+-  for (auto ret : rets) {
+-    llvm::BranchInst::Create(return_bb, ret);
+-    ret->eraseFromParent();
+-  }
+-  /* DXIL's local arrays live in its entry block; move them to the function entry so
+-     they stay static allocas (mem2reg/SROA) */
+-  {
++  /* move a body, returns go to ret_target */
++  auto move_body = [&](llvm::Function *src, llvm::BasicBlock *ret_target) {
++    llvm::BasicBlock *src_entry = &src->getEntryBlock();
++    std::vector<llvm::ReturnInst *> rets;
++    for (auto &I : llvm::instructions(*src)) {
++      llvm::SmallVector<std::pair<unsigned, llvm::MDNode *>> mds;
++      I.getAllMetadata(mds);
++      for (auto &[kind, _] : mds)
++        I.setMetadata(kind, nullptr);
++      if (auto ret = llvm::dyn_cast<llvm::ReturnInst>(&I))
++        rets.push_back(ret);
++    }
++    function->getBasicBlockList().splice(function->end(), src->getBasicBlockList());
++    for (auto ret : rets) {
++      llvm::BranchInst::Create(ret_target, ret);
++      ret->eraseFromParent();
++    }
++    /* DXIL's local arrays live in its entry block; move them to the function entry so
++       they stay static allocas (mem2reg/SROA) */
+     auto &entry = function->getEntryBlock();
+-    for (auto &I : llvm::make_early_inc_range(*body_entry))
++    for (auto &I : llvm::make_early_inc_range(*src_entry))
+       if (auto a = llvm::dyn_cast<llvm::AllocaInst>(&I); a && llvm::isa<llvm::Constant>(a->getArraySize()))
+         a->moveBefore(entry, entry.getFirstInsertionPt());
+-  }
++    return src_entry;
++  };
+ 
+   auto &builder = ctx.builder;
++  llvm::BasicBlock *body_entry;
++  if (shader->shader_type == microsoft::D3D11_SB_HULL_SHADER) {
++    /* neutron: control point function on the first output_control_point_count threads of
++       each patch, then the patch constant function on thread 0, then the control points go
++       to the payload (what DXBC's BasicBlockHullShaderWriteOutput does) */
++    auto pcf = dmod.getFunction(shader->dxil_patch_constant_entry);
++    if (!pcf)
++      return unsupported("patch constant function missing");
++    auto &res = ctx.resource;
++    if (!res.thread_id_in_patch || !res.hull_cp_passthrough_src || !res.hull_cp_passthrough_dst)
++      return unsupported("hull shader outside a tessellation pipeline");
++    auto hs_entry = llvm::BasicBlock::Create(context, "hs_control_point_phase", function);
++    auto cp_end = llvm::BasicBlock::Create(context, "hs_control_point_end", function);
++    auto pc_end = llvm::BasicBlock::Create(context, "hs_patch_constant_end", function);
++    auto write_cp = llvm::BasicBlock::Create(context, "hs_write_control_point", function);
++    auto write_end = llvm::BasicBlock::Create(context, "hs_write_control_point_end", function);
++    auto cp_entry = move_body(main, cp_end);
++    auto pc_entry = move_body(pcf, pc_end);
++    auto ip = builder.saveIP();
++    auto cp_count = builder.getInt32(shader->output_control_point_count);
++    builder.SetInsertPoint(hs_entry);
++    builder.CreateCondBr(builder.CreateICmpULT(res.thread_id_in_patch, cp_count), cp_entry, cp_end);
++    builder.SetInsertPoint(cp_end);
++    ctx.air.CreateBarrier(llvm::air::MemFlags::Threadgroup);
++    builder.CreateCondBr(builder.CreateICmpEQ(res.thread_id_in_patch, builder.getInt32(0)), pc_entry, pc_end);
++    builder.SetInsertPoint(pc_end);
++    ctx.air.CreateBarrier(llvm::air::MemFlags::Threadgroup);
++    builder.CreateCondBr(builder.CreateICmpULT(res.thread_id_in_patch, cp_count), write_cp, write_end);
++    builder.SetInsertPoint(write_cp);
++    auto src = res.hull_cp_passthrough_src;
++    if (src->getType()->getNonOpaquePointerElementType() != res.hull_cp_passthrough_type)
++      src = builder.CreateBitCast(src, res.hull_cp_passthrough_type->getPointerTo(src->getType()->getPointerAddressSpace()));
++    builder.CreateStore(builder.CreateLoad(res.hull_cp_passthrough_type, src), res.hull_cp_passthrough_dst);
++    builder.CreateBr(write_end);
++    builder.SetInsertPoint(write_end);
++    ctx.air.CreateBarrier(llvm::air::MemFlags::Threadgroup);
++    builder.CreateBr(return_bb);
++    builder.restoreIP(ip);
++    body_entry = hs_entry;
++  } else {
++    body_entry = move_body(main, return_bb);
++  }
++
+   auto saved_ip = builder.saveIP();
+ 
+   /* static globals: constant ones go to the constant address space, mutable
+@@ -2741,6 +3057,7 @@ EmitBody(SM50ShaderInternal *shader, struct dxbc::context &ctx, llvm::BasicBlock
+   lowering.ctx = &ctx;
+   lowering.inputs = &inputs;
+   lowering.outputs = &outputs;
++  lowering.patch_constants = &patch_constants;
+   lowering.lane = ~shader->dxil_lane_arg ? function->getArg(shader->dxil_lane_arg) : nullptr;
+   lowering.lanes = ~shader->dxil_lanes_arg ? function->getArg(shader->dxil_lanes_arg) : nullptr;
+   lowering.shader_sample_index_arg = shader->dxil_sample_index_arg;
