@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640">
+  <!-- neutron mark without background: README, badge -->
+  <circle cx="320" cy="320" r="300" fill="none" stroke="#5a6b8c" stroke-width="20"/>
+  <path d="M320 20 A300 300 0 0 1 594 198" fill="none" stroke="#9fb4ff" stroke-width="20" stroke-linecap="round"/>
+  <circle cx="521" cy="97" r="44" fill="#9fb4ff"/>
+  <circle cx="320" cy="320" r="196" fill="#f5f7fb"/>
+  <circle cx="320" cy="320" r="196" fill="none" stroke="#9fb4ff" stroke-width="20"/>
+</svg>
