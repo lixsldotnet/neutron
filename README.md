@@ -10,6 +10,13 @@ Steam bridge to the Steam client that is already running. There is no second
 Windows Steam inside Wine and no Rosetta. neutron is an independent project and
 not Valve's Proton.
 
+neutron does **not** need CrossOver, Apple's Game Porting Toolkit
+(D3DMetal) or any other commercial or closed product. Everything is built from
+source: Wine, FEX, DXMT, LLVM and mingw-w64 are open source, and so is neutron
+itself (LGPL-2.1-or-later). The one exception is Proton's Steam bridge
+(lsteamclient), which is under Valve's Steamworks SDK license; the build fetches it
+from Valve's Proton repository.
+
 ## Status
 
 Early. Real games run, but expect problems, and only a few games were tested.
@@ -260,10 +267,18 @@ The patches in `patches/` follow the license of the project they patch:
   build fetches Valve's code and the repo keeps only the patches.
 - Proton's steam_helper: BSD-3-Clause
 
-License of the repo's own files: TODO (MIT or LGPL-2.1-or-later)
+The repo's own files (scripts, the tool, tests, docs) are under the GNU Lesser
+General Public License 2.1 or later, see `LICENSE`: if you change neutron and
+distribute it, publish your changes under the same license.
 
 No binaries are distributed because of lsteamclient's license: build neutron
 from source.
+
+## Contributing
+
+Contributions are welcome: bug reports with logs, game tests, fixes. See
+`CONTRIBUTING.md` for the workflow (feature branch, pull request to `main`) and
+the patch conventions.
 
 ## Disclaimer
 
