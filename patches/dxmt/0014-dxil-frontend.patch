@@ -1,0 +1,3370 @@
+Experimental DXIL (Shader Model 6.x) front end in airconv: the DXIL bitcode is read with
+airconv's LLVM 15, moved into the AIR module and the dx.op calls are lowered to AIR.
+Resources from !dx.resources fill the same ShaderInfo as DXBC SM 5.1, signatures go
+through the DXBC signature handlers (synthesized dcl instructions), so root signature
+binding, vertex pulling and outputs are shared. Vertex, pixel and compute shaders;
+SM 6.6 dynamic resources (ResourceDescriptorHeap, root signature *_HEAP_DIRECTLY_INDEXED:
+the command list writes the heap addresses after the root parameters), wave and quad
+ops, 64-bit min/max atomics (AIR 2.9 module, macOS 27). D3D12 UAV textures get the
+shader atomic usage. Command list markers and predication no longer abort. airconv CLI
+uses an embedded root signature. No GS/HS/DS/mesh, no 16-bit types, no doubles.
+
+diff --git a/src/airconv/air_signature.cpp b/src/airconv/air_signature.cpp
+index 6bba459..cb9ac45 100644
+--- a/src/airconv/air_signature.cpp
++++ b/src/airconv/air_signature.cpp
+@@ -760,6 +760,22 @@ auto FunctionSignatureBuilder::CreateFunction(
+             ->string("mtl_thread_index_in_threadgroup");
+           return msl_uint.get_llvm_type(context);
+         },
++        [&](const InputThreadIndexInSimdgroup &) {
++          metadata_field.string("air.thread_index_in_simdgroup")
++            ->string("air.arg_type_name")
++            ->string("uint") // HARDCODED
++            ->string("air.arg_name")
++            ->string("mtl_thread_index_in_simdgroup");
++          return msl_uint.get_llvm_type(context);
++        },
++        [&](const InputThreadsPerSimdgroup &) {
++          metadata_field.string("air.threads_per_simdgroup")
++            ->string("air.arg_type_name")
++            ->string("uint") // HARDCODED
++            ->string("air.arg_name")
++            ->string("mtl_threads_per_simdgroup");
++          return msl_uint.get_llvm_type(context);
++        },
+         [&](const InputThreadgroupsPerGrid &) {
+           metadata_field.string("air.threadgroups_per_grid")
+             ->string("air.arg_type_name")
+diff --git a/src/airconv/air_signature.hpp b/src/airconv/air_signature.hpp
+index 112c680..d489e33 100644
+--- a/src/airconv/air_signature.hpp
++++ b/src/airconv/air_signature.hpp
+@@ -543,6 +543,9 @@ struct InputThreadPositionInGrid {};        // uint3
+ struct InputThreadgroupPositionInGrid {};   // uint3
+ 
+ struct InputThreadgroupsPerGrid {};         // uint3
++/* neutron: DXIL wave intrinsics */
++struct InputThreadIndexInSimdgroup {};      // uint
++struct InputThreadsPerSimdgroup {};         // uint
+ 
+ struct OutputRenderTarget {
+   bool dual_source_blending;
+@@ -601,7 +604,7 @@ using FunctionInput = template_concat_t<
+     /* kernel */
+     InputThreadIndexInThreadgroup, InputThreadPositionInThreadgroup,
+     InputThreadPositionInGrid, InputThreadgroupPositionInGrid,
+-    InputThreadgroupsPerGrid>>;
++    InputThreadgroupsPerGrid, InputThreadIndexInSimdgroup, InputThreadsPerSimdgroup>>;
+ 
+ using FunctionOutput = std::variant<
+   /* vertex */
+diff --git a/src/airconv/airconv_cli.cpp b/src/airconv/airconv_cli.cpp
+index e9e6573..f77065a 100644
+--- a/src/airconv/airconv_cli.cpp
++++ b/src/airconv/airconv_cli.cpp
+@@ -1,5 +1,6 @@
+ #include "airconv_context.hpp"
+ #include "airconv_public.h"
++#include "DXBCParser/DXBCUtils.h"
+ #include "metallib_writer.hpp"
+ #include "llvm/Bitcode/BitcodeReader.h"
+ #include "llvm/Bitcode/BitcodeWriter.h"
+@@ -221,6 +222,20 @@ int main(int argc, char **argv) {
+   data.next = 0;
+   data.type = SM50_SHADER_COMMON;
+ 
++  /* neutron: a shader with an embedded root signature (RTS0) is compiled the D3D12 way */
++  SM50_SHADER_ROOT_SIGNATURE_DATA rootsig_data;
++  {
++    const void *rts0;
++    UINT rts0_size;
++    if (SUCCEEDED(microsoft::DXBCGetRootSignature(MemRef.getBufferStart(), &rts0, &rts0_size))) {
++      rootsig_data.type = SM50_SHADER_ROOT_SIGNATURE;
++      rootsig_data.bytecode = MemRef.getBufferStart();
++      rootsig_data.bytecode_length = MemRef.getBufferSize();
++      rootsig_data.next = nullptr;
++      data.next = &rootsig_data;
++    }
++  }
++
+   if (!HullBeforeDomain.getValue().empty()) {
+     ErrorOr<std::unique_ptr<MemoryBuffer>> FileOrErr =
+       MemoryBuffer::getFile(HullBeforeDomain, /*IsText=*/false);
+diff --git a/src/airconv/dxbc_binding_rootsig.cpp b/src/airconv/dxbc_binding_rootsig.cpp
+index 1808d84..be0e4a3 100644
+--- a/src/airconv/dxbc_binding_rootsig.cpp
++++ b/src/airconv/dxbc_binding_rootsig.cpp
+@@ -341,6 +341,16 @@ public:
+ 
+   uint32_t RootSignatureArgumentIndex = ~0u;
+   uint32_t StaticSamplerArgumentIndex = ~0u;
++  uint32_t ResourceHeapArgIndex = ~0u;
++  uint32_t SamplerHeapArgIndex = ~0u;
++
++  llvm::Value *
++  GetDescriptorHeap(llvm::air::AIRBuilder &Builder, bool Sampler) override {
++    auto idx = Sampler ? SamplerHeapArgIndex : ResourceHeapArgIndex;
++    if (~RootSignatureArgumentIndex == 0 || ~idx == 0)
++      return nullptr;
++    return GetArgument(Builder, RootSignatureArgumentIndex, idx);
++  }
+ 
+   std::map<RangeId, std::pair<ConstantBufferInfo, uint64_t>> ConstantBuffers;
+   std::map<RangeId, std::pair<SamplerInfo, uint64_t>> Samplers;
+@@ -574,6 +584,17 @@ setup_binding_rootsig(
+     }
+   }
+ 
++  /* neutron: CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED (0x400) / SAMPLER_HEAP_DIRECTLY_INDEXED (0x800):
++     the runtime puts both heap addresses after the parameters */
++  if (root_sig.Flags & (0x400 | 0x800)) {
++    binding_map->ResourceHeapArgIndex = builder.DefineBuffer(
++        "resource_heap", AddressSpace::constant, MemoryAccess::read, msl_int, inc_attribute_index++
++    );
++    binding_map->SamplerHeapArgIndex = builder.DefineBuffer(
++        "sampler_heap", AddressSpace::constant, MemoryAccess::read, msl_int, inc_attribute_index++
++    );
++  }
++
+   auto [type, metadata] = builder.Build(module.getContext(), module.getDataLayout());
+ 
+   binding_map->RootSignatureArgumentIndex = func_signature.DefineInput(air::ArgumentBindingIndirectBuffer{
+diff --git a/src/airconv/dxbc_converter.cpp b/src/airconv/dxbc_converter.cpp
+index b0704ac..5b8cd99 100644
+--- a/src/airconv/dxbc_converter.cpp
++++ b/src/airconv/dxbc_converter.cpp
+@@ -1,4 +1,5 @@
+ #include "dxbc_converter.hpp"
++#include "dxil_converter.hpp"
+ #include "DXBCParser/BlobContainer.h"
+ #include "DXBCParser/ShaderBinary.h"
+ #include "airconv_error.hpp"
+@@ -315,6 +316,14 @@ component_type_from_pixel_format(air::MTLPixelFormat format) {
+   return RegisterComponentType::Unknown;
+ }
+ 
++/* neutron: the shader body comes from DXBC instructions or from a DXIL module */
++static llvm::Expected<llvm::BasicBlock *>
++convert_body(SM50ShaderInternal *pShaderInternal, context &ctx, llvm::BasicBlock *epilogue_bb) {
++  if (pShaderInternal->is_dxil)
++    return dxmt::dxil::EmitBody(pShaderInternal, ctx, epilogue_bb);
++  return convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
++}
++
+ llvm::Error convert_dxbc_pixel_shader(
+   SM50ShaderInternal *pShaderInternal, const char *name,
+   llvm::LLVMContext &context, llvm::Module &module,
+@@ -450,7 +459,7 @@ llvm::Error convert_dxbc_pixel_shader(
+   if (auto err = prologue.build(ctx).takeError()) {
+     return err;
+   }
+-  auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
++  auto real_entry = convert_body(pShaderInternal, ctx, epilogue_bb);
+   if (auto err = real_entry.takeError()) {
+     return err;
+   }
+@@ -558,7 +567,7 @@ llvm::Error convert_dxbc_compute_shader(
+   if (auto err = prologue.build(ctx).takeError()) {
+     return err;
+   }
+-  auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
++  auto real_entry = convert_body(pShaderInternal, ctx, epilogue_bb);
+   if (auto err = real_entry.takeError()) {
+     return err;
+   }
+@@ -788,7 +797,7 @@ llvm::Error convert_dxbc_vertex_shader(
+   if (auto err = prologue.build(ctx).takeError()) {
+     return err;
+   }
+-  auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
++  auto real_entry = convert_body(pShaderInternal, ctx, epilogue_bb);
+   if (auto err = real_entry.takeError()) {
+     return err;
+   }
+@@ -1008,20 +1017,22 @@ AIRCONV_API int SM50Initialize(
+     return 1;
+   }
+ 
+-  UINT codeBlobIdx = DXBCParser.FindNextMatchingBlob(DXBC_GenericShaderEx);
+-  if (codeBlobIdx == DXBC_BLOB_NOT_FOUND) {
+-    codeBlobIdx = DXBCParser.FindNextMatchingBlob(DXBC_GenericShader);
+-  }
+-  if (codeBlobIdx == DXBC_BLOB_NOT_FOUND) {
+-    errorOut << "Invalid DXBC bytecode: shader blob not found\0";
+-    *ppError = (sm50_error_t)errorObj;
+-    return 1;
++  /* neutron: DXIL (SM 6.x) front end: no shader code blob, ISG1/OSG1 signatures */
++  bool is_dxil = DXBCParser.FindNextMatchingBlob(DXBC_DXIL) != DXBC_BLOB_NOT_FOUND;
++  const void *codeBlob = nullptr;
++  if (!is_dxil) {
++    UINT codeBlobIdx = DXBCParser.FindNextMatchingBlob(DXBC_GenericShaderEx);
++    if (codeBlobIdx == DXBC_BLOB_NOT_FOUND) {
++      codeBlobIdx = DXBCParser.FindNextMatchingBlob(DXBC_GenericShader);
++    }
++    if (codeBlobIdx == DXBC_BLOB_NOT_FOUND) {
++      errorOut << "Invalid DXBC bytecode: shader blob not found\0";
++      *ppError = (sm50_error_t)errorObj;
++      return 1;
++    }
++    codeBlob = DXBCParser.GetBlob(codeBlobIdx);
+   }
+-  const void *codeBlob = DXBCParser.GetBlob(codeBlobIdx);
+ 
+-  CShaderToken *ShaderCode = (CShaderToken *)(BYTE *)codeBlob;
+-  // 1. Collect information about the shader.
+-  D3D10ShaderBinary::CShaderCodeParser CodeParser(ShaderCode);
+   CSignatureParser inputParser;
+   if (DXBCGetInputSignature(pBytecode, &inputParser) != S_OK) {
+     errorOut << "Invalid DXBC bytecode: input signature not found\0";
+@@ -1036,7 +1047,6 @@ AIRCONV_API int SM50Initialize(
+   }
+ 
+   auto sm50_shader = new SM50ShaderInternal();
+-  sm50_shader->shader_type = CodeParser.ShaderType();
+   auto shader_info = &(sm50_shader->shader_info);
+ 
+   {
+@@ -1047,7 +1057,20 @@ AIRCONV_API int SM50Initialize(
+     }
+   }
+ 
+-  sm50_shader->bbs = read_control_flow(CodeParser, sm50_shader, inputParser, outputParser);
++  if (is_dxil) {
++    if (dxmt::dxil::InitializeShader(pBytecode, BytecodeSize, sm50_shader, inputParser, outputParser, errorOut)) {
++      delete sm50_shader;
++      errorOut << '\0';
++      *ppError = (sm50_error_t)errorObj;
++      return 1;
++    }
++  } else {
++    CShaderToken *ShaderCode = (CShaderToken *)(BYTE *)codeBlob;
++    // 1. Collect information about the shader.
++    D3D10ShaderBinary::CShaderCodeParser CodeParser(ShaderCode);
++    sm50_shader->shader_type = CodeParser.ShaderType();
++    sm50_shader->bbs = read_control_flow(CodeParser, sm50_shader, inputParser, outputParser);
++  }
+ 
+   auto &binding_table = shader_info->binding_table;
+   auto &binding_table_cbuffer = shader_info->binding_table_cbuffer;
+diff --git a/src/airconv/dxbc_converter.hpp b/src/airconv/dxbc_converter.hpp
+index a64f6e0..726110e 100644
+--- a/src/airconv/dxbc_converter.hpp
++++ b/src/airconv/dxbc_converter.hpp
+@@ -448,6 +448,14 @@ public:
+   uint32_t gs_max_vertex_output = 0;
+   uint32_t gs_instance_count = 1;
+   uint32_t ps_has_coverage_output = 0;
++  /* neutron: DXIL shaders keep their bitcode and are converted at compile time */
++  bool is_dxil = false;
++  std::vector<char> dxil_bitcode;
++  std::vector<char> dxil_container;
++  std::string dxil_entry;
++  uint32_t dxil_lane_arg = ~0u;
++  uint32_t dxil_lanes_arg = ~0u;
++  uint32_t dxil_sample_index_arg = ~0u;
+ 
+   BasicBlock *entry() const {
+     return bbs.front().get();
+diff --git a/src/airconv/dxil_converter.cpp b/src/airconv/dxil_converter.cpp
+new file mode 100644
+index 0000000..0736ac7
+--- /dev/null
++++ b/src/airconv/dxil_converter.cpp
+@@ -0,0 +1,2829 @@
++/*
++ * neutron: experimental DXIL (Shader Model 6.x) front end for airconv.
++ *
++ * DXIL is LLVM 3.7 bitcode, which the LLVM 15 behind airconv still reads. The
++ * shader's function is moved into the AIR module as is and the dx.op.* calls
++ * are replaced with AIR equivalents. Resources declared in !dx.resources fill
++ * the same ShaderInfo maps the DXBC SM 5.1 path fills, so the root signature
++ * binding (dxbc_binding_rootsig.cpp) is shared.
++ *
++ * Scope of this prototype: compute shaders. Unsupported operations fail the
++ * compilation with a message naming the dx.op opcode.
++ */
++
++#include "airconv_error.hpp"
++#include "dxbc_converter.hpp"
++#include "dxil_converter.hpp"
++#include "nt/dxbc_converter_base.hpp"
++
++#include "DXBCParser/BlobContainer.h"
++#include "DXBCParser/DXBCUtils.h"
++#include "llvm/Bitcode/BitcodeReader.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/IR/InstIterator.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/LLVMContext.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IR/Verifier.h"
++#include "llvm/Transforms/Utils/BasicBlockUtils.h"
++#include "llvm/Support/MemoryBuffer.h"
++#include "llvm/Support/raw_ostream.h"
++
++#include <cstring>
++
++namespace dxmt::dxil {
++
++using namespace dxmt::dxbc;
++using namespace dxmt::shader::common;
++using llvm::air::AIRBuilder;
++using llvm::air::Texture;
++
++/* DXIL enums (DxilConstants.h) */
++enum ResourceClass : uint32_t { SRV = 0, UAV = 1, CBuffer = 2, Sampler = 3 };
++
++enum ResourceKind : uint32_t {
++  RK_Invalid = 0,
++  RK_Texture1D,
++  RK_Texture2D,
++  RK_Texture2DMS,
++  RK_Texture3D,
++  RK_TextureCube,
++  RK_Texture1DArray,
++  RK_Texture2DArray,
++  RK_Texture2DMSArray,
++  RK_TextureCubeArray,
++  RK_TypedBuffer,
++  RK_RawBuffer,
++  RK_StructuredBuffer,
++  RK_CBuffer,
++  RK_Sampler,
++  RK_TBuffer,
++};
++
++enum ComponentType : uint32_t {
++  CT_Invalid = 0,
++  CT_I1,
++  CT_I16,
++  CT_U16,
++  CT_I32,
++  CT_U32,
++  CT_I64,
++  CT_U64,
++  CT_F16,
++  CT_F32,
++  CT_F64,
++  CT_SNormF16,
++  CT_UNormF16,
++  CT_SNormF32,
++  CT_UNormF32,
++};
++
++namespace op {
++enum : uint32_t {
++  LoadInput = 4,
++  StoreOutput = 5,
++  FAbs = 6,
++  Saturate = 7,
++  IsNaN = 8,
++  IsInf = 9,
++  IsFinite = 10,
++  Cos = 12,
++  Tan = 14,
++  Acos = 15,
++  Asin = 16,
++  Atan = 17,
++  Hcos = 18,
++  Hsin = 19,
++  Htan = 20,
++  Sin = 13,
++  Exp = 21,
++  Frc = 22,
++  Log = 23,
++  Sqrt = 24,
++  Rsqrt = 25,
++  Round_ne = 26,
++  Round_ni = 27,
++  Round_pi = 28,
++  Round_z = 29,
++  Bfrev = 30,
++  Countbits = 31,
++  FirstbitLo = 32,
++  FirstbitHi = 33,
++  FirstbitSHi = 34,
++  FMax = 35,
++  FMin = 36,
++  IMax = 37,
++  IMin = 38,
++  UMax = 39,
++  UMin = 40,
++  IMul = 41,
++  UMul = 42,
++  UDiv = 43,
++  UAddc = 44,
++  USubb = 45,
++  FMad = 46,
++  Fma = 47,
++  IMad = 48,
++  UMad = 49,
++  Msad = 50,
++  Ibfe = 51,
++  Ubfe = 52,
++  Bfi = 53,
++  Dot2 = 54,
++  Dot3 = 55,
++  Dot4 = 56,
++  CreateHandle = 57,
++  CBufferLoad = 58,
++  CBufferLoadLegacy = 59,
++  Sample = 60,
++  SampleBias = 61,
++  SampleLevel = 62,
++  SampleGrad = 63,
++  SampleCmp = 64,
++  SampleCmpLevelZero = 65,
++  TextureLoad = 66,
++  TextureStore = 67,
++  BufferLoad = 68,
++  BufferStore = 69,
++  BufferUpdateCounter = 70,
++  GetDimensions = 72,
++  TextureGather = 73,
++  TextureGatherCmp = 74,
++  AtomicBinOp = 78,
++  AtomicCompareExchange = 79,
++  Barrier = 80,
++  CalculateLOD = 81,
++  Discard = 82,
++  DerivCoarseX = 83,
++  DerivCoarseY = 84,
++  DerivFineX = 85,
++  DerivFineY = 86,
++  ThreadId = 93,
++  GroupId = 94,
++  ThreadIdInGroup = 95,
++  FlattenedThreadIdInGroup = 96,
++  WaveIsFirstLane = 110,
++  WaveGetLaneIndex = 111,
++  WaveGetLaneCount = 112,
++  WaveAnyTrue = 113,
++  WaveAllTrue = 114,
++  WaveActiveAllEqual = 115,
++  WaveActiveBallot = 116,
++  WaveReadLaneAt = 117,
++  WaveReadLaneFirst = 118,
++  WaveActiveOp = 119,
++  WaveActiveBit = 120,
++  WavePrefixOp = 121,
++  QuadReadLaneAt = 122,
++  QuadOp = 123,
++  WaveAllBitCount = 135,
++  WavePrefixBitCount = 136,
++  LegacyF32ToF16 = 130,
++  LegacyF16ToF32 = 131,
++  RawBufferLoad = 139,
++  RawBufferStore = 140,
++  Coverage = 91,
++  IsHelperLane = 221,
++  AnnotateHandle = 216,
++  CreateHandleFromBinding = 217,
++};
++} // namespace op
++
++static llvm::Error
++unsupported(const llvm::Twine &msg) {
++  return llvm::make_error<UnsupportedFeature>(("DXIL: " + msg).str());
++}
++
++bool
++ExtractDXIL(const void *pBytecode, size_t BytecodeSize, std::vector<char> &Bitcode, uint32_t &ProgramVersion) {
++  microsoft::CDXBCParser Parser;
++  if (Parser.ReadDXBC(pBytecode, BytecodeSize) != S_OK)
++    return false;
++  UINT idx = Parser.FindNextMatchingBlob(microsoft::DXBC_DXIL);
++  if (idx == DXBC_BLOB_NOT_FOUND)
++    return false;
++  auto *blob = (const char *)Parser.GetBlob(idx);
++  auto size = Parser.GetBlobSize(idx);
++  if (size < 24)
++    return false;
++  /* DxilProgramHeader: ProgramVersion, SizeInUint32, then DxilBitcodeHeader:
++     magic 'DXIL', version, offset (from the bitcode header), size */
++  uint32_t offset, bc_size;
++  memcpy(&ProgramVersion, blob, 4);
++  memcpy(&offset, blob + 16, 4);
++  memcpy(&bc_size, blob + 20, 4);
++  if (8 + offset + bc_size > size)
++    return false;
++  Bitcode.assign(blob + 8 + offset, blob + 8 + offset + bc_size);
++  return true;
++}
++
++static llvm::Expected<std::unique_ptr<llvm::Module>>
++ParseDXIL(const std::vector<char> &Bitcode, llvm::LLVMContext &Context) {
++  auto buffer = llvm::MemoryBuffer::getMemBuffer(llvm::StringRef(Bitcode.data(), Bitcode.size()), "dxil", false);
++  return llvm::parseBitcodeFile(buffer->getMemBufferRef(), Context);
++}
++
++static uint32_t
++md_uint(const llvm::MDOperand &op) {
++  if (auto c = llvm::mdconst::dyn_extract_or_null<llvm::ConstantInt>(op))
++    return (uint32_t)c->getZExtValue();
++  return 0;
++}
++
++static bool
++md_bool(const llvm::MDOperand &op) {
++  if (auto c = llvm::mdconst::dyn_extract_or_null<llvm::ConstantInt>(op))
++    return !c->isZero();
++  return false;
++}
++
++struct ExtProps {
++  uint32_t component_type = CT_Invalid;
++  uint32_t stride = 0;
++};
++
++static ExtProps
++read_ext(const llvm::MDOperand &op) {
++  ExtProps r;
++  auto node = llvm::dyn_cast_or_null<llvm::MDNode>(op.get());
++  if (!node)
++    return r;
++  for (unsigned i = 0; i + 1 < node->getNumOperands(); i += 2) {
++    switch (md_uint(node->getOperand(i))) {
++    case 0:
++      r.component_type = md_uint(node->getOperand(i + 1));
++      break;
++    case 1:
++      r.stride = md_uint(node->getOperand(i + 1));
++      break;
++    }
++  }
++  return r;
++}
++
++static ScalerDataType
++scaler_type(uint32_t ct) {
++  switch (ct) {
++  case CT_I16:
++  case CT_I32:
++  case CT_I64:
++    return ScalerDataType::Int;
++  case CT_U16:
++  case CT_U32:
++  case CT_U64:
++  case CT_I1:
++    return ScalerDataType::Uint;
++  case CT_F64:
++    return ScalerDataType::Double;
++  default:
++    return ScalerDataType::Float;
++  }
++}
++
++static llvm::Expected<ResourceType>
++resource_type(uint32_t kind) {
++  switch (kind) {
++  case RK_Texture1D:
++    return ResourceType::Texture1D;
++  case RK_Texture2D:
++    return ResourceType::Texture2D;
++  case RK_Texture2DMS:
++    return ResourceType::Texture2DMultisampled;
++  case RK_Texture3D:
++    return ResourceType::Texture3D;
++  case RK_TextureCube:
++    return ResourceType::TextureCube;
++  case RK_Texture1DArray:
++    return ResourceType::Texture1DArray;
++  case RK_Texture2DArray:
++    return ResourceType::Texture2DArray;
++  case RK_Texture2DMSArray:
++    return ResourceType::Texture2DMultisampledArray;
++  case RK_TextureCubeArray:
++    return ResourceType::TextureCubeArray;
++  case RK_TypedBuffer:
++    return ResourceType::TextureBuffer;
++  case RK_RawBuffer:
++  case RK_StructuredBuffer:
++    return ResourceType::NonApplicable;
++  default:
++    return unsupported("resource kind " + llvm::Twine(kind));
++  }
++}
++
++static uint32_t
++dx_opcode(llvm::CallInst *call) {
++  auto fn = call->getCalledFunction();
++  if (!fn || !fn->getName().startswith("dx.op.") || call->arg_size() == 0)
++    return ~0u;
++  if (auto c = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(0)))
++    return (uint32_t)c->getZExtValue();
++  return ~0u;
++}
++
++struct HandleInfo {
++  uint32_t cls;
++  uint32_t range_id;
++  llvm::Value *index;
++  /* SM 6.6 createHandleFromHeap: the kind comes from annotateHandle's properties */
++  bool heap = false;
++  uint32_t props0 = 0, props1 = 0;
++};
++
++struct ResourceTable {
++  /* per class: (space, lower bound, size, id) for createHandleFromBinding */
++  struct Entry {
++    uint32_t space, lower, size, id;
++  };
++  std::vector<Entry> entries[4];
++};
++
++/* Resolves a dx.types.Handle value to the resource declaration it refers to. */
++static llvm::Optional<HandleInfo>
++resolve_handle(llvm::Value *v, const ResourceTable &table) {
++  auto call = llvm::dyn_cast<llvm::CallInst>(v);
++  if (!call)
++    return {};
++  switch (dx_opcode(call)) {
++  case op::CreateHandle: {
++    auto cls = (uint32_t)llvm::cast<llvm::ConstantInt>(call->getArgOperand(1))->getZExtValue();
++    auto id = (uint32_t)llvm::cast<llvm::ConstantInt>(call->getArgOperand(2))->getZExtValue();
++    return HandleInfo{cls, id, call->getArgOperand(3)};
++  }
++  case op::AnnotateHandle: {
++    auto h = resolve_handle(call->getArgOperand(1), table);
++    if (h && h->heap) {
++      if (auto props = llvm::dyn_cast<llvm::Constant>(call->getArgOperand(2))) {
++        auto field = [&](unsigned i) -> uint32_t {
++          auto e = props->getAggregateElement(i);
++          if (auto c = llvm::dyn_cast_or_null<llvm::ConstantInt>(e))
++            return (uint32_t)c->getZExtValue();
++          return 0;
++        };
++        h->props0 = field(0);
++        h->props1 = field(1);
++        uint32_t kind = h->props0 & 0xff;
++        bool is_uav = (h->props0 >> 12) & 1;
++        if (kind == RK_Sampler)
++          h->cls = Sampler;
++        else if (kind == RK_CBuffer)
++          h->cls = CBuffer;
++        else
++          h->cls = is_uav ? UAV : SRV;
++      }
++    }
++    return h;
++  }
++  case 218 /* createHandleFromHeap(index, sampler heap, non uniform) */: {
++    HandleInfo h{~0u, 0, call->getArgOperand(1)};
++    h.heap = true;
++    if (auto c = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(2)); c && !c->isZero())
++      h.cls = Sampler;
++    return h;
++  }
++  case op::CreateHandleFromBinding: {
++    auto bind = llvm::dyn_cast<llvm::Constant>(call->getArgOperand(1));
++    if (!bind)
++      return {};
++    auto field = [&](unsigned i) -> uint32_t {
++      auto e = bind->getAggregateElement(i);
++      if (auto c = llvm::dyn_cast_or_null<llvm::ConstantInt>(e))
++        return (uint32_t)c->getZExtValue();
++      return 0;
++    };
++    uint32_t lower = field(0), space = field(2), cls = field(3);
++    if (cls > 3)
++      return {};
++    for (auto &e : table.entries[cls]) {
++      if (e.space == space && e.lower == lower)
++        return HandleInfo{cls, e.id, call->getArgOperand(2)};
++    }
++    return {};
++  }
++  default:
++    return {};
++  }
++}
++
++/* --- Initialize: metadata into ShaderInfo --- */
++
++static llvm::Error
++read_resources(llvm::Module &M, SM50ShaderInternal *shader, ResourceTable &table) {
++  auto &info = shader->shader_info;
++  auto resources = M.getNamedMetadata("dx.resources");
++  if (!resources || resources->getNumOperands() == 0)
++    return llvm::Error::success();
++  auto lists = resources->getOperand(0);
++  for (unsigned cls = 0; cls < 4 && cls < lists->getNumOperands(); cls++) {
++    auto list = llvm::dyn_cast_or_null<llvm::MDNode>(lists->getOperand(cls).get());
++    if (!list)
++      continue;
++    for (auto &rop : list->operands()) {
++      auto r = llvm::cast<llvm::MDNode>(rop.get());
++      ResourceRange range{
++          .range_id = md_uint(r->getOperand(0)),
++          .lower_bound = md_uint(r->getOperand(4)),
++          .size = md_uint(r->getOperand(5)),
++          .space = md_uint(r->getOperand(3)),
++      };
++      table.entries[cls].push_back({range.space, range.lower_bound, range.size, range.range_id});
++      switch (cls) {
++      case SRV: {
++        auto kind = md_uint(r->getOperand(6));
++        auto ext = read_ext(r->getOperand(8));
++        auto type = resource_type(kind);
++        if (!type)
++          return type.takeError();
++        ShaderResourceViewInfo srv{};
++        srv.range = range;
++        srv.scaler_type = scaler_type(ext.component_type);
++        srv.resource_type = *type;
++        srv.read = true;
++        srv.structure_stride = kind == RK_StructuredBuffer ? ext.stride : 0;
++        info.srvMap[range.range_id] = srv;
++        break;
++      }
++      case UAV: {
++        auto kind = md_uint(r->getOperand(6));
++        auto ext = read_ext(r->getOperand(10));
++        auto type = resource_type(kind);
++        if (!type)
++          return type.takeError();
++        UnorderedAccessViewInfo uav{};
++        uav.range = range;
++        uav.scaler_type = scaler_type(ext.component_type);
++        uav.resource_type = *type;
++        uav.global_coherent = md_bool(r->getOperand(7));
++        uav.with_counter = md_bool(r->getOperand(8));
++        uav.rasterizer_order = md_bool(r->getOperand(9));
++        uav.structure_stride = kind == RK_StructuredBuffer ? ext.stride : 0;
++        info.uavMap[range.range_id] = uav;
++        break;
++      }
++      case CBuffer: {
++        ConstantBufferInfo cb{};
++        cb.range = range;
++        cb.size_in_vec4 = (md_uint(r->getOperand(6)) + 15) / 16;
++        info.cbufferMap[range.range_id] = cb;
++        break;
++      }
++      case Sampler: {
++        SamplerInfo s{};
++        s.range = range;
++        info.samplerMap[range.range_id] = s;
++        break;
++      }
++      }
++    }
++  }
++  return llvm::Error::success();
++}
++
++/* How the shader uses its resources decides the Metal access qualifiers. */
++static void
++scan_resource_usage(llvm::Function &F, SM50ShaderInternal *shader, const ResourceTable &table) {
++  auto &info = shader->shader_info;
++  for (auto &I : llvm::instructions(F)) {
++    auto call = llvm::dyn_cast<llvm::CallInst>(&I);
++    if (!call)
++      continue;
++    auto opc = dx_opcode(call);
++    if (opc == ~0u || call->arg_size() < 2)
++      continue;
++    auto h = resolve_handle(call->getArgOperand(1), table);
++    if (!h || h->heap)
++      continue;
++    if (h->cls == SRV) {
++      auto it = info.srvMap.find(h->range_id);
++      if (it == info.srvMap.end())
++        continue;
++      if ((opc >= 60 && opc <= 65) || opc == 73 || opc == 74 || opc == 81 || opc == 224)
++        it->second.sampled = true;
++      if (opc == 64 || opc == 65 || opc == 74 || opc == 224)
++        it->second.compared = true;
++    } else if (h->cls == UAV) {
++      auto it = info.uavMap.find(h->range_id);
++      if (it == info.uavMap.end())
++        continue;
++      switch (opc) {
++      case op::TextureLoad:
++      case op::BufferLoad:
++      case op::RawBufferLoad:
++        it->second.read = true;
++        break;
++      case op::TextureStore:
++      case op::BufferStore:
++      case op::RawBufferStore:
++        it->second.written = true;
++        break;
++      case op::AtomicBinOp:
++      case op::AtomicCompareExchange:
++        it->second.read = it->second.written = true;
++        break;
++      default:
++        break;
++      }
++    }
++  }
++}
++
++/* DXIL signature element (dx.entryPoints signatures) */
++struct SigElement {
++  uint32_t id;
++  uint32_t comp_type;
++  uint32_t kind; /* DXIL::SemanticKind */
++  uint32_t interp;
++  uint32_t rows, cols;
++  int32_t start_row;
++  int32_t start_col;
++};
++
++namespace sk {
++enum : uint32_t {
++  Arbitrary = 0,
++  VertexID = 1,
++  InstanceID = 2,
++  Position = 3,
++  RenderTargetArrayIndex = 4,
++  ViewPortArrayIndex = 5,
++  ClipDistance = 6,
++  CullDistance = 7,
++  PrimitiveID = 10,
++  SampleIndex = 12,
++  IsFrontFace = 13,
++  Coverage = 14,
++  InnerCoverage = 15,
++  Target = 16,
++  Depth = 17,
++  DepthLessEqual = 18,
++  DepthGreaterEqual = 19,
++  StencilRef = 20,
++};
++}
++
++static std::vector<SigElement>
++read_signature(const llvm::MDOperand &op) {
++  std::vector<SigElement> r;
++  auto list = llvm::dyn_cast_or_null<llvm::MDNode>(op.get());
++  if (!list)
++    return r;
++  for (auto &eop : list->operands()) {
++    auto e = llvm::cast<llvm::MDNode>(eop.get());
++    SigElement s;
++    s.id = md_uint(e->getOperand(0));
++    s.comp_type = md_uint(e->getOperand(2));
++    s.kind = md_uint(e->getOperand(3));
++    s.interp = md_uint(e->getOperand(5));
++    s.rows = md_uint(e->getOperand(6));
++    s.cols = md_uint(e->getOperand(7));
++    s.start_row = (int32_t)md_uint(e->getOperand(8));
++    s.start_col = (int8_t)md_uint(e->getOperand(9));
++    r.push_back(s);
++  }
++  return r;
++}
++
++/* A DXBC declaration instruction for one signature row, fed to the DXBC
++   signature handlers so DXIL shaders get the same inputs/outputs plumbing. */
++static microsoft::D3D10ShaderBinary::CInstruction
++make_decl(microsoft::D3D10_SB_OPCODE_TYPE opcode, microsoft::D3D10_SB_OPERAND_TYPE type, uint32_t reg, uint32_t mask) {
++  microsoft::D3D10ShaderBinary::CInstruction inst;
++  memset((void *)&inst, 0, sizeof(inst));
++  inst.m_OpCode = opcode;
++  inst.m_NumOperands = 1;
++  auto &o = inst.m_Operands[0];
++  o.m_Type = type;
++  o.m_IndexDimension = microsoft::D3D10_SB_OPERAND_INDEX_1D;
++  o.m_Index[0].m_RegIndex = reg;
++  o.m_WriteMask = mask << 4;
++  o.m_NumComponents = microsoft::D3D10_SB_OPERAND_4_COMPONENT;
++  return inst;
++}
++
++static uint32_t
++row_mask(const SigElement &e) {
++  return ((1u << e.cols) - 1) << (e.start_col < 0 ? 0 : e.start_col);
++}
++
++static llvm::Error
++synthesize_signature(
++    SM50ShaderInternal *shader, microsoft::CSignatureParser &in, microsoft::CSignatureParser5 &out,
++    const std::vector<SigElement> &inputs, const std::vector<SigElement> &outputs
++) {
++  using namespace microsoft;
++  auto emit = [&](D3D10ShaderBinary::CInstruction inst) { handle_signature(in, out, inst, shader, 0); };
++  bool vs = shader->shader_type == D3D10_SB_VERTEX_SHADER;
++  bool ps = shader->shader_type == D3D10_SB_PIXEL_SHADER;
++
++  for (auto &e : inputs) {
++    if (e.start_row < 0) {
++      if (ps && e.kind == sk::Coverage) {
++        emit(make_decl(D3D10_SB_OPCODE_DCL_INPUT, D3D11_SB_OPERAND_TYPE_INPUT_COVERAGE_MASK, 0, 1));
++        continue;
++      }
++      if (ps && e.kind == sk::SampleIndex)
++        continue; /* dx.op.sampleIndex */
++      return unsupported("input semantic kind " + llvm::Twine(e.kind) + " without register");
++    }
++    for (uint32_t r = 0; r < e.rows; r++) {
++      uint32_t reg = e.start_row + r, mask = row_mask(e);
++      if (vs) {
++        switch (e.kind) {
++        case sk::Arbitrary:
++          emit(make_decl(D3D10_SB_OPCODE_DCL_INPUT, D3D10_SB_OPERAND_TYPE_INPUT, reg, mask));
++          break;
++        case sk::VertexID:
++        case sk::InstanceID: {
++          auto inst = make_decl(D3D10_SB_OPCODE_DCL_INPUT_SGV, D3D10_SB_OPERAND_TYPE_INPUT, reg, mask);
++          inst.m_InputDeclSGV.Name = e.kind == sk::VertexID ? D3D10_SB_NAME_VERTEX_ID : D3D10_SB_NAME_INSTANCE_ID;
++          emit(inst);
++          break;
++        }
++        default:
++          return unsupported("vertex input semantic kind " + llvm::Twine(e.kind));
++        }
++      } else if (ps) {
++        auto interp = (D3D10_SB_INTERPOLATION_MODE)e.interp;
++        switch (e.kind) {
++        case sk::Arbitrary: {
++          auto inst = make_decl(D3D10_SB_OPCODE_DCL_INPUT_PS, D3D10_SB_OPERAND_TYPE_INPUT, reg, mask);
++          inst.m_InputPSDecl.InterpolationMode = interp;
++          emit(inst);
++          break;
++        }
++        case sk::Position:
++        case sk::RenderTargetArrayIndex:
++        case sk::ViewPortArrayIndex:
++        case sk::ClipDistance:
++        case sk::CullDistance: {
++          auto inst = make_decl(D3D10_SB_OPCODE_DCL_INPUT_PS_SIV, D3D10_SB_OPERAND_TYPE_INPUT, reg, mask);
++          inst.m_InputPSDeclSIV.Name = e.kind == sk::Position                 ? D3D10_SB_NAME_POSITION
++                                       : e.kind == sk::RenderTargetArrayIndex ? D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX
++                                       : e.kind == sk::ViewPortArrayIndex     ? D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX
++                                       : e.kind == sk::ClipDistance           ? D3D10_SB_NAME_CLIP_DISTANCE
++                                                                              : D3D10_SB_NAME_CULL_DISTANCE;
++          inst.m_InputPSDeclSIV.InterpolationMode = interp;
++          emit(inst);
++          break;
++        }
++        case sk::IsFrontFace:
++        case sk::SampleIndex:
++        case sk::PrimitiveID: {
++          auto inst = make_decl(D3D10_SB_OPCODE_DCL_INPUT_PS_SGV, D3D10_SB_OPERAND_TYPE_INPUT, reg, mask);
++          inst.m_InputPSDeclSGV.Name = e.kind == sk::IsFrontFace   ? D3D10_SB_NAME_IS_FRONT_FACE
++                                       : e.kind == sk::SampleIndex ? D3D10_SB_NAME_SAMPLE_INDEX
++                                                                   : D3D10_SB_NAME_PRIMITIVE_ID;
++          inst.m_InputPSDeclSGV.InterpolationMode = D3D10_SB_INTERPOLATION_CONSTANT;
++          emit(inst);
++          break;
++        }
++        default:
++          return unsupported("pixel input semantic kind " + llvm::Twine(e.kind));
++        }
++      }
++    }
++  }
++
++  for (auto &e : outputs) {
++    if (ps && e.start_row < 0) {
++      switch (e.kind) {
++      case sk::Depth:
++        emit(make_decl(D3D10_SB_OPCODE_DCL_OUTPUT, D3D10_SB_OPERAND_TYPE_OUTPUT_DEPTH, 0, 1));
++        continue;
++      case sk::DepthLessEqual:
++        emit(make_decl(D3D10_SB_OPCODE_DCL_OUTPUT, D3D11_SB_OPERAND_TYPE_OUTPUT_DEPTH_LESS_EQUAL, 0, 1));
++        continue;
++      case sk::DepthGreaterEqual:
++        emit(make_decl(D3D10_SB_OPCODE_DCL_OUTPUT, D3D11_SB_OPERAND_TYPE_OUTPUT_DEPTH_GREATER_EQUAL, 0, 1));
++        continue;
++      case sk::Coverage:
++        emit(make_decl(D3D10_SB_OPCODE_DCL_OUTPUT, D3D10_SB_OPERAND_TYPE_OUTPUT_COVERAGE_MASK, 0, 1));
++        continue;
++      case sk::StencilRef:
++        emit(make_decl(D3D10_SB_OPCODE_DCL_OUTPUT, D3D11_SB_OPERAND_TYPE_OUTPUT_STENCIL_REF, 0, 1));
++        continue;
++      default:
++        return unsupported("pixel output semantic kind " + llvm::Twine(e.kind));
++      }
++    }
++    if (e.start_row < 0)
++      return unsupported("output semantic kind " + llvm::Twine(e.kind) + " without register");
++    for (uint32_t r = 0; r < e.rows; r++) {
++      uint32_t reg = e.start_row + r, mask = row_mask(e);
++      if (vs) {
++        switch (e.kind) {
++        case sk::Arbitrary:
++          emit(make_decl(D3D10_SB_OPCODE_DCL_OUTPUT, D3D10_SB_OPERAND_TYPE_OUTPUT, reg, mask));
++          break;
++        case sk::Position:
++        case sk::RenderTargetArrayIndex:
++        case sk::ViewPortArrayIndex:
++        case sk::ClipDistance:
++        case sk::CullDistance: {
++          auto inst = make_decl(D3D10_SB_OPCODE_DCL_OUTPUT_SIV, D3D10_SB_OPERAND_TYPE_OUTPUT, reg, mask);
++          inst.m_OutputDeclSIV.Name = e.kind == sk::Position                 ? D3D10_SB_NAME_POSITION
++                                      : e.kind == sk::RenderTargetArrayIndex ? D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX
++                                      : e.kind == sk::ViewPortArrayIndex     ? D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX
++                                      : e.kind == sk::ClipDistance           ? D3D10_SB_NAME_CLIP_DISTANCE
++                                                                             : D3D10_SB_NAME_CULL_DISTANCE;
++          emit(inst);
++          break;
++        }
++        default:
++          return unsupported("vertex output semantic kind " + llvm::Twine(e.kind));
++        }
++      } else if (ps) {
++        if (e.kind != sk::Target)
++          return unsupported("pixel output semantic kind " + llvm::Twine(e.kind));
++        emit(make_decl(D3D10_SB_OPCODE_DCL_OUTPUT, D3D10_SB_OPERAND_TYPE_OUTPUT, reg, mask));
++      }
++    }
++  }
++  return llvm::Error::success();
++}
++
++int
++InitializeShader(
++    const void *pBytecode, size_t BytecodeSize, SM50ShaderInternal *shader, microsoft::CSignatureParser &inputParser,
++    microsoft::CSignatureParser5 &outputParser, llvm::raw_ostream &errorOut
++) {
++  using namespace microsoft;
++  uint32_t version = 0;
++  if (!ExtractDXIL(pBytecode, BytecodeSize, shader->dxil_bitcode, version)) {
++    errorOut << "DXIL: invalid DXIL part";
++    return 1;
++  }
++  shader->is_dxil = true;
++  shader->dxil_container.assign((const char *)pBytecode, (const char *)pBytecode + BytecodeSize);
++
++  llvm::LLVMContext context;
++  context.setOpaquePointers(false);
++  auto M = ParseDXIL(shader->dxil_bitcode, context);
++  if (!M) {
++    errorOut << "DXIL: bitcode parse failed: " << llvm::toString(M.takeError());
++    return 1;
++  }
++  auto &mod = **M;
++
++  uint32_t kind = version >> 16;
++  switch (kind) {
++  case 0:
++    shader->shader_type = D3D10_SB_PIXEL_SHADER;
++    break;
++  case 1:
++    shader->shader_type = D3D10_SB_VERTEX_SHADER;
++    break;
++  case 5:
++    shader->shader_type = D3D11_SB_COMPUTE_SHADER;
++    break;
++  default: {
++    static const char *names[] = {"pixel", "vertex", "geometry", "hull", "domain", "compute"};
++    errorOut << "DXIL: " << (kind < 6 ? names[kind] : "library/mesh/amplification")
++             << " shaders are not supported yet";
++    return 1;
++  }
++  }
++
++  auto entries = mod.getNamedMetadata("dx.entryPoints");
++  if (!entries || entries->getNumOperands() == 0) {
++    errorOut << "DXIL: no entry point";
++    return 1;
++  }
++  auto entry = entries->getOperand(0);
++  auto fn = llvm::mdconst::dyn_extract_or_null<llvm::Function>(entry->getOperand(0));
++  if (!fn) {
++    errorOut << "DXIL: entry point without function";
++    return 1;
++  }
++  shader->dxil_entry = fn->getName().str();
++  if (auto props = llvm::dyn_cast_or_null<llvm::MDNode>(entry->getOperand(4).get())) {
++    for (unsigned i = 0; i + 1 < props->getNumOperands(); i += 2) {
++      auto tag = md_uint(props->getOperand(i));
++      if (tag == 4 /* NumThreads */) {
++        auto nt = llvm::cast<llvm::MDNode>(props->getOperand(i + 1).get());
++        for (unsigned d = 0; d < 3; d++)
++          shader->threadgroup_size[d] = md_uint(nt->getOperand(d));
++      }
++    }
++  }
++
++  ResourceTable table;
++  if (auto err = read_resources(mod, shader, table)) {
++    errorOut << llvm::toString(std::move(err));
++    return 1;
++  }
++  scan_resource_usage(*fn, shader, table);
++
++  /* inputs and outputs through the DXBC signature handlers */
++  if (shader->shader_type == D3D11_SB_COMPUTE_SHADER) {
++    for (auto type : {D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID, D3D11_SB_OPERAND_TYPE_INPUT_THREAD_GROUP_ID,
++                      D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID_IN_GROUP,
++                      D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID_IN_GROUP_FLATTENED}) {
++      auto inst = make_decl(D3D10_SB_OPCODE_DCL_INPUT, type, 0, 0);
++      inst.m_Operands[0].m_IndexDimension = D3D10_SB_OPERAND_INDEX_0D;
++      handle_signature(inputParser, outputParser, inst, shader, 0);
++    }
++  } else {
++    auto sigs = llvm::dyn_cast_or_null<llvm::MDNode>(entry->getOperand(2).get());
++    std::vector<SigElement> inputs, outputs;
++    if (sigs) {
++      inputs = read_signature(sigs->getOperand(0));
++      outputs = read_signature(sigs->getOperand(1));
++    }
++    if (auto err = synthesize_signature(shader, inputParser, outputParser, inputs, outputs)) {
++      errorOut << llvm::toString(std::move(err));
++      return 1;
++    }
++  }
++
++  /* SV_Coverage input is an operation in DXIL, not a signature element */
++  if (shader->shader_type == D3D10_SB_PIXEL_SHADER) {
++    for (auto &I : llvm::instructions(*fn))
++      if (auto call = llvm::dyn_cast<llvm::CallInst>(&I); call && dx_opcode(call) == op::Coverage) {
++        auto inst = make_decl(D3D10_SB_OPCODE_DCL_INPUT, D3D11_SB_OPERAND_TYPE_INPUT_COVERAGE_MASK, 0, 1);
++        inst.m_Operands[0].m_IndexDimension = D3D10_SB_OPERAND_INDEX_0D;
++        handle_signature(inputParser, outputParser, inst, shader, 0);
++        break;
++      }
++  }
++
++  /* SV_SampleIndex is an operation too */
++  if (shader->shader_type == D3D10_SB_PIXEL_SHADER) {
++    for (auto &I : llvm::instructions(*fn))
++      if (auto call = llvm::dyn_cast<llvm::CallInst>(&I); call && dx_opcode(call) == 90) {
++        shader->dxil_sample_index_arg = shader->func_signature.DefineInput(air::InputSampleIndex{});
++        break;
++      }
++  }
++
++  /* wave intrinsics need the simdgroup lane and size */
++  bool uses_wave = false;
++  for (auto &I : llvm::instructions(*fn))
++    if (auto call = llvm::dyn_cast<llvm::CallInst>(&I)) {
++      auto opc = dx_opcode(call);
++      if ((opc >= 110 && opc <= 123) || opc == 135 || opc == 136)
++        uses_wave = true;
++      /* compute derivatives are emulated with quad shuffles */
++      if (shader->shader_type == D3D11_SB_COMPUTE_SHADER &&
++          (opc == 60 || opc == 61 || opc == 64 || (opc >= 83 && opc <= 86)))
++        uses_wave = true;
++    }
++  if (uses_wave && (shader->shader_type == D3D11_SB_COMPUTE_SHADER || shader->shader_type == D3D10_SB_PIXEL_SHADER)) {
++    shader->dxil_lane_arg = shader->func_signature.DefineInput(air::InputThreadIndexInSimdgroup{});
++    shader->dxil_lanes_arg = shader->func_signature.DefineInput(air::InputThreadsPerSimdgroup{});
++  }
++  return 0;
++}
++
++/* --- Compile: dx.op calls to AIR --- */
++
++namespace {
++
++class Lowering {
++public:
++  Lowering(
++      llvm::IRBuilder<> &B, AIRBuilder &air, Converter &conv, BindingMap &binding, const ResourceTable &table,
++      const ShaderInfo &info
++  ) :
++      B(B),
++      air(air),
++      conv(conv),
++      binding(binding),
++      table(table),
++      info(info) {}
++
++  struct dxbc::context *ctx = nullptr;
++  const std::vector<SigElement> *inputs = nullptr, *outputs = nullptr;
++  llvm::Value *lane = nullptr, *lanes = nullptr;
++  uint32_t shader_sample_index_arg = ~0u;
++  bool needs_air_2_9 = false; /* 64-bit atomics */
++  bool used_msad = false;
++  bool used_samplepos = false;
++
++  llvm::Error
++  lower(llvm::CallInst *call, llvm::Value *&result) {
++    auto opc = dx_opcode(call);
++    auto arg = [&](unsigned i) { return call->getArgOperand(i); };
++    auto cint = [&](unsigned i) { return (uint32_t)llvm::cast<llvm::ConstantInt>(arg(i))->getZExtValue(); };
++    result = nullptr;
++    switch (opc) {
++    case op::CreateHandle:
++    case op::CreateHandleFromBinding:
++    case 218: /* createHandleFromHeap */
++    case op::AnnotateHandle:
++      return llvm::Error::success(); /* resolved at the users */
++
++    case op::ThreadId:
++      result = B.CreateExtractElement(ctx->resource.thread_id_arg, (uint64_t)cint(1));
++      return llvm::Error::success();
++    case op::GroupId:
++      result = B.CreateExtractElement(ctx->resource.thread_group_id_arg, (uint64_t)cint(1));
++      return llvm::Error::success();
++    case op::ThreadIdInGroup:
++      result = B.CreateExtractElement(ctx->resource.thread_id_in_group_arg, (uint64_t)cint(1));
++      return llvm::Error::success();
++    case op::FlattenedThreadIdInGroup:
++      result = ctx->resource.thread_id_in_group_flat_arg;
++      return llvm::Error::success();
++
++    case op::FAbs:
++    case op::Saturate:
++    case op::Cos:
++    case op::Sin:
++    case op::Exp:
++    case op::Frc:
++    case op::Log:
++    case op::Sqrt:
++    case op::Rsqrt:
++    case op::Round_ne:
++    case op::Round_ni:
++    case op::Round_pi:
++    case op::Round_z: {
++      static const std::pair<uint32_t, AIRBuilder::FPUnOp> map[] = {
++          {op::FAbs, AIRBuilder::fabs},      {op::Saturate, AIRBuilder::saturate}, {op::Cos, AIRBuilder::cos},
++          {op::Sin, AIRBuilder::sin},        {op::Exp, AIRBuilder::exp2},          {op::Frc, AIRBuilder::fract},
++          {op::Log, AIRBuilder::log2},       {op::Sqrt, AIRBuilder::sqrt},         {op::Rsqrt, AIRBuilder::rsqrt},
++          {op::Round_ne, AIRBuilder::rint},  {op::Round_ni, AIRBuilder::floor},    {op::Round_pi, AIRBuilder::ceil},
++          {op::Round_z, AIRBuilder::trunc},
++      };
++      /* sqrt stays precise: fast_sqrt misses exact results (sqrt(109*109) != 109) */
++      for (auto &[o, f] : map)
++        if (o == opc)
++          result = air.CreateFPUnOp(f, arg(1), opc != op::Sqrt);
++      return llvm::Error::success();
++    }
++    case op::Tan:
++    case op::Acos:
++    case op::Asin:
++    case op::Atan:
++    case op::Hcos:
++    case op::Hsin:
++    case op::Htan: {
++      static const char *names[] = {"air.tan", "air.acos", "air.asin", "air.atan", "air.cosh", "air.sinh", "air.tanh"};
++      auto ty = arg(1)->getType();
++      std::string name = std::string(names[opc - op::Tan]) + (ty->isHalfTy() ? ".f16" : ".f32");
++      auto &C = B.getContext();
++      auto attrs = llvm::AttributeList::get(
++          C, {{~0U, llvm::Attribute::get(C, llvm::Attribute::ReadNone)},
++              {~0U, llvm::Attribute::get(C, llvm::Attribute::NoUnwind)},
++              {~0U, llvm::Attribute::get(C, llvm::Attribute::WillReturn)}}
++      );
++      auto fn = B.GetInsertBlock()->getModule()->getOrInsertFunction(name, llvm::FunctionType::get(ty, {ty}, false), attrs);
++      result = B.CreateCall(fn, {arg(1)});
++      return llvm::Error::success();
++    }
++    case op::IsNaN:
++      result = air.CreateIsNaN(arg(1));
++      return llvm::Error::success();
++    case op::IsInf:
++      result = B.CreateFCmpOEQ(
++          air.CreateFPUnOp(AIRBuilder::fabs, arg(1)), llvm::ConstantFP::getInfinity(arg(1)->getType())
++      );
++      return llvm::Error::success();
++    case op::IsFinite:
++      result = B.CreateFCmpOLT(
++          air.CreateFPUnOp(AIRBuilder::fabs, arg(1)), llvm::ConstantFP::getInfinity(arg(1)->getType())
++      );
++      return llvm::Error::success();
++    case op::Bfrev:
++      result = air.CreateIntUnOp(AIRBuilder::reverse_bits, arg(1));
++      return llvm::Error::success();
++    case op::Countbits:
++      result = air.CreateIntUnOp(AIRBuilder::popcount, arg(1));
++      return llvm::Error::success();
++    case op::FirstbitLo: {
++      auto v = arg(1);
++      result = B.CreateSelect(
++          B.CreateICmpEQ(v, B.getInt32(0)), B.getInt32(~0u), air.CreateCountZero(v, true)
++      );
++      return llvm::Error::success();
++    }
++    case op::FirstbitHi:
++    case op::FirstbitSHi: {
++      /* DXIL counts from the MSB (like DXBC firstbit_hi), -1 when not found */
++      auto v = arg(1);
++      if (opc == op::FirstbitSHi)
++        v = B.CreateSelect(B.CreateICmpSLT(v, B.getInt32(0)), B.CreateNot(v), v);
++      result = B.CreateSelect(
++          B.CreateICmpEQ(v, B.getInt32(0)), B.getInt32(~0u), air.CreateCountZero(v, false)
++      );
++      return llvm::Error::success();
++    }
++    case op::FMax:
++      result = air.CreateFPBinOp(AIRBuilder::fmax, arg(1), arg(2));
++      return llvm::Error::success();
++    case op::FMin:
++      result = air.CreateFPBinOp(AIRBuilder::fmin, arg(1), arg(2));
++      return llvm::Error::success();
++    case op::IMax:
++      result = air.CreateIntBinOp(AIRBuilder::max, arg(1), arg(2), true);
++      return llvm::Error::success();
++    case op::IMin:
++      result = air.CreateIntBinOp(AIRBuilder::min, arg(1), arg(2), true);
++      return llvm::Error::success();
++    case op::UMax:
++      result = air.CreateIntBinOp(AIRBuilder::max, arg(1), arg(2), false);
++      return llvm::Error::success();
++    case op::UMin:
++      result = air.CreateIntBinOp(AIRBuilder::min, arg(1), arg(2), false);
++      return llvm::Error::success();
++    case op::IMul:
++    case op::UMul: {
++      /* dx.types.twoi32 { high, low } */
++      auto ext = [&](llvm::Value *v) {
++        return opc == op::IMul ? B.CreateSExt(v, B.getInt64Ty()) : B.CreateZExt(v, B.getInt64Ty());
++      };
++      auto p = B.CreateMul(ext(arg(1)), ext(arg(2)));
++      llvm::Value *st = llvm::UndefValue::get(call->getType());
++      st = B.CreateInsertValue(st, B.CreateTrunc(B.CreateLShr(p, 32), B.getInt32Ty()), {0});
++      result = B.CreateInsertValue(st, B.CreateTrunc(p, B.getInt32Ty()), {1});
++      return llvm::Error::success();
++    }
++    case op::UAddc:
++    case op::USubb: {
++      /* dx.types.i32c { result, carry/borrow } */
++      auto r = opc == op::UAddc ? B.CreateAdd(arg(1), arg(2)) : B.CreateSub(arg(1), arg(2));
++      auto flag = opc == op::UAddc ? B.CreateICmpULT(r, arg(1)) : B.CreateICmpULT(arg(1), arg(2));
++      auto st_ty = llvm::cast<llvm::StructType>(call->getType());
++      llvm::Value *st = llvm::UndefValue::get(st_ty);
++      st = B.CreateInsertValue(st, r, {0});
++      auto flag_ty = st_ty->getElementType(1);
++      result = B.CreateInsertValue(st, flag_ty->isIntegerTy(1) ? flag : B.CreateZExt(flag, flag_ty), {1});
++      return llvm::Error::success();
++    }
++    case op::UDiv: {
++      /* dx.types.twoi32 { quotient, remainder }, x/0 gives 0xffffffff like D3D */
++      auto a = arg(1), b = arg(2);
++      auto zero = B.CreateICmpEQ(b, B.getInt32(0));
++      auto safe_b = B.CreateSelect(zero, B.getInt32(1), b);
++      auto q = B.CreateSelect(zero, B.getInt32(~0u), B.CreateUDiv(a, safe_b));
++      auto r = B.CreateSelect(zero, B.getInt32(~0u), B.CreateURem(a, safe_b));
++      llvm::Value *s = llvm::UndefValue::get(call->getType());
++      s = B.CreateInsertValue(s, q, {0});
++      result = B.CreateInsertValue(s, r, {1});
++      return llvm::Error::success();
++    }
++    case op::Msad: {
++      auto &C = B.getContext();
++      auto attrs = llvm::AttributeList::get(
++          C, {{~0U, llvm::Attribute::get(C, llvm::Attribute::ReadNone)},
++              {~0U, llvm::Attribute::get(C, llvm::Attribute::NoUnwind)},
++              {~0U, llvm::Attribute::get(C, llvm::Attribute::WillReturn)}}
++      );
++      auto ty = arg(1)->getType();
++      auto fn = B.GetInsertBlock()->getModule()->getOrInsertFunction(
++          "dxmt.msad" + air.getTypeOverloadSuffix(ty), llvm::FunctionType::get(ty, {ty, ty, ty}, false), attrs
++      );
++      result = B.CreateCall(fn, {arg(1), arg(2), arg(3)});
++      used_msad = true;
++      return llvm::Error::success();
++    }
++    case op::Ibfe:
++    case op::Ubfe: {
++      /* (width, offset, value): D3D bitfield extract */
++      auto w = B.CreateAnd(arg(1), 31), o = B.CreateAnd(arg(2), 31), v = arg(3);
++      auto wo = B.CreateAdd(w, o);
++      auto shifted = B.CreateShl(v, B.CreateSub(B.getInt32(32), wo));
++      auto field = opc == op::Ibfe ? B.CreateAShr(shifted, B.CreateSub(B.getInt32(32), w))
++                                   : B.CreateLShr(shifted, B.CreateSub(B.getInt32(32), w));
++      auto high = opc == op::Ibfe ? B.CreateAShr(v, o) : B.CreateLShr(v, o);
++      auto r = B.CreateSelect(B.CreateICmpULT(wo, B.getInt32(32)), field, high);
++      result = B.CreateSelect(B.CreateICmpEQ(w, B.getInt32(0)), B.getInt32(0), r);
++      return llvm::Error::success();
++    }
++    case op::Bfi: {
++      /* (width, offset, value, replaced) */
++      auto w = B.CreateAnd(arg(1), 31), o = B.CreateAnd(arg(2), 31);
++      auto bits = B.CreateSelect(
++          B.CreateICmpEQ(w, B.getInt32(0)), B.getInt32(0), B.CreateLShr(B.getInt32(~0u), B.CreateSub(B.getInt32(32), w))
++      );
++      auto mask = B.CreateShl(bits, o);
++      result = B.CreateOr(B.CreateAnd(B.CreateShl(arg(3), o), mask), B.CreateAnd(arg(4), B.CreateNot(mask)));
++      return llvm::Error::success();
++    }
++    case op::FMad:
++      result = B.CreateFAdd(B.CreateFMul(arg(1), arg(2)), arg(3));
++      return llvm::Error::success();
++    case op::Fma:
++      result = air.CreateFMA(arg(1), arg(2), arg(3));
++      return llvm::Error::success();
++    case op::IMad:
++    case op::UMad:
++      result = B.CreateAdd(B.CreateMul(arg(1), arg(2)), arg(3));
++      return llvm::Error::success();
++    case op::Dot2:
++    case op::Dot3:
++    case op::Dot4: {
++      unsigned n = opc == op::Dot2 ? 2 : opc == op::Dot3 ? 3 : 4;
++      llvm::Value *acc = B.CreateFMul(arg(1), arg(1 + n));
++      for (unsigned i = 1; i < n; i++)
++        acc = B.CreateFAdd(acc, B.CreateFMul(arg(1 + i), arg(1 + n + i)));
++      result = acc;
++      return llvm::Error::success();
++    }
++    case op::LegacyF32ToF16: {
++      auto h = B.CreateFPTrunc(arg(1), B.getHalfTy());
++      result = B.CreateZExt(B.CreateBitCast(h, B.getInt16Ty()), B.getInt32Ty());
++      return llvm::Error::success();
++    }
++    case op::LegacyF16ToF32: {
++      auto h = B.CreateBitCast(B.CreateTrunc(arg(1), B.getInt16Ty()), B.getHalfTy());
++      result = B.CreateFPExt(h, B.getFloatTy());
++      return llvm::Error::success();
++    }
++
++    case op::Barrier: {
++      /* 1 SyncThreadGroup, 2 UAVFenceGlobal, 4 UAVFenceThreadGroup, 8 TGSMFence */
++      auto mode = cint(1);
++      uint32_t flags = 0;
++      if (mode & (2 | 4))
++        flags |= uint32_t(llvm::air::MemFlags::Device) | uint32_t(llvm::air::MemFlags::Texture);
++      if (mode & 8)
++        flags |= uint32_t(llvm::air::MemFlags::Threadgroup);
++      if (mode & 1)
++        air.CreateBarrier(llvm::air::MemFlags(flags));
++      else
++        air.CreateAtomicFence(
++            llvm::air::MemFlags(flags),
++            (mode & 2) ? llvm::air::ThreadScope::Device : llvm::air::ThreadScope::Threadgroup
++        );
++      return llvm::Error::success();
++    }
++
++    case op::CBufferLoadLegacy:
++      return cbuffer_load_legacy(call, result);
++    case op::BufferLoad:
++    case op::RawBufferLoad:
++      return buffer_load(call, result);
++    case op::BufferStore:
++    case op::RawBufferStore:
++      return buffer_store(call);
++    case op::TextureLoad:
++      return texture_load(call, result);
++    case op::TextureStore:
++      return texture_store(call);
++    case op::SampleLevel:
++      return sample_level(call, result);
++    case op::Sample:
++    case op::SampleBias:
++    case op::SampleGrad:
++    case op::SampleCmp:
++    case op::SampleCmpLevelZero:
++    case 224: /* sampleCmpLevel */
++      return sample(call, opc, result);
++    case op::LoadInput:
++      return load_input(call, result);
++    case op::StoreOutput:
++      return store_output(call);
++    case op::Discard: {
++      auto cond = arg(1);
++      if (auto c = llvm::dyn_cast<llvm::ConstantInt>(cond)) {
++        if (!c->isZero())
++          air.CreateDiscard();
++        return llvm::Error::success();
++      }
++      auto then = llvm::SplitBlockAndInsertIfThen(cond, call, false);
++      B.SetInsertPoint(then);
++      air.CreateDiscard();
++      B.SetInsertPoint(call);
++      return llvm::Error::success();
++    }
++    case op::Coverage:
++      if (!ctx->resource.coverage_mask_arg)
++        return unsupported("SV_Coverage input not declared");
++      result = ctx->resource.coverage_mask_arg;
++      return llvm::Error::success();
++    case 90: /* sampleIndex */
++      if (!~shader_sample_index_arg)
++        return unsupported("SV_SampleIndex not declared");
++      result = ctx->function->getArg(shader_sample_index_arg);
++      return llvm::Error::success();
++    case 219: { /* unpack4x8(mode, packed): mode 0 zero extend, 1 sign extend */
++      auto st = llvm::cast<llvm::StructType>(call->getType());
++      auto ety = st->getElementType(0);
++      llvm::Value *r = llvm::UndefValue::get(st);
++      for (unsigned i = 0; i < 4; i++) {
++        auto byte = B.CreateTrunc(B.CreateLShr(arg(2), 8 * i), B.getInt8Ty());
++        r = B.CreateInsertValue(r, cint(1) ? B.CreateSExt(byte, ety) : B.CreateZExt(byte, ety), {i});
++      }
++      result = r;
++      return llvm::Error::success();
++    }
++    case 220: { /* pack4x8(mode, x, y, z, w): 0 truncate, 1 clamp u8, 2 clamp s8 */
++      auto mode = cint(1);
++      llvm::Value *r = B.getInt32(0);
++      for (unsigned i = 0; i < 4; i++) {
++        llvm::Value *v = arg(2 + i);
++        if (v->getType() != B.getInt32Ty())
++          v = B.CreateSExt(v, B.getInt32Ty());
++        if (mode == 1)
++          v = air.CreateIntBinOp(AIRBuilder::min, air.CreateIntBinOp(AIRBuilder::max, v, B.getInt32(0), true), B.getInt32(255), true);
++        else if (mode == 2)
++          v = air.CreateIntBinOp(AIRBuilder::min, air.CreateIntBinOp(AIRBuilder::max, v, B.getInt32(-128), true), B.getInt32(127), true);
++        r = B.CreateOr(r, B.CreateShl(B.CreateAnd(v, 0xff), 8 * i));
++      }
++      result = r;
++      return llvm::Error::success();
++    }
++    case 163: /* dot4AddI8Packed(acc, a, b) */
++    case 164: { /* dot4AddU8Packed */
++      llvm::Value *acc = arg(1);
++      for (unsigned i = 0; i < 4; i++) {
++        auto a = B.CreateTrunc(B.CreateLShr(arg(2), 8 * i), B.getInt8Ty());
++        auto b = B.CreateTrunc(B.CreateLShr(arg(3), 8 * i), B.getInt8Ty());
++        auto ea = opc == 163 ? B.CreateSExt(a, B.getInt32Ty()) : B.CreateZExt(a, B.getInt32Ty());
++        auto eb = opc == 163 ? B.CreateSExt(b, B.getInt32Ty()) : B.CreateZExt(b, B.getInt32Ty());
++        acc = B.CreateAdd(acc, B.CreateMul(ea, eb));
++      }
++      result = acc;
++      return llvm::Error::success();
++    }
++    case 75: { /* texture2DMSGetSamplePosition(srv, index) -> dx.types.SamplePos {x, y} */
++      auto h = handle(arg(1));
++      if (!h)
++        return h.takeError();
++      auto tex = texture(*h);
++      if (!tex)
++        return tex.takeError();
++      auto count = air.CreateTextureQuery(tex->Texture, tex->Handle, Texture::num_samples, B.getInt32(0));
++      auto pos = conv.GetSamplePos(count, arg(2));
++      llvm::Value *st = llvm::UndefValue::get(call->getType());
++      st = B.CreateInsertValue(st, B.CreateExtractElement(pos, (uint64_t)0), {0});
++      result = B.CreateInsertValue(st, B.CreateExtractElement(pos, (uint64_t)1), {1});
++      used_samplepos = true;
++      return llvm::Error::success();
++    }
++    case 76: { /* renderTargetGetSamplePosition(index) */
++      auto pos = conv.GetSamplePos(air.CreateGetNumSamples(), arg(1));
++      llvm::Value *st = llvm::UndefValue::get(call->getType());
++      st = B.CreateInsertValue(st, B.CreateExtractElement(pos, (uint64_t)0), {0});
++      result = B.CreateInsertValue(st, B.CreateExtractElement(pos, (uint64_t)1), {1});
++      used_samplepos = true;
++      return llvm::Error::success();
++    }
++    case 77: /* renderTargetGetSampleCount */
++      result = air.CreateGetNumSamples();
++      return llvm::Error::success();
++    case 71: /* checkAccessFullyMapped(status): no tiled resources, every access is mapped */
++      result = B.CreateICmpNE(arg(1), B.getInt32(0));
++      return llvm::Error::success();
++    case 92: /* innerCoverage: no conservative rasterization */
++    case 138: /* viewID: no view instancing */
++      result = B.getInt32(0);
++      return llvm::Error::success();
++    case 256: /* startVertexLocation */
++      if (!ctx->resource.base_vertex_id)
++        return unsupported("startVertexLocation outside a vertex shader");
++      result = ctx->resource.base_vertex_id;
++      return llvm::Error::success();
++    case 257: /* startInstanceLocation */
++      if (!ctx->resource.base_instance_id)
++        return unsupported("startInstanceLocation outside a vertex shader");
++      result = ctx->resource.base_instance_id;
++      return llvm::Error::success();
++    case 222: { /* quadVote(cond, op): 0 any, 1 all */
++      auto c = B.CreateZExt(arg(1), B.getInt32Ty());
++      llvm::Value *acc = c;
++      for (unsigned k = 1; k < 4; k++) {
++        auto o = simd_typed("air.quad_shuffle_xor", c, false, {B.getInt16(k)});
++        acc = cint(2) ? B.CreateAnd(acc, o) : B.CreateOr(acc, o);
++      }
++      result = B.CreateICmpNE(acc, B.getInt32(0));
++      return llvm::Error::success();
++    }
++    case op::IsHelperLane:
++      result = simd_call("air.simd_is_helper_thread", B.getInt1Ty(), {});
++      return llvm::Error::success();
++    case op::CalculateLOD: {
++      auto h = handle(arg(1));
++      auto sh = handle(arg(2));
++      if (!h)
++        return h.takeError();
++      if (!sh)
++        return sh.takeError();
++      auto tex = texture(*h);
++      if (!tex)
++        return tex.takeError();
++      auto sampler = sampler_of(*sh);
++      if (!sampler)
++        return unsupported("sampler not bound by the root signature");
++      auto [coord, array] = coords(*tex, arg(3), arg(4), arg(5), true);
++      if (!coord)
++        return unsupported("CalculateLOD on this texture kind");
++      auto [clamped, unclamped] = air.CreateCalculateLOD(tex->Texture, tex->Handle, sampler->SamplerHandle, coord);
++      result = cint(6) ? clamped : unclamped;
++      return llvm::Error::success();
++    }
++    case op::DerivCoarseX:
++    case op::DerivFineX:
++      result = derivative(arg(1), false);
++      return result ? llvm::Error::success() : unsupported("derivative type");
++    case op::DerivCoarseY:
++    case op::DerivFineY:
++      result = derivative(arg(1), true);
++      return result ? llvm::Error::success() : unsupported("derivative type");
++    case op::AtomicBinOp:
++      return atomic_binop(call, result);
++    case op::BufferUpdateCounter:
++      return update_counter(call, result);
++    case op::GetDimensions:
++      return get_dimensions(call, result);
++    case op::TextureGather:
++    case op::TextureGatherCmp:
++      return gather(call, opc, result);
++    case op::AtomicCompareExchange:
++      return atomic_cmpxchg(call, result);
++
++    case op::WaveIsFirstLane:
++      result = simd_call("air.simd_is_first", B.getInt1Ty(), {});
++      return llvm::Error::success();
++    case op::WaveGetLaneIndex:
++      result = lane;
++      return lane ? llvm::Error::success() : unsupported("wave lane index in this shader stage");
++    case op::WaveGetLaneCount:
++      result = lanes;
++      return lanes ? llvm::Error::success() : unsupported("wave lane count in this shader stage");
++    case op::WaveAnyTrue:
++      result = simd_call("air.simd_any", B.getInt1Ty(), {arg(1)});
++      return llvm::Error::success();
++    case op::WaveAllTrue:
++      result = simd_call("air.simd_all", B.getInt1Ty(), {arg(1)});
++      return llvm::Error::success();
++    case op::WaveActiveBallot: {
++      auto bits = simd_call("air.simd_ballot.i64", B.getInt64Ty(), {arg(1)});
++      llvm::Value *s = llvm::UndefValue::get(call->getType());
++      s = B.CreateInsertValue(s, B.CreateTrunc(bits, B.getInt32Ty()), {0});
++      s = B.CreateInsertValue(s, B.CreateTrunc(B.CreateLShr(bits, 32), B.getInt32Ty()), {1});
++      s = B.CreateInsertValue(s, B.getInt32(0), {2});
++      result = B.CreateInsertValue(s, B.getInt32(0), {3});
++      return llvm::Error::success();
++    }
++    case op::WaveReadLaneFirst:
++      result = simd_typed("air.simd_broadcast_first", arg(1), false, {});
++      return result ? llvm::Error::success() : unsupported("wave op type");
++    case op::WaveReadLaneAt:
++      /* simd_shuffle: the lane may differ per thread */
++      result = simd_typed("air.simd_shuffle", arg(1), false, {B.CreateTrunc(arg(2), B.getInt16Ty())});
++      return result ? llvm::Error::success() : unsupported("wave op type");
++    case op::WaveActiveAllEqual: {
++      auto first = simd_typed("air.simd_broadcast_first", arg(1), false, {});
++      if (!first)
++        return unsupported("wave op type");
++      auto eq = arg(1)->getType()->isFloatingPointTy() ? B.CreateFCmpOEQ(arg(1), first) : B.CreateICmpEQ(arg(1), first);
++      result = simd_call("air.simd_all", B.getInt1Ty(), {eq});
++      return llvm::Error::success();
++    }
++    case op::WaveActiveBit: {
++      static const char *names[] = {"air.simd_and", "air.simd_or", "air.simd_xor"};
++      auto kind = cint(2);
++      if (kind > 2)
++        return unsupported("wave bit op " + llvm::Twine(kind));
++      result = simd_typed(names[kind], arg(1), false, {});
++      return result ? llvm::Error::success() : unsupported("wave op type");
++    }
++    case op::WaveAllBitCount:
++    case op::WavePrefixBitCount: {
++      llvm::Value *bits = simd_call("air.simd_ballot.i64", B.getInt64Ty(), {arg(1)});
++      if (opc == op::WavePrefixBitCount) {
++        if (!lane)
++          return unsupported("wave prefix in this shader stage");
++        auto below = B.CreateSub(B.CreateShl(B.getInt64(1), B.CreateZExt(lane, B.getInt64Ty())), B.getInt64(1));
++        bits = B.CreateAnd(bits, below);
++      }
++      auto lo = B.CreateTrunc(bits, B.getInt32Ty());
++      auto hi = B.CreateTrunc(B.CreateLShr(bits, 32), B.getInt32Ty());
++      result = B.CreateAdd(
++          air.CreateIntUnOp(AIRBuilder::popcount, lo), air.CreateIntUnOp(AIRBuilder::popcount, hi)
++      );
++      return llvm::Error::success();
++    }
++    case op::QuadReadLaneAt:
++      result = simd_typed("air.quad_shuffle", arg(1), false, {B.CreateTrunc(arg(2), B.getInt16Ty())});
++      return result ? llvm::Error::success() : unsupported("quad op type");
++    case op::QuadOp: {
++      auto kind = cint(2); /* 0 across x, 1 across y, 2 diagonal */
++      if (kind > 2)
++        return unsupported("quad op " + llvm::Twine(kind));
++      result = simd_typed("air.quad_shuffle_xor", arg(1), false, {B.getInt16(kind + 1)});
++      return result ? llvm::Error::success() : unsupported("quad op type");
++    }
++    case op::WaveActiveOp:
++    case op::WavePrefixOp: {
++      auto kind = cint(2);
++      bool is_signed = cint(3) == 0;
++      static const char *active[] = {"air.simd_sum", "air.simd_product", "air.simd_min", "air.simd_max"};
++      static const char *prefix[] = {"air.simd_prefix_exclusive_sum", "air.simd_prefix_exclusive_product"};
++      if (opc == op::WaveActiveOp ? kind > 3 : kind > 1)
++        return unsupported("wave op kind " + llvm::Twine(kind));
++      result = simd_typed(opc == op::WaveActiveOp ? active[kind] : prefix[kind], arg(1), is_signed, {});
++      return result ? llvm::Error::success() : unsupported("wave op type");
++    }
++
++    default:
++      return unsupported(
++          "operation " + llvm::Twine(opc) + " (" + call->getCalledFunction()->getName() + ") not implemented"
++      );
++    }
++  }
++
++private:
++  llvm::IRBuilder<> &B;
++  AIRBuilder &air;
++  Converter &conv;
++  BindingMap &binding;
++  const ResourceTable &table;
++  const ShaderInfo &info;
++
++  /* Metal has no derivatives in kernels: SM 6.6 compute derivatives come from the
++     2x2 quad (lanes 4k..4k+3, x = lane bit 0, y = lane bit 1) */
++  llvm::Value *
++  derivative(llvm::Value *v, bool y) {
++    if (ctx->shader_type != microsoft::D3D11_SB_COMPUTE_SHADER)
++      return air.CreateDerivative(v, y);
++    if (!lane)
++      return nullptr;
++    auto other = simd_typed("air.quad_shuffle_xor", v, false, {B.getInt16(y ? 2 : 1)});
++    if (!other)
++      return nullptr;
++    auto upper = B.CreateICmpNE(B.CreateAnd(lane, y ? 2 : 1), B.getInt32(0));
++    return B.CreateSelect(upper, B.CreateFSub(v, other), B.CreateFSub(other, v));
++  }
++
++  llvm::Value *
++  simd_call(const char *name, llvm::Type *ret, llvm::ArrayRef<llvm::Value *> args) {
++    auto &C = B.getContext();
++    auto attrs = llvm::AttributeList::get(
++        C, {{~0U, llvm::Attribute::get(C, llvm::Attribute::Convergent)},
++            {~0U, llvm::Attribute::get(C, llvm::Attribute::NoUnwind)},
++            {~0U, llvm::Attribute::get(C, llvm::Attribute::WillReturn)}}
++    );
++    llvm::SmallVector<llvm::Type *> tys;
++    for (auto a : args)
++      tys.push_back(a->getType());
++    auto fn = B.GetInsertBlock()->getModule()->getOrInsertFunction(
++        name, llvm::FunctionType::get(ret, tys, false), attrs
++    );
++    return B.CreateCall(fn, args);
++  }
++
++  llvm::Value *
++  simd_typed(const char *base, llvm::Value *v, bool is_signed, llvm::ArrayRef<llvm::Value *> extra) {
++    auto ty = v->getType();
++    std::string name = base;
++    if (ty->isFloatTy())
++      name += ".f32";
++    else if (ty->isHalfTy())
++      name += ".f16";
++    else if (ty->isIntegerTy(32))
++      name += is_signed ? ".s.i32" : ".u.i32";
++    else if (ty->isIntegerTy(1)) {
++      /* bool: go through uint */
++      auto r = simd_typed(base, B.CreateZExt(v, B.getInt32Ty()), false, extra);
++      return r ? B.CreateICmpNE(r, B.getInt32(0)) : nullptr;
++    } else
++      return nullptr;
++    llvm::SmallVector<llvm::Value *> args{v};
++    args.append(extra.begin(), extra.end());
++    return simd_call(name.c_str(), ty, args);
++  }
++
++  llvm::Expected<HandleInfo>
++  handle(llvm::Value *v) {
++    auto h = resolve_handle(v, table);
++    if (!h)
++      return unsupported("resource handle not resolvable (dynamic handle selection not supported yet)");
++    if (h->heap && h->props0 == 0 && h->cls != Sampler)
++      return unsupported("heap resource handle without annotateHandle");
++    return *h;
++  }
++
++  /* struct { v0, v1, v2, v3, status } from a <4 x i32> */
++  llvm::Value *
++  make_resret(llvm::Type *ret_ty, llvm::Value *vec_i32, unsigned n = 4) {
++    auto st = llvm::cast<llvm::StructType>(ret_ty);
++    llvm::Value *s = llvm::UndefValue::get(st);
++    for (unsigned i = 0; i < n && i < st->getNumElements(); i++) {
++      auto elem_ty = st->getElementType(i);
++      llvm::Value *e = B.CreateExtractElement(vec_i32, (uint64_t)i);
++      if (elem_ty->isFloatTy())
++        e = B.CreateBitCast(e, elem_ty);
++      else if (elem_ty != e->getType())
++        e = B.CreateTrunc(e, elem_ty);
++      s = B.CreateInsertValue(s, e, {i});
++    }
++    if (st->getNumElements() == 5)
++      s = B.CreateInsertValue(s, B.getInt32(1), {4}); /* status: fully mapped */
++    return s;
++  }
++
++  llvm::Value *
++  to_i32(llvm::Value *v) {
++    if (v->getType()->isFloatTy())
++      return B.CreateBitCast(v, B.getInt32Ty());
++    return v;
++  }
++
++  llvm::Error
++  cbuffer_load_legacy(llvm::CallInst *call, llvm::Value *&result) {
++    auto h = handle(call->getArgOperand(1));
++    if (!h)
++      return h.takeError();
++    llvm::Optional<ConstantBufferDescriptor> cb;
++    if (h->heap) {
++      auto entry = heap_entry(*h, false, air.getIntTy(4)->getPointerTo(2));
++      if (!entry)
++        return unsupported("descriptor heap not directly indexed by the root signature");
++      cb = ConstantBufferDescriptor{entry->first, entry->second};
++    } else {
++      cb = binding.GetConstantBuffer(air, h->range_id, h->index);
++    }
++    if (!cb)
++      return unsupported("constant buffer not bound by the root signature");
++    auto st = llvm::cast<llvm::StructType>(call->getType());
++    auto vec_ty = air.getIntTy(4);
++    auto ptr = B.CreatePointerCast(cb->Pointer, vec_ty->getPointerTo(2));
++    auto v = B.CreateLoad(vec_ty, B.CreateGEP(vec_ty, ptr, {call->getArgOperand(2)}));
++    if (st->getNumElements() == 2 && st->getElementType(0)->isIntegerTy(64)) {
++      /* CBufRet.i64: two 64-bit values from xy and zw */
++      llvm::Value *r = llvm::UndefValue::get(st);
++      for (unsigned i = 0; i < 2; i++)
++        r = B.CreateInsertValue(r, combine64(B.CreateExtractElement(v, (uint64_t)(2 * i)),
++                                             B.CreateExtractElement(v, (uint64_t)(2 * i + 1))), {i});
++      result = r;
++      return llvm::Error::success();
++    }
++    if (st->getNumElements() != 4 || st->getElementType(0)->getPrimitiveSizeInBits() != 32)
++      return unsupported("16-bit/double cbuffer loads not implemented");
++    result = make_resret(st, v);
++    return llvm::Error::success();
++  }
++
++  llvm::Value *
++  combine64(llvm::Value *lo, llvm::Value *hi) {
++    return B.CreateOr(B.CreateZExt(lo, B.getInt64Ty()), B.CreateShl(B.CreateZExt(hi, B.getInt64Ty()), 32));
++  }
++
++  /* descriptor heap entry {handle, metadata, ...} (32 bytes) of a heap handle */
++  llvm::Optional<std::pair<llvm::Value *, llvm::Value *>>
++  heap_entry(const HandleInfo &h, bool sampler_heap, llvm::Type *handle_ty) {
++    auto base = binding.GetDescriptorHeap(air, sampler_heap);
++    if (!base)
++      return {};
++    auto i64 = B.getInt64Ty();
++    auto entry_ty = llvm::StructType::get(B.getContext(), {handle_ty, i64, i64, i64});
++    auto ptr = B.CreatePointerCast(base, entry_ty->getPointerTo(2));
++    auto handle = B.CreateLoad(handle_ty, B.CreateGEP(entry_ty, ptr, {h.index, B.getInt32(0)}));
++    auto meta = B.CreateLoad(i64, B.CreateGEP(entry_ty, ptr, {h.index, B.getInt32(1)}));
++    return std::make_pair((llvm::Value *)handle, (llvm::Value *)meta);
++  }
++
++  /* DXIL resource kind of a handle */
++  uint32_t
++  resource_kind(const HandleInfo &h) {
++    if (h.heap)
++      return h.props0 & 0xff;
++    auto from = [](ResourceType t, uint32_t stride) -> uint32_t {
++      switch (t) {
++      case ResourceType::TextureBuffer:
++        return RK_TypedBuffer;
++      case ResourceType::NonApplicable:
++        return stride ? RK_StructuredBuffer : RK_RawBuffer;
++      default:
++        return RK_Texture2D; /* some texture */
++      }
++    };
++    if (h.cls == SRV && info.srvMap.count(h.range_id)) {
++      auto &r = info.srvMap.at(h.range_id);
++      return from(r.resource_type, r.structure_stride);
++    }
++    if (h.cls == UAV && info.uavMap.count(h.range_id)) {
++      auto &r = info.uavMap.at(h.range_id);
++      return from(r.resource_type, r.structure_stride);
++    }
++    return RK_Invalid;
++  }
++
++  bool
++  is_texture(const HandleInfo &h) {
++    auto k = resource_kind(h);
++    return k != RK_RawBuffer && k != RK_StructuredBuffer && k != RK_Invalid && k != RK_CBuffer && k != RK_Sampler;
++  }
++
++  llvm::Optional<SamplerDescriptor>
++  sampler_of(const HandleInfo &s) {
++    if (!s.heap)
++      return binding.GetSampler(air, s.range_id, s.index);
++    auto base = binding.GetDescriptorHeap(air, true);
++    if (!base)
++      return {};
++    auto smp_ty = air.getSamplerHandleType();
++    auto i64 = B.getInt64Ty();
++    auto entry_ty = llvm::StructType::get(B.getContext(), {smp_ty, smp_ty, i64, i64});
++    auto ptr = B.CreatePointerCast(base, entry_ty->getPointerTo(2));
++    auto load = [&](unsigned f, llvm::Type *ty) {
++      return (llvm::Value *)B.CreateLoad(ty, B.CreateGEP(entry_ty, ptr, {s.index, B.getInt32(f)}));
++    };
++    return SamplerDescriptor{load(0, smp_ty), load(1, smp_ty), load(2, i64)};
++  }
++
++  llvm::Expected<BufferResourceHandle>
++  buffer(const HandleInfo &h) {
++    if (h.heap) {
++      auto entry = heap_entry(h, false, B.getInt32Ty()->getPointerTo(1));
++      if (!entry)
++        return unsupported("descriptor heap not directly indexed by the root signature");
++      uint32_t stride = (h.props0 & 0xff) == RK_StructuredBuffer ? h.props1 : 0;
++      bool coherent = (h.props0 >> 14) & 1;
++      return BufferResourceHandle{entry->first, entry->second, stride, swizzle_identity, coherent};
++    }
++    llvm::Optional<BufferDescriptor> d;
++    if (h.cls == SRV)
++      d = binding.GetSRVBuffer(air, h.range_id, h.index);
++    else if (h.cls == UAV)
++      d = binding.GetUAVBuffer(air, h.range_id, h.index);
++    if (!d)
++      return unsupported("buffer not bound by the root signature");
++    return BufferResourceHandle{d->Pointer, d->Metadata, d->StructureStride, swizzle_identity, d->GlobalCoherent};
++  }
++
++  llvm::Expected<TextureResourceHandle>
++  texture(const HandleInfo &h, bool compared = false) {
++    if (h.heap) {
++      uint32_t kind = h.props0 & 0xff;
++      bool is_uav = (h.props0 >> 12) & 1;
++      auto type = resource_type(kind);
++      if (!type)
++        return type.takeError();
++      auto logical = air::to_air_resource_type(*type, compared);
++      auto lowered = air::lowering_texture_1d_to_2d(logical);
++      Texture t;
++      t.kind = lowered;
++      t.memory_access = is_uav ? Texture::MemoryAccess::acesss_readwrite : Texture::MemoryAccess::access_sample;
++      switch (h.props1 & 0xff) {
++      case CT_I32:
++      case CT_I16:
++        t.sample_type = Texture::sample_int;
++        break;
++      case CT_U32:
++      case CT_U16:
++        t.sample_type = Texture::sample_uint;
++        break;
++      default:
++        t.sample_type = Texture::sample_float;
++        break;
++      }
++      auto entry = heap_entry(h, false, air.getTextureHandleType(lowered));
++      if (!entry)
++        return unsupported("descriptor heap not directly indexed by the root signature");
++      return TextureResourceHandle{t, logical, entry->first, entry->second, swizzle_identity, false};
++    }
++    llvm::Optional<TextureDescirptor> d;
++    if (h.cls == SRV)
++      d = binding.GetSRVTexture(air, h.range_id, h.index);
++    else if (h.cls == UAV)
++      d = binding.GetUAVTexture(air, h.range_id, h.index);
++    if (!d)
++      return unsupported("texture not bound by the root signature");
++    Texture t;
++    t.kind = d->ResourceKind;
++    t.memory_access = d->MemoryAccess;
++    t.sample_type = d->SampleType;
++    return TextureResourceHandle{t, d->ResourceKindLogical, d->ResourceHandle, d->Metadata, swizzle_identity,
++                                 d->GlobalCoherent};
++  }
++
++  bool
++  is_typed_buffer(const HandleInfo &h) {
++    if (h.heap)
++      return (h.props0 & 0xff) == RK_TypedBuffer;
++    if (h.cls == SRV) {
++      auto it = info.srvMap.find(h.range_id);
++      return it != info.srvMap.end() && it->second.resource_type == ResourceType::TextureBuffer;
++    }
++    if (h.cls == UAV) {
++      auto it = info.uavMap.find(h.range_id);
++      return it != info.uavMap.end() && it->second.resource_type == ResourceType::TextureBuffer;
++    }
++    return false;
++  }
++
++  /* dword index of a raw / structured access */
++  llvm::Value *
++  dword_index(const BufferResourceHandle &buf, llvm::Value *index, llvm::Value *offset) {
++    if (buf.StructureStride) {
++      auto off = llvm::isa<llvm::UndefValue>(offset) ? (llvm::Value *)B.getInt32(0) : offset;
++      return B.CreateAdd(B.CreateMul(index, B.getInt32(buf.StructureStride >> 2)), B.CreateLShr(off, 2));
++    }
++    return B.CreateLShr(index, 2);
++  }
++
++  llvm::Error
++  buffer_load(llvm::CallInst *call, llvm::Value *&result) {
++    auto h = handle(call->getArgOperand(1));
++    if (!h)
++      return h.takeError();
++    auto st = llvm::cast<llvm::StructType>(call->getType());
++    bool is64 = st->getElementType(0)->isIntegerTy(64);
++    if (!is64 && st->getElementType(0)->getPrimitiveSizeInBits() != 32)
++      return unsupported("16-bit/double buffer loads not implemented");
++    if (is64 && is_typed_buffer(*h))
++      return unsupported("64-bit typed buffer loads not implemented");
++    if (is_typed_buffer(*h)) {
++      auto tex = texture(*h);
++      if (!tex)
++        return tex.takeError();
++      auto addr = B.CreateAdd(call->getArgOperand(2), conv.DecodeTextureBufferOffset(tex->Metadata));
++      auto [v, _] = air.CreateRead(tex->Texture, tex->Handle, addr, nullptr, nullptr, B.getInt32(0), tex->GlobalCoherent);
++      if (v->getType() != air.getIntTy(4))
++        v = B.CreateBitCast(v, air.getIntTy(4));
++      result = make_resret(st, v);
++      return llvm::Error::success();
++    }
++    auto buf = buffer(*h);
++    if (!buf)
++      return buf.takeError();
++    auto base = dword_index(*buf, call->getArgOperand(2), call->getArgOperand(3));
++    llvm::Value *v = llvm::UndefValue::get(air.getIntTy(4));
++    unsigned mask = call->getFunction() && call->arg_size() > 4 && llvm::isa<llvm::ConstantInt>(call->getArgOperand(4))
++                        ? (unsigned)llvm::cast<llvm::ConstantInt>(call->getArgOperand(4))->getZExtValue()
++                        : 0xf;
++    if (dx_opcode(call) == op::BufferLoad)
++      mask = 0xf;
++    if (is64) {
++      llvm::Value *r = llvm::UndefValue::get(st);
++      for (unsigned i = 0; i < 4; i++) {
++        if (!(mask & (1u << i)))
++          continue;
++        llvm::Value *dw[2];
++        for (unsigned k = 0; k < 2; k++) {
++          auto ptr = conv.CreateGEPInt32WithBoundCheck(*buf, B.CreateAdd(base, B.getInt32(2 * i + k)));
++          dw[k] = buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(B.getInt32Ty(), ptr)
++                                      : (llvm::Value *)B.CreateLoad(B.getInt32Ty(), ptr);
++        }
++        r = B.CreateInsertValue(r, combine64(dw[0], dw[1]), {i});
++      }
++      result = B.CreateInsertValue(r, B.getInt32(1), {4});
++      return llvm::Error::success();
++    }
++    for (unsigned i = 0; i < 4; i++) {
++      if (!(mask & (1u << i)))
++        continue;
++      auto ptr = conv.CreateGEPInt32WithBoundCheck(*buf, B.CreateAdd(base, B.getInt32(i)));
++      auto e = buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(B.getInt32Ty(), ptr)
++                                   : (llvm::Value *)B.CreateLoad(B.getInt32Ty(), ptr);
++      v = B.CreateInsertElement(v, e, (uint64_t)i);
++    }
++    result = make_resret(st, v);
++    return llvm::Error::success();
++  }
++
++  llvm::Error
++  buffer_store(llvm::CallInst *call) {
++    auto h = handle(call->getArgOperand(1));
++    if (!h)
++      return h.takeError();
++    auto mask = (unsigned)llvm::cast<llvm::ConstantInt>(call->getArgOperand(8))->getZExtValue();
++    bool is64 = call->getArgOperand(4)->getType()->isIntegerTy(64);
++    if (!is64 && call->getArgOperand(4)->getType()->getPrimitiveSizeInBits() != 32)
++      return unsupported("16-bit/double buffer stores not implemented");
++    if (is64) {
++      if (is_typed_buffer(*h))
++        return unsupported("64-bit typed buffer stores not implemented");
++      auto buf = buffer(*h);
++      if (!buf)
++        return buf.takeError();
++      auto base = dword_index(*buf, call->getArgOperand(2), call->getArgOperand(3));
++      for (unsigned i = 0; i < 4; i++) {
++        if (!(mask & (1u << i)))
++          continue;
++        auto v = call->getArgOperand(4 + i);
++        llvm::Value *dw[2] = {B.CreateTrunc(v, B.getInt32Ty()), B.CreateTrunc(B.CreateLShr(v, 32), B.getInt32Ty())};
++        for (unsigned k = 0; k < 2; k++) {
++          auto ptr = conv.CreateGEPInt32WithBoundCheck(*buf, B.CreateAdd(base, B.getInt32(2 * i + k)));
++          if (buf->GlobalCoherent)
++            air.CreateDeviceCoherentStore(dw[k], ptr);
++          else
++            B.CreateStore(dw[k], ptr);
++        }
++      }
++      return llvm::Error::success();
++    }
++    if (is_typed_buffer(*h)) {
++      auto tex = texture(*h);
++      if (!tex)
++        return tex.takeError();
++      auto addr = B.CreateAdd(call->getArgOperand(2), conv.DecodeTextureBufferOffset(tex->Metadata));
++      llvm::Value *v = llvm::UndefValue::get(air.getTexelType(tex->Texture));
++      for (unsigned i = 0; i < 4; i++) {
++        llvm::Value *e = call->getArgOperand(4 + i);
++        if (llvm::isa<llvm::UndefValue>(e))
++          e = llvm::Constant::getNullValue(e->getType());
++        v = B.CreateInsertElement(v, e, (uint64_t)i);
++      }
++      air.CreateWrite(tex->Texture, tex->Handle, addr, nullptr, nullptr, B.getInt32(0), v, tex->GlobalCoherent);
++      return llvm::Error::success();
++    }
++    auto buf = buffer(*h);
++    if (!buf)
++      return buf.takeError();
++    auto base = dword_index(*buf, call->getArgOperand(2), call->getArgOperand(3));
++    for (unsigned i = 0; i < 4; i++) {
++      if (!(mask & (1u << i)))
++        continue;
++      auto ptr = conv.CreateGEPInt32WithBoundCheck(*buf, B.CreateAdd(base, B.getInt32(i)));
++      auto val = to_i32(call->getArgOperand(4 + i));
++      if (buf->GlobalCoherent)
++        air.CreateDeviceCoherentStore(val, ptr);
++      else
++        B.CreateStore(val, ptr);
++    }
++    return llvm::Error::success();
++  }
++
++  /* coordinates for a texture access; Count = how many of c0..c2 the kind uses */
++  std::pair<llvm::Value *, llvm::Value *>
++  coords(
++      const TextureResourceHandle &tex, llvm::Value *c0, llvm::Value *c1, llvm::Value *c2, bool is_float,
++      llvm::Value *c3 = nullptr
++  ) {
++    auto elem = is_float ? B.getFloatTy() : B.getInt32Ty();
++    auto vec = [&](llvm::ArrayRef<llvm::Value *> cs) -> llvm::Value * {
++      if (cs.size() == 1)
++        return cs[0];
++      llvm::Value *v = llvm::UndefValue::get(llvm::FixedVectorType::get(elem, cs.size()));
++      for (unsigned i = 0; i < cs.size(); i++)
++        v = B.CreateInsertElement(v, cs[i], (uint64_t)i);
++      return v;
++    };
++    auto zero = is_float ? (llvm::Value *)llvm::ConstantFP::get(elem, 0.0) : (llvm::Value *)B.getInt32(0);
++    llvm::Value *array = nullptr;
++    auto to_index = [&](llvm::Value *c) -> llvm::Value * {
++      if (!is_float)
++        return c;
++      return conv.ClampArrayIndex(c, tex.Metadata);
++    };
++    switch (tex.Logical) {
++    case Texture::texture1d:
++      return {vec({c0, zero}), nullptr};
++    case Texture::texture1d_array:
++      array = to_index(c1);
++      return {vec({c0, zero}), array};
++    case Texture::texture2d:
++    case Texture::texture2d_ms:
++    case Texture::depth2d:
++      return {vec({c0, c1}), nullptr};
++    case Texture::texture2d_array:
++    case Texture::texture2d_ms_array:
++    case Texture::depth2d_array:
++      return {vec({c0, c1}), to_index(c2)};
++    case Texture::texture3d:
++    case Texture::texturecube:
++    case Texture::depthcube:
++      return {vec({c0, c1, c2}), nullptr};
++    case Texture::texturecube_array:
++    case Texture::depthcube_array:
++      if (!c3)
++        return {nullptr, nullptr};
++      return {vec({c0, c1, c2}), to_index(c3)};
++    default:
++      return {nullptr, nullptr};
++    }
++  }
++
++  /* loadInput(sig id, row, col, vertex): the signature handlers keep inputs in a vec4 register file */
++  llvm::Error
++  load_input(llvm::CallInst *call, llvm::Value *&result) {
++    auto id = (uint32_t)llvm::cast<llvm::ConstantInt>(call->getArgOperand(1))->getZExtValue();
++    const SigElement *e = nullptr;
++    for (auto &x : *inputs)
++      if (x.id == id)
++        e = &x;
++    if (!e)
++      return unsupported("loadInput: unknown signature element");
++    auto ty = call->getType();
++    llvm::Value *v;
++    if (e->start_row < 0) {
++      if (e->kind == sk::Coverage && ctx->resource.coverage_mask_arg)
++        v = ctx->resource.coverage_mask_arg;
++      else
++        return unsupported("loadInput of semantic kind " + llvm::Twine(e->kind));
++    } else {
++      auto reg = B.CreateAdd(B.getInt32(e->start_row), call->getArgOperand(2));
++      auto col = B.CreateAdd(B.getInt32(e->start_col), B.CreateZExt(call->getArgOperand(3), B.getInt32Ty()));
++      auto file_ty = ctx->resource.input.ptr_int4->getType()->getNonOpaquePointerElementType();
++      auto ptr = B.CreateGEP(file_ty, ctx->resource.input.ptr_int4, {B.getInt32(0), reg, col});
++      v = B.CreateLoad(B.getInt32Ty(), ptr);
++    }
++    if (ty->isFloatTy())
++      v = B.CreateBitCast(v, ty);
++    else if (ty->isIntegerTy(1))
++      v = B.CreateICmpNE(v, B.getInt32(0));
++    else if (ty->isHalfTy())
++      v = B.CreateFPTrunc(B.CreateBitCast(v, B.getFloatTy()), ty);
++    else if (ty->isIntegerTy(16))
++      v = B.CreateTrunc(v, ty);
++    else if (!ty->isIntegerTy(32))
++      return unsupported("loadInput type");
++    result = v;
++    return llvm::Error::success();
++  }
++
++  llvm::Error
++  store_output(llvm::CallInst *call) {
++    auto id = (uint32_t)llvm::cast<llvm::ConstantInt>(call->getArgOperand(1))->getZExtValue();
++    const SigElement *e = nullptr;
++    for (auto &x : *outputs)
++      if (x.id == id)
++        e = &x;
++    if (!e)
++      return unsupported("storeOutput: unknown signature element");
++    llvm::Value *v = call->getArgOperand(4);
++    auto ty = v->getType();
++    if (ty->isHalfTy())
++      v = B.CreateFPExt(v, B.getFloatTy());
++    else if (ty->isIntegerTy(1) || ty->isIntegerTy(16))
++      v = B.CreateZExt(v, B.getInt32Ty());
++    if (e->start_row < 0) {
++      llvm::Value *slot = nullptr;
++      switch (e->kind) {
++      case sk::Depth:
++      case sk::DepthLessEqual:
++      case sk::DepthGreaterEqual:
++        slot = ctx->resource.depth_output_reg;
++        break;
++      case sk::Coverage:
++        slot = ctx->resource.coverage_mask_reg;
++        break;
++      case sk::StencilRef:
++        slot = ctx->resource.stencil_ref_reg;
++        break;
++      }
++      if (!slot)
++        return unsupported("storeOutput of semantic kind " + llvm::Twine(e->kind));
++      auto slot_ty = slot->getType()->getNonOpaquePointerElementType();
++      if (v->getType() != slot_ty)
++        v = B.CreateBitCast(v, slot_ty);
++      B.CreateStore(v, slot);
++      return llvm::Error::success();
++    }
++    if (v->getType()->isFloatTy())
++      v = B.CreateBitCast(v, B.getInt32Ty());
++    auto reg = B.CreateAdd(B.getInt32(e->start_row), call->getArgOperand(2));
++    auto col = B.CreateAdd(B.getInt32(e->start_col), B.CreateZExt(call->getArgOperand(3), B.getInt32Ty()));
++    auto file_ty = ctx->resource.output.ptr_int4->getType()->getNonOpaquePointerElementType();
++    B.CreateStore(v, B.CreateGEP(file_ty, ctx->resource.output.ptr_int4, {B.getInt32(0), reg, col}));
++    return llvm::Error::success();
++  }
++
++  llvm::Error
++  sample(llvm::CallInst *call, uint32_t opc, llvm::Value *&result) {
++    auto h = handle(call->getArgOperand(1));
++    auto s = handle(call->getArgOperand(2));
++    if (!h)
++      return h.takeError();
++    if (!s)
++      return s.takeError();
++    auto tex = texture(*h, opc == op::SampleCmp || opc == op::SampleCmpLevelZero || opc == 224);
++    if (!tex)
++      return tex.takeError();
++    auto sampler = sampler_of(*s);
++    if (!sampler)
++      return unsupported("sampler not bound by the root signature");
++    bool cube = tex->Logical == Texture::texturecube || tex->Logical == Texture::texturecube_array ||
++                tex->Logical == Texture::depthcube || tex->Logical == Texture::depthcube_array;
++    auto smp = cube ? sampler->CubeSamplerHandle : sampler->SamplerHandle;
++    auto [coord, array] = coords(
++        *tex, call->getArgOperand(3), call->getArgOperand(4), call->getArgOperand(5), true, call->getArgOperand(6)
++    );
++    if (!coord)
++      return unsupported("sample on this texture kind");
++    int32_t offset[3] = {0, 0, 0};
++    for (unsigned i = 0; i < 3; i++)
++      if (auto c = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(7 + i)))
++        offset[i] = (int32_t)c->getSExtValue();
++    auto fval = [&](unsigned i) -> llvm::Value * {
++      auto v = call->getArgOperand(i);
++      return llvm::isa<llvm::UndefValue>(v) ? (llvm::Value *)air.getFloat(0) : v;
++    };
++    std::pair<llvm::Value *, llvm::Value *> r;
++    bool kernel = ctx->shader_type == microsoft::D3D11_SB_COMPUTE_SHADER;
++    if (kernel && (opc == op::Sample || opc == op::SampleBias)) {
++      /* implicit LOD in a kernel: gradients from the quad */
++      unsigned n = coord->getType()->isVectorTy() ? llvm::cast<llvm::FixedVectorType>(coord->getType())->getNumElements() : 1;
++      llvm::Value *gx = llvm::UndefValue::get(coord->getType()), *gy = llvm::UndefValue::get(coord->getType());
++      for (unsigned i = 0; i < n; i++) {
++        auto c = n == 1 ? coord : B.CreateExtractElement(coord, (uint64_t)i);
++        auto dx = derivative(c, false), dy = derivative(c, true);
++        if (!dx || !dy)
++          return unsupported("compute sample gradients");
++        gx = n == 1 ? dx : B.CreateInsertElement(gx, dx, (uint64_t)i);
++        gy = n == 1 ? dy : B.CreateInsertElement(gy, dy, (uint64_t)i);
++      }
++      r = air.CreateSampleGrad(tex->Texture, tex->Handle, smp, coord, array, gx, gy, fval(opc == op::Sample ? 10 : 11), offset);
++      opc = ~0u;
++    } else if (kernel && opc == op::SampleCmp) {
++      opc = op::SampleCmpLevelZero;
++    }
++    switch (opc) {
++    case ~0u:
++      break;
++    case op::Sample:
++      r = air.CreateSample(tex->Texture, tex->Handle, smp, coord, array, offset, llvm::air::sample_min_lod_clamp{fval(10)});
++      break;
++    case op::SampleBias:
++      r = air.CreateSample(
++          tex->Texture, tex->Handle, smp, coord, array, offset, llvm::air::sample_bias{fval(10)},
++          llvm::air::sample_min_lod_clamp{fval(11)}
++      );
++      break;
++    case op::SampleGrad: {
++      unsigned n = llvm::cast<llvm::FixedVectorType>(coord->getType())->getNumElements();
++      auto grad = [&](unsigned base) {
++        llvm::Value *v = llvm::UndefValue::get(air.getFloatTy(n));
++        for (unsigned i = 0; i < n; i++)
++          v = B.CreateInsertElement(v, fval(base + i), (uint64_t)i);
++        return v;
++      };
++      r = air.CreateSampleGrad(tex->Texture, tex->Handle, smp, coord, array, grad(10), grad(13), fval(16), offset);
++      break;
++    }
++    case op::SampleCmp:
++      r = air.CreateSampleCmp(
++          tex->Texture, tex->Handle, smp, coord, array, call->getArgOperand(10), offset,
++          llvm::air::sample_bias{air.getFloat(0)}, llvm::air::sample_min_lod_clamp{fval(11)}
++      );
++      break;
++    case 224:
++      r = air.CreateSampleCmp(
++          tex->Texture, tex->Handle, smp, coord, array, call->getArgOperand(10), offset,
++          llvm::air::sample_level{fval(11)}
++      );
++      break;
++    case op::SampleCmpLevelZero:
++      r = air.CreateSampleCmp(
++          tex->Texture, tex->Handle, smp, coord, array, call->getArgOperand(10), offset,
++          llvm::air::sample_level{air.getFloat(0)}
++      );
++      break;
++    }
++    llvm::Value *v = r.first;
++    if (v->getType()->isFloatTy()) {
++      /* comparison: one float */
++      llvm::Value *vec = llvm::UndefValue::get(air.getFloatTy(4));
++      for (unsigned i = 0; i < 4; i++)
++        vec = B.CreateInsertElement(vec, v, (uint64_t)i);
++      v = vec;
++    }
++    if (v->getType() != air.getIntTy(4))
++      v = B.CreateBitCast(v, air.getIntTy(4));
++    result = make_resret(call->getType(), v);
++    return llvm::Error::success();
++  }
++
++  /* address of a texture or typed buffer element for atomics */
++  std::pair<llvm::Value *, llvm::Value *>
++  atomic_texture_address(const TextureResourceHandle &tex, llvm::CallInst *call, unsigned first) {
++    if (tex.Logical == Texture::texture_buffer)
++      return {B.CreateAdd(call->getArgOperand(first), conv.DecodeTextureBufferOffset(tex.Metadata)), nullptr};
++    return coords(tex, call->getArgOperand(first), call->getArgOperand(first + 1), call->getArgOperand(first + 2), false);
++  }
++
++  llvm::Value *
++  splat4(llvm::Value *v) {
++    llvm::Value *vec = llvm::UndefValue::get(llvm::FixedVectorType::get(v->getType(), 4));
++    for (unsigned i = 0; i < 4; i++)
++      vec = B.CreateInsertElement(vec, v, (uint64_t)i);
++    return vec;
++  }
++
++  llvm::Error
++  texture_atomic(llvm::CallInst *call, llvm::Value *&result) {
++    auto h = handle(call->getArgOperand(1));
++    if (!h)
++      return h.takeError();
++    auto tex = texture(*h);
++    if (!tex)
++      return tex.takeError();
++    if (call->getType()->isIntegerTy(64))
++      return atomic64(call, *tex, result);
++    if (!call->getType()->isIntegerTy(32))
++      return unsupported("texture atomic type");
++    static const llvm::AtomicRMWInst::BinOp ops[] = {
++        llvm::AtomicRMWInst::Add, llvm::AtomicRMWInst::And,  llvm::AtomicRMWInst::Or,
++        llvm::AtomicRMWInst::Xor, llvm::AtomicRMWInst::Min,  llvm::AtomicRMWInst::Max,
++        llvm::AtomicRMWInst::UMin, llvm::AtomicRMWInst::UMax, llvm::AtomicRMWInst::Xchg,
++    };
++    auto kind = (uint32_t)llvm::cast<llvm::ConstantInt>(call->getArgOperand(2))->getZExtValue();
++    if (kind > 8)
++      return unsupported("atomic op " + llvm::Twine(kind));
++    auto [pos, array] = atomic_texture_address(*tex, call, 3);
++    if (!pos)
++      return unsupported("texture atomic on this texture kind");
++    auto v = air.CreateAtomicRMW(tex->Texture, tex->Handle, ops[kind], pos, splat4(call->getArgOperand(6)), array);
++    if (!v)
++      return unsupported("texture atomic lowering failed");
++    result = v->getType()->isVectorTy() ? B.CreateExtractElement(v, (uint64_t)0) : v;
++    return llvm::Error::success();
++  }
++
++  /* Metal has 64-bit atomics for unsigned min/max only, and they return nothing
++     (Nanite's InterlockedMax on R32G32_UINT, Apple8+ for textures) */
++  llvm::Optional<const char *>
++  atomic64_op(llvm::CallInst *call) {
++    auto kind = (uint32_t)llvm::cast<llvm::ConstantInt>(call->getArgOperand(2))->getZExtValue();
++    if (!call->use_empty())
++      return {};
++    if (kind == 6)
++      return "min";
++    if (kind == 7)
++      return "max";
++    return {};
++  }
++
++  llvm::Value *
++  call_void(const std::string &name, llvm::ArrayRef<llvm::Value *> args) {
++    auto &C = B.getContext();
++    auto attrs = llvm::AttributeList::get(
++        C, {{~0U, llvm::Attribute::get(C, llvm::Attribute::NoUnwind)},
++            {~0U, llvm::Attribute::get(C, llvm::Attribute::WillReturn)}}
++    );
++    llvm::SmallVector<llvm::Type *> tys;
++    for (auto a : args)
++      tys.push_back(a->getType());
++    auto fn = B.GetInsertBlock()->getModule()->getOrInsertFunction(
++        name, llvm::FunctionType::get(B.getVoidTy(), tys, false), attrs
++    );
++    return B.CreateCall(fn, args);
++  }
++
++  /* The calls below are what the Metal compiler emits for texture2d<ulong>::atomic_max
++     and atomic_max_explicit(device atomic_ulong *). The Metal backend only takes them
++     in AIR 2.9 modules (macOS 27); with DXMT's AIR 2.6/2.7 it crashes
++     (XPC_ERROR_CONNECTION_INTERRUPTED). EmitBody bumps the module version for them. */
++  static constexpr bool kAtomic64Works = true;
++
++  llvm::Error
++  atomic64(llvm::CallInst *call, const TextureResourceHandle &tex, llvm::Value *&result) {
++    if (!kAtomic64Works)
++      return unsupported("64-bit texture atomics not implemented yet");
++    auto opname = atomic64_op(call);
++    if (!opname)
++      return unsupported("64-bit texture atomics: only InterlockedMin/Max on uint64 without result");
++    if (tex.Logical != Texture::texture2d)
++      return unsupported("64-bit texture atomics on this texture kind");
++    llvm::Value *pos = llvm::UndefValue::get(air.getIntTy(2));
++    pos = B.CreateInsertElement(pos, call->getArgOperand(3), (uint64_t)0);
++    pos = B.CreateInsertElement(pos, call->getArgOperand(4), (uint64_t)1);
++    llvm::Value *val = llvm::UndefValue::get(llvm::FixedVectorType::get(B.getInt64Ty(), 4));
++    for (unsigned i = 0; i < 4; i++)
++      val = B.CreateInsertElement(val, call->getArgOperand(6), (uint64_t)i);
++    needs_air_2_9 = true;
++    call_void(
++        std::string("air.atomic_") + *opname + "_explicit_texture_2d.u.v4i64",
++        {tex.Handle, pos, llvm::ConstantAggregateZero::get(air.getIntTy(2)), val, B.getInt32(0), B.getInt32(3)}
++    );
++    result = llvm::UndefValue::get(call->getType());
++    return llvm::Error::success();
++  }
++
++  llvm::Error
++  atomic64_buffer(llvm::CallInst *call, const BufferResourceHandle &buf, llvm::Value *&result) {
++    if (!kAtomic64Works)
++      return unsupported("64-bit buffer atomics not implemented yet");
++    auto opname = atomic64_op(call);
++    if (!opname)
++      return unsupported("64-bit buffer atomics: only InterlockedMin/Max on uint64 without result");
++    auto idx = dword_index(buf, call->getArgOperand(3), call->getArgOperand(4));
++    auto ptr32 = B.CreateGEP(B.getInt32Ty(), buf.Pointer, {idx});
++    auto ptr = B.CreateBitCast(ptr32, B.getInt64Ty()->getPointerTo(1));
++    needs_air_2_9 = true;
++    call_void(
++        std::string("air.atomic.global.") + *opname + ".u.i64",
++        {ptr, call->getArgOperand(6), B.getInt32(0), B.getInt32(2), B.getInt32(0), B.getInt1(true)}
++    );
++    result = llvm::UndefValue::get(call->getType());
++    return llvm::Error::success();
++  }
++
++  /* atomicCompareExchange(handle, o0, o1, o2, compare, value) */
++  llvm::Error
++  atomic_cmpxchg(llvm::CallInst *call, llvm::Value *&result) {
++    auto h = handle(call->getArgOperand(1));
++    if (!h)
++      return h.takeError();
++    if (!call->getType()->isIntegerTy(32))
++      return unsupported("64-bit compare exchange not implemented");
++    if (is_texture(*h)) {
++      auto tex = texture(*h);
++      if (!tex)
++        return tex.takeError();
++      auto [pos, array] = atomic_texture_address(*tex, call, 2);
++      if (!pos)
++        return unsupported("texture compare exchange on this texture kind");
++      auto [v, _] = air.CreateAtomicCmpXchg(
++          tex->Texture, tex->Handle, pos, splat4(call->getArgOperand(5)), splat4(call->getArgOperand(6)), array
++      );
++      result = v->getType()->isVectorTy() ? B.CreateExtractElement(v, (uint64_t)0) : v;
++      return llvm::Error::success();
++    }
++    auto buf = buffer(*h);
++    if (!buf)
++      return buf.takeError();
++    auto idx = dword_index(*buf, call->getArgOperand(2), call->getArgOperand(3));
++    auto ptr = B.CreateGEP(B.getInt32Ty(), buf->Pointer, {idx});
++    auto r = B.CreateAtomicCmpXchg(
++        ptr, call->getArgOperand(5), call->getArgOperand(6), {}, llvm::AtomicOrdering::Monotonic,
++        llvm::AtomicOrdering::Monotonic
++    );
++    result = B.CreateExtractValue(r, 0);
++    return llvm::Error::success();
++  }
++
++  /* textureGather(srv, sampler, c0..c3, o0, o1, channel[, compare]) */
++  llvm::Error
++  gather(llvm::CallInst *call, uint32_t opc, llvm::Value *&result) {
++    auto h = handle(call->getArgOperand(1));
++    auto s = handle(call->getArgOperand(2));
++    if (!h)
++      return h.takeError();
++    if (!s)
++      return s.takeError();
++    auto tex = texture(*h, opc == op::TextureGatherCmp);
++    if (!tex)
++      return tex.takeError();
++    auto sampler = sampler_of(*s);
++    if (!sampler)
++      return unsupported("sampler not bound by the root signature");
++    bool cube = tex->Logical == Texture::texturecube || tex->Logical == Texture::texturecube_array ||
++                tex->Logical == Texture::depthcube || tex->Logical == Texture::depthcube_array;
++    auto smp = cube ? sampler->CubeSamplerHandle : sampler->SamplerHandle;
++    auto [coord, array] = coords(
++        *tex, call->getArgOperand(3), call->getArgOperand(4), call->getArgOperand(5), true, call->getArgOperand(6)
++    );
++    if (!coord)
++      return unsupported("gather on this texture kind");
++    int32_t offset[3] = {0, 0, 0};
++    for (unsigned i = 0; i < 2; i++)
++      if (auto c = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(7 + i)))
++        offset[i] = (int32_t)c->getSExtValue();
++    std::pair<llvm::Value *, llvm::Value *> r;
++    if (opc == op::TextureGather)
++      r = air.CreateGather(tex->Texture, tex->Handle, smp, coord, array, offset, call->getArgOperand(9));
++    else
++      r = air.CreateGatherCompare(tex->Texture, tex->Handle, smp, coord, array, call->getArgOperand(10), offset);
++    llvm::Value *v = r.first;
++    if (v->getType() != air.getIntTy(4))
++      v = B.CreateBitCast(v, air.getIntTy(4));
++    result = make_resret(call->getType(), v);
++    return llvm::Error::success();
++  }
++
++  llvm::Error
++  texture_load(llvm::CallInst *call, llvm::Value *&result) {
++    auto h = handle(call->getArgOperand(1));
++    if (!h)
++      return h.takeError();
++    auto tex = texture(*h);
++    if (!tex)
++      return tex.takeError();
++    /* textureLoad(handle, mip/sample, c0, c1, c2, o0, o1, o2): immediate offsets add to the coordinates */
++    llvm::Value *c[3];
++    for (unsigned i = 0; i < 3; i++) {
++      c[i] = call->getArgOperand(3 + i);
++      auto off = call->getArgOperand(6 + i);
++      if (!llvm::isa<llvm::UndefValue>(c[i]) && !llvm::isa<llvm::UndefValue>(off))
++        c[i] = B.CreateAdd(c[i], off);
++    }
++    bool is_array_slice_last = tex->Logical == Texture::texture1d_array || tex->Logical == Texture::texture2d_array ||
++                               tex->Logical == Texture::texture2d_ms_array;
++    if (is_array_slice_last) {
++      /* the slice takes no offset */
++      unsigned slice = tex->Logical == Texture::texture1d_array ? 1 : 2;
++      c[slice] = call->getArgOperand(3 + slice);
++    }
++    auto [pos, array] = coords(*tex, c[0], c[1], c[2], false);
++    if (!pos)
++      return unsupported("textureLoad on this texture kind");
++    llvm::Value *level = call->getArgOperand(2);
++    if (llvm::isa<llvm::UndefValue>(level))
++      level = B.getInt32(0);
++    llvm::Value *sample = nullptr;
++    if (tex->Logical == Texture::texture2d_ms || tex->Logical == Texture::texture2d_ms_array) {
++      sample = level;
++      level = nullptr;
++    }
++    if (h->cls == UAV && level)
++      level = B.getInt32(0);
++    auto [v, _] = air.CreateRead(tex->Texture, tex->Handle, pos, array, sample, level, tex->GlobalCoherent);
++    if (v->getType() != air.getIntTy(4))
++      v = B.CreateBitCast(v, air.getIntTy(4));
++    result = make_resret(call->getType(), v);
++    return llvm::Error::success();
++  }
++
++  llvm::Error
++  texture_store(llvm::CallInst *call) {
++    auto h = handle(call->getArgOperand(1));
++    if (!h)
++      return h.takeError();
++    auto tex = texture(*h);
++    if (!tex)
++      return tex.takeError();
++    auto [pos, array] = coords(*tex, call->getArgOperand(2), call->getArgOperand(3), call->getArgOperand(4), false);
++    if (!pos)
++      return unsupported("textureStore on this texture kind");
++    auto texel_ty = air.getTexelType(tex->Texture);
++    llvm::Value *v = llvm::UndefValue::get(texel_ty);
++    auto elem_ty = llvm::cast<llvm::FixedVectorType>(texel_ty)->getElementType();
++    for (unsigned i = 0; i < 4; i++) {
++      llvm::Value *e = call->getArgOperand(5 + i);
++      if (llvm::isa<llvm::UndefValue>(e))
++        e = llvm::Constant::getNullValue(elem_ty);
++      if (e->getType() != elem_ty)
++        e = B.CreateBitCast(e, elem_ty);
++      v = B.CreateInsertElement(v, e, (uint64_t)i);
++    }
++    air.CreateWrite(tex->Texture, tex->Handle, pos, array, nullptr, B.getInt32(0), v, tex->GlobalCoherent);
++    return llvm::Error::success();
++  }
++
++  llvm::Error
++  sample_level(llvm::CallInst *call, llvm::Value *&result) {
++    auto h = handle(call->getArgOperand(1));
++    auto s = handle(call->getArgOperand(2));
++    if (!h)
++      return h.takeError();
++    if (!s)
++      return s.takeError();
++    auto tex = texture(*h);
++    if (!tex)
++      return tex.takeError();
++    auto sampler = sampler_of(*s);
++    if (!sampler)
++      return unsupported("sampler not bound by the root signature");
++    bool cube = tex->Logical == Texture::texturecube || tex->Logical == Texture::texturecube_array ||
++                tex->Logical == Texture::depthcube || tex->Logical == Texture::depthcube_array;
++    auto [coord, array] = coords(
++        *tex, call->getArgOperand(3), call->getArgOperand(4), call->getArgOperand(5), true, call->getArgOperand(6)
++    );
++    if (!coord)
++      return unsupported("sampleLevel on this texture kind");
++    int32_t offset[3] = {0, 0, 0};
++    for (unsigned i = 0; i < 3; i++)
++      if (auto c = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(7 + i)))
++        offset[i] = (int32_t)c->getSExtValue();
++    auto [v, _] = air.CreateSample(
++        tex->Texture, tex->Handle, cube ? sampler->CubeSamplerHandle : sampler->SamplerHandle, coord, array, offset,
++        llvm::air::sample_level{call->getArgOperand(10)}
++    );
++    if (v->getType() != air.getIntTy(4))
++      v = B.CreateBitCast(v, air.getIntTy(4));
++    result = make_resret(call->getType(), v);
++    return llvm::Error::success();
++  }
++
++  llvm::Error
++  atomic_binop(llvm::CallInst *call, llvm::Value *&result) {
++    auto h = handle(call->getArgOperand(1));
++    if (!h)
++      return h.takeError();
++    if (is_texture(*h))
++      return texture_atomic(call, result);
++    auto buf = buffer(*h);
++    if (!buf)
++      return buf.takeError();
++    if (call->getType()->isIntegerTy(64))
++      return atomic64_buffer(call, *buf, result);
++    if (!call->getType()->isIntegerTy(32))
++      return unsupported("atomic type");
++    static const llvm::AtomicRMWInst::BinOp ops[] = {
++        llvm::AtomicRMWInst::Add, llvm::AtomicRMWInst::And,  llvm::AtomicRMWInst::Or,
++        llvm::AtomicRMWInst::Xor, llvm::AtomicRMWInst::Min,  llvm::AtomicRMWInst::Max,
++        llvm::AtomicRMWInst::UMin, llvm::AtomicRMWInst::UMax, llvm::AtomicRMWInst::Xchg,
++    };
++    auto kind = (uint32_t)llvm::cast<llvm::ConstantInt>(call->getArgOperand(2))->getZExtValue();
++    if (kind > 8)
++      return unsupported("atomic op " + llvm::Twine(kind));
++    auto idx = dword_index(*buf, call->getArgOperand(3), call->getArgOperand(4));
++    AtomicBufferResourceHandle abuf{buf->Pointer, buf->Metadata, buf->StructureStride, 1, buf->GlobalCoherent};
++    auto ptr = conv.CreateGEPInt32WithBoundCheck(abuf, idx);
++    result = air.CreateAtomicRMW(ops[kind], ptr, call->getArgOperand(6));
++    if (!result)
++      return unsupported("atomic op lowering failed");
++    return llvm::Error::success();
++  }
++
++  llvm::Error
++  update_counter(llvm::CallInst *call, llvm::Value *&result) {
++    auto h = handle(call->getArgOperand(1));
++    if (!h)
++      return h.takeError();
++    auto counter = binding.GetUAVCounter(air, h->range_id, h->index);
++    if (!counter)
++      return unsupported("UAV counter not bound");
++    auto inc = (int8_t)llvm::cast<llvm::ConstantInt>(call->getArgOperand(2))->getSExtValue();
++    if (inc > 0) {
++      result = air.CreateAtomicRMW(llvm::AtomicRMWInst::Add, counter->Pointer, B.getInt32(1));
++    } else {
++      auto old = air.CreateAtomicRMW(llvm::AtomicRMWInst::Sub, counter->Pointer, B.getInt32(1));
++      result = B.CreateSub(old, B.getInt32(1));
++    }
++    return llvm::Error::success();
++  }
++
++  llvm::Error
++  get_dimensions(llvm::CallInst *call, llvm::Value *&result) {
++    auto h = handle(call->getArgOperand(1));
++    if (!h)
++      return h.takeError();
++    auto st = call->getType();
++    llvm::Value *s = llvm::UndefValue::get(st);
++    if (is_typed_buffer(*h)) {
++      auto tex = texture(*h);
++      if (!tex)
++        return tex.takeError();
++      s = B.CreateInsertValue(s, conv.DecodeTextureBufferElement(tex->Metadata), {0});
++    } else {
++      bool is_buffer = !is_texture(*h);
++      if (!is_buffer) {
++        auto tex = texture(*h);
++        if (!tex)
++          return tex.takeError();
++        llvm::Value *level = call->getArgOperand(2);
++        if (llvm::isa<llvm::UndefValue>(level) || h->cls == UAV)
++          level = B.getInt32(0);
++        auto q = [&](Texture::Query what, llvm::Value *lvl) {
++          return air.CreateTextureQuery(tex->Texture, tex->Handle, what, lvl);
++        };
++        llvm::Value *x = B.getInt32(0), *y = B.getInt32(0), *z = B.getInt32(0), *mips = B.getInt32(1);
++        switch (tex->Logical) {
++        case Texture::texture1d:
++          x = q(Texture::width, level);
++          break;
++        case Texture::texture1d_array:
++          x = q(Texture::width, level);
++          y = q(Texture::array_length, B.getInt32(0));
++          break;
++        case Texture::depth2d:
++        case Texture::texture2d:
++        case Texture::texturecube:
++        case Texture::depthcube:
++        case Texture::depth_2d_ms:
++        case Texture::texture2d_ms:
++          x = q(Texture::width, level);
++          y = q(Texture::height, level);
++          break;
++        case Texture::depth2d_array:
++        case Texture::texture2d_array:
++        case Texture::texturecube_array:
++        case Texture::depthcube_array:
++        case Texture::depth_2d_ms_array:
++        case Texture::texture2d_ms_array:
++          x = q(Texture::width, level);
++          y = q(Texture::height, level);
++          z = q(Texture::array_length, B.getInt32(0));
++          break;
++        case Texture::texture3d:
++          x = q(Texture::width, level);
++          y = q(Texture::height, level);
++          z = q(Texture::depth, level);
++          break;
++        default:
++          return unsupported("GetDimensions on this texture kind");
++        }
++        bool ms = tex->Logical == Texture::texture2d_ms || tex->Logical == Texture::texture2d_ms_array ||
++                  tex->Logical == Texture::depth_2d_ms || tex->Logical == Texture::depth_2d_ms_array;
++        if (ms)
++          mips = q(Texture::num_samples, B.getInt32(0));
++        else if (h->cls == SRV)
++          mips = q(Texture::num_mip_levels, B.getInt32(0));
++        s = B.CreateInsertValue(s, x, {0});
++        s = B.CreateInsertValue(s, y, {1});
++        s = B.CreateInsertValue(s, z, {2});
++        s = B.CreateInsertValue(s, mips, {3});
++        result = s;
++        return llvm::Error::success();
++      }
++      auto buf = buffer(*h);
++      if (!buf)
++        return buf.takeError();
++      llvm::Value *len = conv.DecodeRawBufferByteLength(buf->Metadata);
++      if (buf->StructureStride)
++        len = B.CreateUDiv(len, B.getInt32(buf->StructureStride));
++      s = B.CreateInsertValue(s, len, {0});
++      s = B.CreateInsertValue(s, B.getInt32(buf->StructureStride), {1});
++    }
++    result = s;
++    return llvm::Error::success();
++  }
++};
++
++} // namespace
++
++/* groupshared atomics are plain LLVM atomicrmw / cmpxchg in DXIL */
++static llvm::Error
++lower_llvm_atomics(llvm::Function &F, llvm::IRBuilder<> &B, AIRBuilder &air) {
++  std::vector<llvm::Instruction *> todo;
++  for (auto &I : llvm::instructions(F))
++    if (llvm::isa<llvm::AtomicRMWInst>(I) || llvm::isa<llvm::AtomicCmpXchgInst>(I))
++      todo.push_back(&I);
++  for (auto I : todo) {
++    B.SetInsertPoint(I);
++    if (auto rmw = llvm::dyn_cast<llvm::AtomicRMWInst>(I)) {
++      if (!rmw->getType()->isIntegerTy(32))
++        return unsupported("groupshared atomics are 32-bit only on Metal");
++      auto v = air.CreateAtomicRMW(rmw->getOperation(), rmw->getPointerOperand(), rmw->getValOperand());
++      if (!v)
++        return unsupported("groupshared atomicrmw");
++      rmw->replaceAllUsesWith(v);
++      rmw->eraseFromParent();
++    }
++    /* cmpxchg stays an LLVM instruction, the DXBC path emits the same */
++  }
++  return llvm::Error::success();
++}
++
++/* float <-> int conversions: D3D wants saturating ones, AIR's convert is that */
++static void
++lower_conversions(llvm::Function &F, llvm::IRBuilder<> &B, AIRBuilder &air) {
++  std::vector<llvm::Instruction *> todo;
++  for (auto &I : llvm::instructions(F)) {
++    switch (I.getOpcode()) {
++    case llvm::Instruction::FPToSI:
++    case llvm::Instruction::FPToUI:
++      if (I.getType()->isIntegerTy(32) && I.getOperand(0)->getType()->isFloatTy())
++        todo.push_back(&I);
++      break;
++    case llvm::Instruction::SIToFP:
++    case llvm::Instruction::UIToFP:
++      if (I.getType()->isFloatTy() && I.getOperand(0)->getType()->isIntegerTy(32))
++        todo.push_back(&I);
++      break;
++    default:
++      break;
++    }
++  }
++  for (auto I : todo) {
++    B.SetInsertPoint(I);
++    llvm::Value *v = nullptr;
++    switch (I->getOpcode()) {
++    case llvm::Instruction::FPToSI:
++      v = air.CreateConvertToSigned(I->getOperand(0));
++      break;
++    case llvm::Instruction::FPToUI:
++      v = air.CreateConvertToUnsigned(I->getOperand(0));
++      break;
++    case llvm::Instruction::SIToFP:
++      v = air.CreateConvertToFloat(I->getOperand(0), llvm::air::Signedness::Signed);
++      break;
++    case llvm::Instruction::UIToFP:
++      v = air.CreateConvertToFloat(I->getOperand(0), llvm::air::Signedness::Unsigned);
++      break;
++    }
++    I->replaceAllUsesWith(v);
++    I->eraseFromParent();
++  }
++}
++
++/* constant expressions on a global become instructions, so the global can be replaced */
++static void
++expand_constexpr_users(llvm::Constant *C) {
++  for (auto *U : llvm::make_early_inc_range(C->users())) {
++    auto CE = llvm::dyn_cast<llvm::ConstantExpr>(U);
++    if (!CE)
++      continue;
++    expand_constexpr_users(CE);
++    for (auto &use : llvm::make_early_inc_range(CE->uses())) {
++      auto I = llvm::dyn_cast<llvm::Instruction>(use.getUser());
++      if (!I)
++        continue;
++      llvm::Instruction *at = I;
++      if (auto phi = llvm::dyn_cast<llvm::PHINode>(I))
++        at = phi->getIncomingBlock(use)->getTerminator();
++      auto NI = CE->getAsInstruction(at);
++      use.set(NI);
++    }
++    if (CE->use_empty())
++      CE->destroyConstant();
++  }
++}
++
++/* re-roots GEP/load/bitcast chains on a pointer in another address space */
++static bool
++rewrite_pointer_uses(llvm::Value *Old, llvm::Value *New) {
++  unsigned as = New->getType()->getPointerAddressSpace();
++  for (auto &U : llvm::make_early_inc_range(Old->uses())) {
++    auto I = llvm::dyn_cast<llvm::Instruction>(U.getUser());
++    if (!I)
++      return false;
++    llvm::IRBuilder<> b(I);
++    if (auto gep = llvm::dyn_cast<llvm::GetElementPtrInst>(I)) {
++      llvm::SmallVector<llvm::Value *> idx(gep->indices());
++      auto ngep = b.CreateGEP(gep->getSourceElementType(), New, idx);
++      if (!rewrite_pointer_uses(gep, ngep))
++        return false;
++      gep->eraseFromParent();
++    } else if (auto ld = llvm::dyn_cast<llvm::LoadInst>(I)) {
++      auto nl = b.CreateLoad(ld->getType(), New);
++      ld->replaceAllUsesWith(nl);
++      ld->eraseFromParent();
++    } else if (auto bc = llvm::dyn_cast<llvm::BitCastInst>(I)) {
++      auto nbc = b.CreateBitCast(New, llvm::PointerType::get(bc->getType()->getNonOpaquePointerElementType(), as));
++      if (!rewrite_pointer_uses(bc, nbc))
++        return false;
++      bc->eraseFromParent();
++    } else {
++      return false;
++    }
++  }
++  return true;
++}
++
++llvm::Expected<llvm::BasicBlock *>
++EmitBody(SM50ShaderInternal *shader, struct dxbc::context &ctx, llvm::BasicBlock *return_bb) {
++  auto &context = ctx.llvm;
++  auto &module = ctx.module;
++  auto function = ctx.function;
++
++  auto dxil = ParseDXIL(shader->dxil_bitcode, context);
++  if (!dxil)
++    return unsupported("bitcode parse failed: " + llvm::toString(dxil.takeError()));
++  auto &dmod = **dxil;
++  auto main = dmod.getFunction(shader->dxil_entry);
++  if (!main)
++    return unsupported("entry function missing");
++
++  ResourceTable table;
++  {
++    SM50ShaderInternal scratch;
++    if (auto err = read_resources(dmod, &scratch, table))
++      return std::move(err);
++  }
++  std::vector<SigElement> inputs, outputs;
++  if (auto entries = dmod.getNamedMetadata("dx.entryPoints")) {
++    if (auto sigs = llvm::dyn_cast_or_null<llvm::MDNode>(entries->getOperand(0)->getOperand(2).get())) {
++      inputs = read_signature(sigs->getOperand(0));
++      outputs = read_signature(sigs->getOperand(1));
++    }
++  }
++
++  /* groupshared variables become threadgroup globals of the AIR module */
++  for (auto &gv : llvm::make_early_inc_range(dmod.globals())) {
++    if (gv.use_empty())
++      continue;
++    if (gv.getAddressSpace() == 0)
++      continue; /* static globals: below, after the body moved */
++    if (gv.getAddressSpace() != 3)
++      return unsupported("global variable in address space " + llvm::Twine(gv.getAddressSpace()));
++    auto ngv = new llvm::GlobalVariable(
++        module, gv.getValueType(), false, llvm::GlobalValue::InternalLinkage, llvm::UndefValue::get(gv.getValueType()),
++        gv.getName(), nullptr, llvm::GlobalValue::NotThreadLocal, 3
++    );
++    ngv->setAlignment(llvm::MaybeAlign(gv.getAlign() ? gv.getAlign()->value() : 4));
++    gv.replaceAllUsesWith(ngv);
++  }
++
++  /* move the body, returns go to the epilogue */
++  llvm::BasicBlock *body_entry = &main->getEntryBlock();
++  function->getBasicBlockList().splice(function->end(), main->getBasicBlockList());
++  std::vector<llvm::ReturnInst *> rets;
++  for (auto &I : llvm::instructions(*function)) {
++    llvm::SmallVector<std::pair<unsigned, llvm::MDNode *>> mds;
++    I.getAllMetadata(mds);
++    for (auto &[kind, _] : mds)
++      I.setMetadata(kind, nullptr);
++    if (auto ret = llvm::dyn_cast<llvm::ReturnInst>(&I))
++      rets.push_back(ret);
++  }
++  for (auto ret : rets) {
++    llvm::BranchInst::Create(return_bb, ret);
++    ret->eraseFromParent();
++  }
++  /* DXIL's local arrays live in its entry block; move them to the function entry so
++     they stay static allocas (mem2reg/SROA) */
++  {
++    auto &entry = function->getEntryBlock();
++    for (auto &I : llvm::make_early_inc_range(*body_entry))
++      if (auto a = llvm::dyn_cast<llvm::AllocaInst>(&I); a && llvm::isa<llvm::Constant>(a->getArraySize()))
++        a->moveBefore(entry, entry.getFirstInsertionPt());
++  }
++
++  auto &builder = ctx.builder;
++  auto saved_ip = builder.saveIP();
++
++  /* static globals: constant ones go to the constant address space, mutable
++     ones (per thread in HLSL) become allocas */
++  for (auto &gv : llvm::make_early_inc_range(dmod.globals())) {
++    if (gv.use_empty() || gv.getAddressSpace() != 0)
++      continue;
++    expand_constexpr_users(&gv);
++    if (gv.isConstant() && gv.hasInitializer()) {
++      auto ngv = new llvm::GlobalVariable(
++          module, gv.getValueType(), true, llvm::GlobalValue::InternalLinkage, gv.getInitializer(), gv.getName(),
++          nullptr, llvm::GlobalValue::NotThreadLocal, 2
++      );
++      ngv->setAlignment(llvm::MaybeAlign(16));
++      if (!rewrite_pointer_uses(&gv, ngv))
++        return unsupported("unsupported use of a static const array");
++    } else {
++      builder.restoreIP(saved_ip);
++      auto slot = builder.CreateAlloca(gv.getValueType());
++      if (gv.hasInitializer() && !llvm::isa<llvm::UndefValue>(gv.getInitializer()))
++        builder.CreateStore(gv.getInitializer(), slot);
++      saved_ip = builder.saveIP();
++      gv.replaceAllUsesWith(slot);
++    }
++  }
++  Converter conv(ctx.air, ctx, ctx.resource);
++  Lowering lowering(builder, ctx.air, conv, ctx.binding, table, shader->shader_info);
++  lowering.ctx = &ctx;
++  lowering.inputs = &inputs;
++  lowering.outputs = &outputs;
++  lowering.lane = ~shader->dxil_lane_arg ? function->getArg(shader->dxil_lane_arg) : nullptr;
++  lowering.lanes = ~shader->dxil_lanes_arg ? function->getArg(shader->dxil_lanes_arg) : nullptr;
++  lowering.shader_sample_index_arg = shader->dxil_sample_index_arg;
++
++  /* Metal has no 64-bit floats; the device reports DoublePrecisionFloatShaderOps = FALSE */
++  for (auto &I : llvm::instructions(*function)) {
++    if (I.getType()->isDoubleTy())
++      return unsupported("double precision is not supported on Metal");
++    for (auto &op : I.operands())
++      if (op->getType()->isDoubleTy())
++        return unsupported("double precision is not supported on Metal");
++  }
++
++  std::vector<llvm::CallInst *> calls;
++  for (auto &I : llvm::instructions(*function))
++    if (auto call = llvm::dyn_cast<llvm::CallInst>(&I))
++      if (dx_opcode(call) != ~0u)
++        calls.push_back(call);
++  std::vector<llvm::CallInst *> handles;
++  for (auto call : calls) {
++    builder.SetInsertPoint(call);
++    llvm::Value *result = nullptr;
++    if (auto err = lowering.lower(call, result))
++      return std::move(err);
++    auto opc = dx_opcode(call);
++    if (opc == op::CreateHandle || opc == op::CreateHandleFromBinding || opc == op::AnnotateHandle || opc == 218) {
++      handles.push_back(call);
++      continue;
++    }
++    if (result)
++      call->replaceAllUsesWith(result);
++    else if (!call->use_empty())
++      return unsupported("operation " + llvm::Twine(opc) + " has users but no result");
++    call->eraseFromParent();
++  }
++  for (auto it = handles.rbegin(); it != handles.rend(); ++it) {
++    if (!(*it)->use_empty())
++      (*it)->replaceAllUsesWith(llvm::UndefValue::get((*it)->getType()));
++    (*it)->eraseFromParent();
++  }
++  if (auto err = lower_llvm_atomics(*function, builder, ctx.air))
++    return std::move(err);
++  lower_conversions(*function, builder, ctx.air);
++  builder.restoreIP(saved_ip);
++
++  /* LLVM intrinsics of the DXIL module: lifetime markers go, others are redeclared here */
++  for (auto &I : llvm::make_early_inc_range(llvm::instructions(*function))) {
++    auto call = llvm::dyn_cast<llvm::CallInst>(&I);
++    if (!call || !call->getCalledFunction() || call->getCalledFunction()->getParent() == &module)
++      continue;
++    auto callee = call->getCalledFunction();
++    if (callee->getName().startswith("llvm.lifetime.") || callee->getName().startswith("llvm.dbg.")) {
++      call->eraseFromParent();
++      continue;
++    }
++    call->setCalledFunction(module.getOrInsertFunction(callee->getName(), callee->getFunctionType(), callee->getAttributes()));
++  }
++
++  /* nothing may point into the DXIL module any more */
++  for (auto &I : llvm::instructions(*function))
++    for (auto &op : I.operands())
++      if (auto g = llvm::dyn_cast<llvm::GlobalValue>(op.get()); g && g->getParent() != &module) {
++        std::string msg;
++        llvm::raw_string_ostream os(msg);
++        I.print(os);
++        return unsupported("left a reference to " + g->getName() + " in: " + os.str());
++      }
++
++  if (lowering.used_msad)
++    shader->shader_info.use_msad = true;
++  if (lowering.used_samplepos)
++    shader->shader_info.use_samplepos = true;
++  if (lowering.needs_air_2_9) {
++    auto &C = module.getContext();
++    auto u = [&](uint32_t v) { return llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(C, llvm::APInt{32, v, false})); };
++    auto ver = module.getOrInsertNamedMetadata("air.version");
++    ver->clearOperands();
++    ver->addOperand(llvm::MDTuple::get(C, {u(2), u(9), u(0)}));
++    module.setTargetTriple("air64-apple-macosx27.0.0");
++  }
++
++  dxil->reset();
++  return body_entry;
++}
++
++} // namespace dxmt::dxil
+diff --git a/src/airconv/dxil_converter.hpp b/src/airconv/dxil_converter.hpp
+new file mode 100644
+index 0000000..ae7d9bf
+--- /dev/null
++++ b/src/airconv/dxil_converter.hpp
+@@ -0,0 +1,30 @@
++#pragma once
++/* neutron: experimental DXIL front end (see dxil_converter.cpp) */
++#include "airconv_public.h"
++#include "llvm/IR/LLVMContext.h"
++#include "llvm/IR/Module.h"
++#include "llvm/Support/Error.h"
++#include "llvm/Support/raw_ostream.h"
++#include <vector>
++
++#include "DXBCParser/DXBCUtils.h"
++
++namespace dxmt::dxbc {
++class SM50ShaderInternal;
++struct context;
++}
++
++namespace dxmt::dxil {
++
++bool ExtractDXIL(const void *pBytecode, size_t BytecodeSize, std::vector<char> &Bitcode, uint32_t &ProgramVersion);
++
++int InitializeShader(
++    const void *pBytecode, size_t BytecodeSize, dxbc::SM50ShaderInternal *shader,
++    microsoft::CSignatureParser &inputParser, microsoft::CSignatureParser5 &outputParser, llvm::raw_ostream &errorOut
++);
++
++/* moves the DXIL body into ctx.function, lowered to AIR; returns its entry block */
++llvm::Expected<llvm::BasicBlock *>
++EmitBody(dxbc::SM50ShaderInternal *shader, struct dxbc::context &ctx, llvm::BasicBlock *return_bb);
++
++} // namespace dxmt::dxil
+diff --git a/src/airconv/meson.build b/src/airconv/meson.build
+index 8e0c8be..b42f58b 100644
+--- a/src/airconv/meson.build
++++ b/src/airconv/meson.build
+@@ -12,6 +12,7 @@ airconv_src = files([
+  'dxbc_converter_cfg.cpp',
+  'dxbc_instructions.cpp',
+  'dxbc_signature.cpp',
++ 'dxil_converter.cpp',
+  'metallib_writer.cpp',
+  'nt/air_builder.cpp',
+  'nt/dxbc_converter_base.cpp',
+diff --git a/src/airconv/nt/dxbc_binding_map.hpp b/src/airconv/nt/dxbc_binding_map.hpp
+index c92b050..ad4fd90 100644
+--- a/src/airconv/nt/dxbc_binding_map.hpp
++++ b/src/airconv/nt/dxbc_binding_map.hpp
+@@ -57,6 +57,11 @@ public:
+   GetUAVBuffer(llvm::air::AIRBuilder &Builder, RangeId Range, llvm::Value *Index) = 0;
+   virtual llvm::Optional<CounterDescriptor>
+   GetUAVCounter(llvm::air::AIRBuilder &Builder, RangeId Range, llvm::Value *Index) = 0;
++  /* neutron: SM 6.6 directly indexed descriptor heap base (null when the root signature has none) */
++  virtual llvm::Value *
++  GetDescriptorHeap(llvm::air::AIRBuilder &Builder, bool Sampler) {
++    return nullptr;
++  }
+ };
+ 
+ } // namespace dxmt::dxbc
+\ No newline at end of file
+diff --git a/src/d3d12/d3d12_command_list.cpp b/src/d3d12/d3d12_command_list.cpp
+index 1d54278..c3b4a42 100644
+--- a/src/d3d12/d3d12_command_list.cpp
++++ b/src/d3d12/d3d12_command_list.cpp
+@@ -145,6 +145,8 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
+   Com<MTLD3D12ComputePipelineState, false> pso_compute_;
+   Com<MTLD3D12RootSignature, false> rootsig_compute_;
+   uint64_t rootarg_compute_staging_[64];
++  uint64_t resource_heap_address_ = 0;
++  uint64_t sampler_heap_address_ = 0;
+ 
+   FLOAT blend_factor_[4];
+   UINT8 stencil_ref_;
+@@ -1028,9 +1030,37 @@ public:
+   void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList *CommandList) { IMPLEMENT_ME };
+ 
+   void STDMETHODCALLTYPE SetDescriptorHeaps(UINT HeapCount, ID3D12DescriptorHeap *const *Heaps) {
+-    // no need to do anything here because because we encode the full descriptor table address in root argument
++    // descriptor tables carry the full descriptor address in the root arguments;
++    // neutron: shaders that index the heaps directly (SM 6.6) get the heap addresses
++    for (UINT i = 0; i < HeapCount; i++) {
++      if (!Heaps[i])
++        continue;
++      D3D12_DESCRIPTOR_HEAP_DESC desc;
++      D3D12_GPU_DESCRIPTOR_HANDLE start;
++      Heaps[i]->GetDesc(&desc);
++      Heaps[i]->GetGPUDescriptorHandleForHeapStart(&start);
++      if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
++        sampler_heap_address_ = start.ptr;
++      else if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
++        resource_heap_address_ = start.ptr;
++    }
++    UpdateHeapRootArguments();
+   };
+ 
++  void
++  UpdateHeapRootArguments() {
++    if (rootsig_compute_ && ~rootsig_compute_->HeapQwordOffset) {
++      rootarg_compute_staging_[rootsig_compute_->HeapQwordOffset] = resource_heap_address_;
++      rootarg_compute_staging_[rootsig_compute_->HeapQwordOffset + 1] = sampler_heap_address_;
++      dirty_state_.set(DirtyState::ComputeRootArguments);
++    }
++    if (rootsig_graphics_ && ~rootsig_graphics_->HeapQwordOffset) {
++      rootarg_graphics_staging_[rootsig_graphics_->HeapQwordOffset] = resource_heap_address_;
++      rootarg_graphics_staging_[rootsig_graphics_->HeapQwordOffset + 1] = sampler_heap_address_;
++      dirty_state_.set(DirtyState::GraphicsRootArguments);
++    }
++  }
++
+   void STDMETHODCALLTYPE
+   SetComputeRootSignature(ID3D12RootSignature *pRootSignature) {
+     if (rootsig_compute_.ptr() == pRootSignature)
+@@ -1038,6 +1068,7 @@ public:
+     if (pRootSignature) {
+       rootsig_compute_ = static_cast<MTLD3D12RootSignature *>(pRootSignature);
+       assert(rootsig_compute_->UploadQwords < std::size(rootarg_compute_staging_));
++      UpdateHeapRootArguments();
+     } else {
+       rootsig_compute_ = nullptr;
+     }
+@@ -1051,6 +1082,7 @@ public:
+     if (pRootSignature) {
+       rootsig_graphics_ = static_cast<MTLD3D12RootSignature *>(pRootSignature);
+       assert(rootsig_graphics_->UploadQwords < std::size(rootarg_graphics_staging_));
++      UpdateHeapRootArguments();
+     } else {
+       rootsig_graphics_ = nullptr;
+     }
+@@ -1440,15 +1472,19 @@ public:
+     DEBUG("ResolveQueryData");
+   };
+ 
++  /* neutron: predication is a hint to skip work; without it everything is drawn,
++     which is what an app gets when the predicate passes. Debug markers (PIX events,
++     engines' GPU event scopes) carry nothing for Metal. None of these may abort. */
+   void STDMETHODCALLTYPE SetPredication(ID3D12Resource *pBuffer, UINT64 AlignedBufferOffset, D3D12_PREDICATION_OP Op) {
+-    IMPLEMENT_ME
++    if (pBuffer)
++      WARN("SetPredication: ignored, drawing unconditionally");
+   };
+ 
+-  void STDMETHODCALLTYPE SetMarker(UINT Metadata, const void *data, UINT size) { IMPLEMENT_ME };
++  void STDMETHODCALLTYPE SetMarker(UINT Metadata, const void *data, UINT size) {};
+ 
+-  void STDMETHODCALLTYPE BeginEvent(UINT Metadata, const void *data, UINT size) { IMPLEMENT_ME };
++  void STDMETHODCALLTYPE BeginEvent(UINT Metadata, const void *data, UINT size) {};
+ 
+-  void STDMETHODCALLTYPE EndEvent() { IMPLEMENT_ME };
++  void STDMETHODCALLTYPE EndEvent() {};
+ 
+   void STDMETHODCALLTYPE ExecuteIndirect(
+       ID3D12CommandSignature *pCommandSignature, UINT MaxCommandCount, ID3D12Resource *pArgBuffer,
+diff --git a/src/d3d12/d3d12_device.hpp b/src/d3d12/d3d12_device.hpp
+index cb0412e..c2e99a3 100644
+--- a/src/d3d12/d3d12_device.hpp
++++ b/src/d3d12/d3d12_device.hpp
+@@ -40,6 +40,14 @@
+ 
+ namespace dxmt {
+ 
++/* neutron: shader model the device reports, from the DXMT option d3d12.shaderModel
++   (51 default, 60..66 opt-in for the experimental DXIL front end). With 6.x the
++   device also reports what Unreal's SM6 path asks for (feature level 12_0,
++   binding tier 3, wave ops, 64-bit atomics), parts of which are not implemented. */
++D3D_SHADER_MODEL GetReportedShaderModel();
++D3D_FEATURE_LEVEL GetReportedMaxFeatureLevel();
++
++
+ class MTLD3D12GraphicsCommandList : public ID3D12GraphicsCommandList2 {
+ public:
+   EncoderData *entry;
+@@ -107,6 +115,9 @@ public:
+   uint32_t UploadQwords;
+   uint32_t ParameterSlots;
+   uint32_t const *SlotQwordOffsets;
++  /* neutron: SM 6.6 dynamic resources (CBV_SRV_UAV/SAMPLER_HEAP_DIRECTLY_INDEXED): two
++     qwords after the parameters hold the bound resource and sampler heap addresses */
++  uint32_t HeapQwordOffset = ~0u;
+ 
+   size_t NumStaticSamplers;
+   uint64_t const *EncodedStaticSamplers;
+diff --git a/src/d3d12/d3d12_pipeline_compute.cpp b/src/d3d12/d3d12_pipeline_compute.cpp
+index aae4946..5d6bb17 100644
+--- a/src/d3d12/d3d12_pipeline_compute.cpp
++++ b/src/d3d12/d3d12_pipeline_compute.cpp
+@@ -64,7 +64,7 @@ public:
+     SM50ShaderBitcode cs_bitcode;
+ 
+     if (SM50Compile(shader_cs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&common, "cs_main", &cs_bitcode, &sm50_err)) {
+-      ERR("Failed to compile cs shader");
++      ERR("Failed to compile cs shader: ", SM50GetErrorMessageString(sm50_err));
+       return E_FAIL;
+     }
+ 
+diff --git a/src/d3d12/d3d12_pipeline_graphics.cpp b/src/d3d12/d3d12_pipeline_graphics.cpp
+index 12664d5..826a4ee 100644
+--- a/src/d3d12/d3d12_pipeline_graphics.cpp
++++ b/src/d3d12/d3d12_pipeline_graphics.cpp
+@@ -241,8 +241,7 @@ MTLD3D12PipelineState::InitializeShader(
+   if (FAILED(hr = Parser.ReadDXBC(Bytecode.pShaderBytecode, Bytecode.BytecodeLength)))
+     return hr;
+ 
+-  if (Parser.FindNextMatchingBlob(microsoft::DXBC_DXIL) != DXBC_BLOB_NOT_FOUND)
+-    return E_NOTIMPL;
++  /* neutron: DXIL goes to airconv's experimental DXIL front end (compute only for now) */
+ 
+   SM50Error error;
+   if (SM50Initialize(Bytecode.pShaderBytecode, Bytecode.BytecodeLength, ppShader, pRefl, &error)) {
+@@ -534,7 +533,7 @@ public:
+       if (SM50Compile(
+               shader_vs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, "vs_main", &vs_bitcode, &sm50_err
+           )) {
+-        ERR("Failed to compile vs shader");
++        ERR("Failed to compile vs shader: ", SM50GetErrorMessageString(sm50_err));
+         return E_FAIL;
+       }
+ 
+@@ -591,7 +590,7 @@ public:
+       if (SM50Compile(
+               shader_ps, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, ps_name.c_str(), &ps_bitcode, &sm50_err
+           )) {
+-        ERR("Failed to compile ps shader");
++        ERR("Failed to compile ps shader: ", SM50GetErrorMessageString(sm50_err));
+         return E_FAIL;
+       }
+       SM50_COMPILED_BITCODE ps_bitcode_compiled;
+diff --git a/src/d3d12/d3d12_root_signature.cpp b/src/d3d12/d3d12_root_signature.cpp
+index 7a24aac..79ed182 100644
+--- a/src/d3d12/d3d12_root_signature.cpp
++++ b/src/d3d12/d3d12_root_signature.cpp
+@@ -455,6 +455,11 @@ public:
+     auto [offsets, total_qwords] = CalculateRootSignatureQwordOffsets(desc);
+     qword_offsets_ = offsets;
+     UploadQwords = total_qwords;
++    if (desc.Flags & (D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
++                      D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED)) {
++      HeapQwordOffset = total_qwords;
++      UploadQwords = total_qwords + 2;
++    }
+     ParameterSlots = qword_offsets_.size();
+     SlotQwordOffsets = qword_offsets_.data();
+ 
+diff --git a/src/d3d12/d3d12_texture.cpp b/src/d3d12/d3d12_texture.cpp
+index 174b3b6..34078ae 100644
+--- a/src/d3d12/d3d12_texture.cpp
++++ b/src/d3d12/d3d12_texture.cpp
+@@ -110,8 +110,14 @@ PopulateWMTTextureInfo(WMT::Device Device, WMTTextureInfo &InfoOut, const D3D12_
+     Usage |= WMTTextureUsageRenderTarget;
+   if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+     Usage |= WMTTextureUsageRenderTarget;
+-  if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
++  if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+     Usage |= WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite;
++    /* neutron: texture atomics (InterlockedAdd on RWTexture2D<uint>, 64-bit InterlockedMax
++       on R32G32_UINT) need the atomic usage, like the D3D11 path sets it */
++    if (InfoOut.pixel_format == WMTPixelFormatR32Uint || InfoOut.pixel_format == WMTPixelFormatR32Sint ||
++        (InfoOut.pixel_format == WMTPixelFormatRG32Uint && Device.supportsFamily(WMTGPUFamilyApple8)))
++      Usage |= WMTTextureUsageShaderAtomic;
++  }
+   if (!(Desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
+     Usage |= WMTTextureUsageShaderRead;
+   InfoOut.usage = Usage;

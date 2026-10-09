@@ -11,6 +11,16 @@ as x86_64 Windows executables, like games, so they also run through FEX.
 | `d3d11_present.c` | borderless fullscreen window with a flip swapchain in a given format (see `dev/direct-test.sh`) | yes, fullscreen | `-ld3d11 -ldxgi -luser32` |
 | `d3d12_clear.c` | D3D12 device, clear and readback of one pixel | no | `-ld3d12` |
 | `d3d12_triangle.c` | D3D12 root signature, pipeline with HLSL shaders, one draw, pixel check | no | `-ld3d12 -ld3dcompiler` |
+| `d3d12_caps.c` | D3D12 caps the way Unreal 5 checks them (feature level, shader model, binding tier, wave ops, 64-bit atomics); exit 0 when Unreal would pick SM6 | no | `-ldxgi -ld3d12 -lole32` |
+| `d3d12_dxil_compute.c` | DXIL compute: groupshared, barriers, cbuffer, root UAVs, wave ops (needs `DXMT_CONFIG="d3d12.shaderModel = 66"`, as all `d3d12_dxil_*`) | no | `-ld3d12 -ldxgi` |
+| `d3d12_dxil_draw.c` | DXIL VS and PS, input layout, SRV table, static sampler, discard | no | `-ld3d12 -ldxgi` |
+| `d3d12_dxil_mrt.c` | DXIL with 3 render targets, SV_Depth, IsFrontFace, InstanceID | no | `-ld3d12` |
+| `d3d12_dxil_ops.c` | DXIL operations: GetDimensions, Gather, offsets, bit ops, wave and quad ops, f16 conversion, trig | no | `-ld3d12` |
+| `d3d12_dxil_heap.c` | SM 6.6 descriptor heap indexing | no | `-ld3d12` |
+| `d3d12_dxil_atomic64.c` | 64-bit InterlockedMax/Min like Nanite | no | `-ld3d12` |
+| `d3d12_dxil_pso.c` | pipeline creation for 12 pixel shaders (derivatives, LOD, MSAA, coverage, UAV, wave) | no | `-ld3d12` |
+| `sync_semantics.c` | 56 checks of Windows sync semantics (wait any/all, APCs, abandoned mutexes, cross-process), with and without `NEUTRON_MSYNC=1` | no | |
+| `sandbox/sbtest.sh` | the game sandbox (`NEUTRON_SANDBOX=1`): 35 checks of what is denied and allowed, D3D11, audio and controllers inside it | no | builds its own |
 
 Exit code 0 means the test passed.
 

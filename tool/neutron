@@ -26,6 +26,8 @@
 #   NEUTRON_RAW_MOUSE=0         raw input (mouse look) from the accelerated macOS
 #                               cursor deltas instead of the GCMouse device deltas
 #   NEUTRON_PRECISE_TIMERS=0    Sleep() through select() again instead of a kqueue timer
+#   NEUTRON_D3D12_SM6=1         D3D12 with shader model 6.6 / feature level 12_0 (DXIL shaders,
+#                               Unreal 5 -dx12); also lifts a game's forced -dx11
 #   NEUTRON_MSYNC=1             events, semaphores and mutexes in the game process (shared
 #                               memory) instead of a wineserver round trip; off by default
 #                               until tested with more games. NEUTRON_MSYNC_SPIN=<ns> sets
@@ -150,6 +152,11 @@ export DXMT_SHADER_CACHE_PATH="${DXMT_SHADER_CACHE_PATH:-$STEAM_COMPAT_DATA_PATH
 if [ -n "${NEUTRON_METALFX:-}" ]; then
   export DXMT_METALFX_SPATIAL_SWAPCHAIN=1
   export DXMT_CONFIG="d3d11.metalSpatialUpscaleFactor = $NEUTRON_METALFX${DXMT_CONFIG:+; $DXMT_CONFIG}"
+fi
+# DXMT's D3D12 reports shader model 6.6 and feature level 12_0 (its DXIL front end,
+# DXMT patch 0014); Unreal 5 needs that for -dx12. Opt-in until tested with games.
+if [ "${NEUTRON_D3D12_SM6:-0}" = 1 ]; then
+  export DXMT_CONFIG="d3d12.shaderModel = 66${DXMT_CONFIG:+; $DXMT_CONFIG}"
 fi
 if [ "${NEUTRON_FEX_TSO:-}" = "strict" ]; then
   export FEX_VECTORTSOENABLED=1 FEX_MEMCPYSETTSOENABLED=1 FEX_HALFBARRIERTSOENABLED=0
@@ -372,6 +379,12 @@ EOF
 # With -dx11 in APP_ARGS, a -dx12/-d3d12 from the game's launch entry is dropped
 # (DXMT's D3D12 is not enough for these games yet).
 APP_ARGS_1144200="-dx11"   # Ready or Not: "DirectX 12 is not supported" with -dx12
+# NEUTRON_D3D12_SM6=1 lifts the forced -dx11 (to test DX12 with the DXIL front end).
+if [ "${NEUTRON_D3D12_SM6:-0}" = 1 ]; then
+  app_args_var="APP_ARGS_$APP_ID"
+  app_args_value="${!app_args_var:-}"
+  printf -v "$app_args_var" '%s' "${app_args_value//-dx11/}"
+fi
 
 app_args() {
   local var="APP_ARGS_$APP_ID" arg

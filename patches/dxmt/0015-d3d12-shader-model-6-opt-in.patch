@@ -1,0 +1,114 @@
+DXMT option d3d12.shaderModel (51 default, 60..66): with 6.x the device reports that
+shader model, feature level 12_0, resource binding tier 3, wave ops (32 lanes),
+Int64ShaderOps and AtomicInt64OnTypedResource, which is what Unreal 5's SM6 D3D12 path
+needs (DXMT_CONFIG="d3d12.shaderModel = 66"). Needs patch 0014.
+
+diff --git a/src/d3d12/d3d12.cpp b/src/d3d12/d3d12.cpp
+index 78ca597..fe72c54 100644
+--- a/src/d3d12/d3d12.cpp
++++ b/src/d3d12/d3d12.cpp
+@@ -40,7 +40,7 @@ D3D12CreateDevice(IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel, REF
+   /* neutron: the device reports 11_1 at most (CheckFeatureSupport FEATURE_LEVELS),
+      so creating one for a higher minimum level must fail like on a real 11_1 GPU,
+      or engines that probe 12_x first pick paths the device does not have */
+-  if (MinimumFeatureLevel > D3D_FEATURE_LEVEL_11_1) {
++  if (MinimumFeatureLevel > GetReportedMaxFeatureLevel()) {
+     WARN("D3D12CreateDevice: feature level 0x", str::format(std::hex, (unsigned)MinimumFeatureLevel), " not supported");
+     return E_INVALIDARG;
+   }
+diff --git a/src/d3d12/d3d12_device.cpp b/src/d3d12/d3d12_device.cpp
+index 52b2e32..8fefc31 100644
+--- a/src/d3d12/d3d12_device.cpp
++++ b/src/d3d12/d3d12_device.cpp
+@@ -26,11 +26,31 @@
+ #include "log/log.hpp"
+ #include <map>
+ #include <cstring>
++#include "config/config.hpp"
+ #include "d3d10_1.h"
+ #include "d3d11_4.h"
+ 
+ namespace dxmt {
+ 
++D3D_SHADER_MODEL
++GetReportedShaderModel() {
++  static D3D_SHADER_MODEL sm = [] {
++    int32_t v = Config::getInstance().getOption<int32_t>("d3d12.shaderModel", 51);
++    if (v < 60 || v > 69)
++      v = 51;
++    auto r = (D3D_SHADER_MODEL)(((v / 10) << 4) | (v % 10));
++    if (r != D3D_SHADER_MODEL_5_1)
++      WARN("D3D12: reporting shader model ", v / 10, ".", v % 10, " (experimental DXIL support)");
++    return r;
++  }();
++  return sm;
++}
++
++D3D_FEATURE_LEVEL
++GetReportedMaxFeatureLevel() {
++  return GetReportedShaderModel() >= D3D_SHADER_MODEL_6_0 ? D3D_FEATURE_LEVEL_12_0 : D3D_FEATURE_LEVEL_11_1;
++}
++
+ const GUID kD3D12DeviceDownlevelUUID = {0x74eaee3f, 0x2f4b, 0x476d, {0x82, 0xba, 0x2b, 0x85, 0xcb, 0x49, 0xe3, 0x10}};
+ 
+ HRESULT PopulateWMTTextureInfo(WMT::Device Device, WMTTextureInfo &InfoOut, const D3D12_RESOURCE_DESC &Desc);
+@@ -240,7 +260,7 @@ public:
+          min(max requested, 11_1), which can answer a level the caller did not ask for */
+       D3D_FEATURE_LEVEL max_level = {};
+       for (unsigned i = 0; i < out->NumFeatureLevels; i++)
+-        if (out->pFeatureLevelsRequested[i] <= D3D_FEATURE_LEVEL_11_1)
++        if (out->pFeatureLevelsRequested[i] <= GetReportedMaxFeatureLevel())
+           max_level = std::max(out->pFeatureLevelsRequested[i], max_level);
+       out->MaxSupportedFeatureLevel = max_level;
+       return max_level ? S_OK : DXGI_ERROR_UNSUPPORTED;
+@@ -277,7 +297,7 @@ public:
+       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_SHADER_MODEL *>(pFeatureData);
+       if (out->HighestShaderModel < D3D_SHADER_MODEL_5_1 || out->HighestShaderModel > (D3D_SHADER_MODEL)0x69)
+         return E_INVALIDARG;
+-      out->HighestShaderModel = std::min(out->HighestShaderModel, D3D_SHADER_MODEL_5_1);
++      out->HighestShaderModel = std::min(out->HighestShaderModel, GetReportedShaderModel());
+       return S_OK;
+     }
+     case D3D12_FEATURE_D3D12_OPTIONS: {
+@@ -288,7 +308,8 @@ public:
+       out->OutputMergerLogicOp = FALSE;
+       out->MinPrecisionSupport = D3D12_SHADER_MIN_PRECISION_SUPPORT_16_BIT;
+       out->TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
+-      out->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_2;
++      out->ResourceBindingTier = GetReportedShaderModel() >= D3D_SHADER_MODEL_6_0 ? D3D12_RESOURCE_BINDING_TIER_3
++                                                                                  : D3D12_RESOURCE_BINDING_TIER_2;
+       out->PSSpecifiedStencilRefSupported = TRUE;
+       out->TypedUAVLoadAdditionalFormats = TRUE;
+       out->ROVsSupported = TRUE;
+@@ -332,13 +353,15 @@ public:
+       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS1))
+         return E_INVALIDARG;
+       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS1 *>(pFeatureData);
+-      out->WaveOps = 0;
+-      out->WaveLaneCountMin = 0;
+-      out->WaveLaneCountMax = 0;
+-      out->TotalLaneCount = 0;
++      /* neutron: DXIL wave intrinsics map to Metal simdgroup functions (32 lanes) */
++      bool sm6 = GetReportedShaderModel() >= D3D_SHADER_MODEL_6_0;
++      out->WaveOps = sm6;
++      out->WaveLaneCountMin = sm6 ? 32 : 0;
++      out->WaveLaneCountMax = sm6 ? 32 : 0;
++      out->TotalLaneCount = sm6 ? 32 * 1024 : 0;
+       // If CheckFeatureSupport succeeds this value will always be true.
+       out->ExpandedComputeResourceStates = TRUE;
+-      out->Int64ShaderOps = FALSE;
++      out->Int64ShaderOps = sm6; /* 64-bit integer math, loads and stores work in the DXIL path */
+       return S_OK;
+     }
+     case D3D12_FEATURE_D3D12_OPTIONS12: {
+@@ -417,6 +440,10 @@ public:
+         return E_INVALIDARG;
+       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS9 *>(pFeatureData);
+       memset(out, 0, sizeof(*out));
++      /* Unreal's SM6 path requires it (Nanite). The DXIL front end does uint64
++         InterlockedMin/Max on R32G32_UINT textures and buffers (the Metal subset:
++         unsigned min/max, no returned value) */
++      out->AtomicInt64OnTypedResourceSupported = GetReportedShaderModel() >= D3D_SHADER_MODEL_6_6;
+       out->WaveMMATier = D3D12_WAVE_MMA_TIER_NOT_SUPPORTED;
+       return S_OK;
+     }

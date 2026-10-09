@@ -188,6 +188,7 @@ Launch options override `neutron.env`. Changes apply at the next game start.
 | `NEUTRON_FPS_LOG` | off | `1`: FPS and the slowest frame per second in the game log. In the tab. |
 | `NEUTRON_RAW_MOUSE` | `1` | Mouse look from the mouse's device deltas (no macOS acceleration). `0`: Wine's cursor deltas. |
 | `NEUTRON_PRECISE_TIMERS` | `1` | Precise `Sleep()` through kqueue timers. `0` turns it off. |
+| `NEUTRON_D3D12_SM6` | off | `1`: D3D12 reports shader model 6.6 and feature level 12_0, DXIL shaders are translated (Unreal 5 games with `-dx12`). Also lifts a game's forced `-dx11`. Experimental. In the tab. |
 | `NEUTRON_MSYNC` | off | `1`: Windows events, semaphores and mutexes work in the game process instead of through wineserver (30 to 290 times faster sync calls). Experimental, set it in `neutron.env`. |
 | `NEUTRON_METALFX` | from render scale | MetalFX upscale factor, normally `1 / NEUTRON_RENDER_SCALE`. |
 | `NEUTRON_APP_NAME` | game name | Name in the menu bar and Dock. |

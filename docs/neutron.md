@@ -333,6 +333,37 @@ log, `NEUTRON_HUD=2` shows the Metal HUD with DXMT's per-frame statistics.
 - **HUD cost.** `NEUTRON_HUD=2` loads libMetalMetricsInterpose and costs about
   11% game CPU per frame in the Gamble menu. Benchmarks run without it.
 
+## D3D12 and DXIL
+
+Unreal 5 decides D3D12 support from the device's caps: feature level 12_0, shader
+model 6.x, resource binding tier 3, wave ops and 64-bit atomics (Nanite), and asks
+OPTIONS9 (feature 37), which upstream DXMT did not answer. DXMT's D3D12 only
+compiled DXBC (SM 5.1), so Ready or Not with `-dx12` showed "DirectX 12 is not
+supported on your system".
+
+- DXMT patch 0012 answers all remaining feature queries (unsupported features as
+  "not supported" with S_OK) and exports `D3D12EnableExperimentalFeatures`; 0013
+  makes `D3D12CreateDevice` fail for a minimum feature level above what the device
+  reports, like a real GPU.
+- 0014 is a DXIL front end in airconv: LLVM 15 reads the DXIL bitcode, `dx.op`
+  calls (about 120 opcodes) become AIR, resources and root signatures reuse the
+  DXBC SM 5.1 path, signatures go through the DXBC signature handlers. VS, PS and
+  CS; SM 6.6 `ResourceDescriptorHeap`/`SamplerDescriptorHeap`; wave and quad ops
+  on Metal SIMD groups (32 lanes); compute derivatives through quad shuffles;
+  64-bit atomics only as unsigned InterlockedMin/Max on R32G32_UINT textures and
+  buffers without return value (Nanite), in AIR 2.9 (Metal's compiler crashes on
+  them in 2.7). PSO failures log the missing operation by name.
+- 0015: `d3d12.shaderModel = 66` (DXMT config, `NEUTRON_D3D12_SM6=1` in the tool)
+  reports FL 12_0, SM 6.6, binding tier 3, wave ops, Int64 and Atomic64. Default
+  stays SM 5.1.
+- Tests (headless): `tests/d3d12_caps.c` reproduces Unreal 5's adapter checks,
+  `tests/d3d12_dxil_*.c` cover compute, draw, MRT, ops, descriptor heap indexing,
+  64-bit atomics and PSO creation. 204 of 243 vkd3d-proton SM6 test shaders convert.
+- Missing: geometry, hull and domain shaders in DXMT's D3D12 (DXBC too), 16-bit
+  shader types, doubles, other 64-bit atomics, SM 6.7+, mesh shaders, ray tracing;
+  `ResolveQueryData` is a no-op; no D3D12 shader cache (DXIL is converted for every
+  PSO). Not yet run with a real Unreal 5 game.
+
 ## msync
 
 Every Windows sync call (SetEvent, WaitForSingleObject, ReleaseSemaphore) was a

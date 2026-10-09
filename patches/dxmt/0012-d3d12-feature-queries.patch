@@ -1,0 +1,165 @@
+D3D12 CheckFeatureSupport: answer OPTIONS5/6/8/9/10/11/13/14/15/17/18, SERIALIZATION,
+CROSS_NODE, DISPLAYABLE, EXISTING_HEAPS, PROTECTED_RESOURCE_SESSION_SUPPORT and
+COMMAND_QUEUE_PRIORITY with "not supported" values and S_OK instead of E_NOTIMPL
+(Unreal 5 asks OPTIONS9). SHADER_MODEL returns min(requested, supported) and fails for
+unknown models; FEATURE_LEVELS only picks levels from the caller's list.
+D3D12EnableExperimentalFeatures export (E_NOINTERFACE).
+
+diff --git a/src/d3d12/d3d12.cpp b/src/d3d12/d3d12.cpp
+index aacf63d..47f95cd 100644
+--- a/src/d3d12/d3d12.cpp
++++ b/src/d3d12/d3d12.cpp
+@@ -72,6 +72,16 @@ D3D12GetInterface(REFCLSID rcslid, REFIID iid, void **debug) {
+   return E_NOINTERFACE;
+ }
+ 
++/* neutron: Wine's and Windows' d3d12.dll export it; a game importing it
++   statically must still load. Experimental features need developer mode on
++   Windows, which answers E_NOINTERFACE without it. */
++extern "C" HRESULT WINAPI
++D3D12EnableExperimentalFeatures(UINT NumFeatures, const IID *pIIDs, void *pConfigurationStructs, UINT *pConfigurationStructSizes) {
++  for (UINT i = 0; i < NumFeatures && pIIDs; i++)
++    WARN("D3D12EnableExperimentalFeatures: ", dxmt::str::format(pIIDs[i]), " not supported");
++  return E_NOINTERFACE;
++}
++
+ extern "C" HRESULT WINAPI
+ D3D12GetDebugInterface(REFIID iid, void **debug) {
+   WARN("D3D12GetDebugInterface: Unknown interface query ", dxmt::str::format(iid));
+diff --git a/src/d3d12/d3d12.def b/src/d3d12/d3d12.def
+index f365ee9..05240ae 100644
+--- a/src/d3d12/d3d12.def
++++ b/src/d3d12/d3d12.def
+@@ -6,4 +6,5 @@ EXPORTS
+     D3D12CreateVersionedRootSignatureDeserializer
+     D3D12SerializeRootSignature
+     D3D12SerializeVersionedRootSignature
+-    D3D12GetInterface
+\ No newline at end of file
++    D3D12GetInterface
++    D3D12EnableExperimentalFeatures
+\ No newline at end of file
+diff --git a/src/d3d12/d3d12_device.cpp b/src/d3d12/d3d12_device.cpp
+index 080353c..52b2e32 100644
+--- a/src/d3d12/d3d12_device.cpp
++++ b/src/d3d12/d3d12_device.cpp
+@@ -25,6 +25,7 @@
+ #include "dxmt_format.hpp"
+ #include "log/log.hpp"
+ #include <map>
++#include <cstring>
+ #include "d3d10_1.h"
+ #include "d3d11_4.h"
+ 
+@@ -235,11 +236,14 @@ public:
+       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_FEATURE_LEVELS *>(pFeatureData);
+       if (!out->NumFeatureLevels)
+         return E_INVALIDARG;
++      /* neutron: highest level of the requested list that is supported, not just
++         min(max requested, 11_1), which can answer a level the caller did not ask for */
+       D3D_FEATURE_LEVEL max_level = {};
+       for (unsigned i = 0; i < out->NumFeatureLevels; i++)
+-        max_level = std::max(out->pFeatureLevelsRequested[i], max_level);
+-      out->MaxSupportedFeatureLevel = std::min(max_level, D3D_FEATURE_LEVEL_11_1);
+-      return S_OK;
++        if (out->pFeatureLevelsRequested[i] <= D3D_FEATURE_LEVEL_11_1)
++          max_level = std::max(out->pFeatureLevelsRequested[i], max_level);
++      out->MaxSupportedFeatureLevel = max_level;
++      return max_level ? S_OK : DXGI_ERROR_UNSUPPORTED;
+     }
+     case D3D12_FEATURE_FORMAT_INFO:  {
+        if (DataSize != sizeof(D3D12_FEATURE_DATA_FORMAT_INFO))
+@@ -268,7 +272,12 @@ public:
+     case D3D12_FEATURE_SHADER_MODEL: {
+       if (DataSize != sizeof(D3D12_FEATURE_DATA_SHADER_MODEL))
+         return E_INVALIDARG;
+-      reinterpret_cast<D3D12_FEATURE_DATA_SHADER_MODEL *>(pFeatureData)->HighestShaderModel = D3D_SHADER_MODEL_5_1;
++      /* neutron: the runtime answers min(requested, supported) and fails for shader
++         models it does not know (engines walk down from the newest one) */
++      auto *out = reinterpret_cast<D3D12_FEATURE_DATA_SHADER_MODEL *>(pFeatureData);
++      if (out->HighestShaderModel < D3D_SHADER_MODEL_5_1 || out->HighestShaderModel > (D3D_SHADER_MODEL)0x69)
++        return E_INVALIDARG;
++      out->HighestShaderModel = std::min(out->HighestShaderModel, D3D_SHADER_MODEL_5_1);
+       return S_OK;
+     }
+     case D3D12_FEATURE_D3D12_OPTIONS: {
+@@ -383,6 +392,79 @@ public:
+       out->Support2 = (D3D12_FORMAT_SUPPORT2)0xffffffff;
+       return S_OK;
+     }
++    /* neutron: the feature blocks newer engines query. Answer "not supported"
++       with S_OK like a real driver instead of E_NOTIMPL (Unreal 5 asks OPTIONS9
++       for 64-bit atomics). */
++    case D3D12_FEATURE_D3D12_OPTIONS5: {
++      if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS5))
++        return E_INVALIDARG;
++      auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS5 *>(pFeatureData);
++      out->SRVOnlyTiledResourceTier3 = FALSE;
++      out->RenderPassesTier = D3D12_RENDER_PASS_TIER_0;
++      out->RaytracingTier = D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
++      return S_OK;
++    }
++    case D3D12_FEATURE_D3D12_OPTIONS6: {
++      if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS6))
++        return E_INVALIDARG;
++      auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS6 *>(pFeatureData);
++      memset(out, 0, sizeof(*out));
++      out->VariableShadingRateTier = D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED;
++      return S_OK;
++    }
++    case D3D12_FEATURE_D3D12_OPTIONS9: {
++      if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS9))
++        return E_INVALIDARG;
++      auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS9 *>(pFeatureData);
++      memset(out, 0, sizeof(*out));
++      out->WaveMMATier = D3D12_WAVE_MMA_TIER_NOT_SUPPORTED;
++      return S_OK;
++    }
++#define NEUTRON_FEATURE_NONE(feature, type)                                                                            \
++  case feature:                                                                                                        \
++    if (DataSize != sizeof(type))                                                                                      \
++      return E_INVALIDARG;                                                                                             \
++    memset(pFeatureData, 0, sizeof(type));                                                                             \
++    return S_OK;
++      NEUTRON_FEATURE_NONE(D3D12_FEATURE_D3D12_OPTIONS8, D3D12_FEATURE_DATA_D3D12_OPTIONS8)
++      NEUTRON_FEATURE_NONE(D3D12_FEATURE_D3D12_OPTIONS10, D3D12_FEATURE_DATA_D3D12_OPTIONS10)
++      NEUTRON_FEATURE_NONE(D3D12_FEATURE_D3D12_OPTIONS11, D3D12_FEATURE_DATA_D3D12_OPTIONS11)
++      NEUTRON_FEATURE_NONE(D3D12_FEATURE_D3D12_OPTIONS13, D3D12_FEATURE_DATA_D3D12_OPTIONS13)
++      NEUTRON_FEATURE_NONE(D3D12_FEATURE_D3D12_OPTIONS14, D3D12_FEATURE_DATA_D3D12_OPTIONS14)
++      NEUTRON_FEATURE_NONE(D3D12_FEATURE_D3D12_OPTIONS15, D3D12_FEATURE_DATA_D3D12_OPTIONS15)
++      NEUTRON_FEATURE_NONE(D3D12_FEATURE_D3D12_OPTIONS17, D3D12_FEATURE_DATA_D3D12_OPTIONS17)
++      NEUTRON_FEATURE_NONE(D3D12_FEATURE_D3D12_OPTIONS18, D3D12_FEATURE_DATA_D3D12_OPTIONS18)
++      NEUTRON_FEATURE_NONE(D3D12_FEATURE_EXISTING_HEAPS, D3D12_FEATURE_DATA_EXISTING_HEAPS)
++      NEUTRON_FEATURE_NONE(D3D12_FEATURE_CROSS_NODE, D3D12_FEATURE_DATA_CROSS_NODE)
++      NEUTRON_FEATURE_NONE(D3D12_FEATURE_DISPLAYABLE, D3D12_FEATURE_DATA_DISPLAYABLE)
++#undef NEUTRON_FEATURE_NONE
++    case D3D12_FEATURE_SERIALIZATION: {
++      if (DataSize != sizeof(D3D12_FEATURE_DATA_SERIALIZATION))
++        return E_INVALIDARG;
++      auto *out = reinterpret_cast<D3D12_FEATURE_DATA_SERIALIZATION *>(pFeatureData);
++      if (out->NodeIndex > 0)
++        return E_INVALIDARG;
++      out->HeapSerializationTier = D3D12_HEAP_SERIALIZATION_TIER_0;
++      return S_OK;
++    }
++    case D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT: {
++      if (DataSize != sizeof(D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_SUPPORT))
++        return E_INVALIDARG;
++      auto *out = reinterpret_cast<D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_SUPPORT *>(pFeatureData);
++      if (out->NodeIndex > 0)
++        return E_INVALIDARG;
++      out->Support = D3D12_PROTECTED_RESOURCE_SESSION_SUPPORT_FLAG_NONE;
++      return S_OK;
++    }
++    case D3D12_FEATURE_COMMAND_QUEUE_PRIORITY: {
++      if (DataSize != sizeof(D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY))
++        return E_INVALIDARG;
++      auto *out = reinterpret_cast<D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY *>(pFeatureData);
++      /* priorities are accepted and ignored, global realtime needs privileges */
++      out->PriorityForTypeIsSupported = out->Priority == D3D12_COMMAND_QUEUE_PRIORITY_NORMAL ||
++                                        out->Priority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
++      return S_OK;
++    }
+     default:
+       break;
+     }

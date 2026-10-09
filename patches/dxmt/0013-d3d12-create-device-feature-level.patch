@@ -1,0 +1,22 @@
+D3D12CreateDevice fails with E_INVALIDARG for a minimum feature level above what the
+device reports (11_1, or 12_0 with d3d12.shaderModel >= 60 from patch 0015).
+
+diff --git a/src/d3d12/d3d12.cpp b/src/d3d12/d3d12.cpp
+index 47f95cd..78ca597 100644
+--- a/src/d3d12/d3d12.cpp
++++ b/src/d3d12/d3d12.cpp
+@@ -37,6 +37,14 @@ D3D12CreateDevice(IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel, REF
+   if (MinimumFeatureLevel < D3D_FEATURE_LEVEL_11_0)
+     return E_INVALIDARG;
+ 
++  /* neutron: the device reports 11_1 at most (CheckFeatureSupport FEATURE_LEVELS),
++     so creating one for a higher minimum level must fail like on a real 11_1 GPU,
++     or engines that probe 12_x first pick paths the device does not have */
++  if (MinimumFeatureLevel > D3D_FEATURE_LEVEL_11_1) {
++    WARN("D3D12CreateDevice: feature level 0x", str::format(std::hex, (unsigned)MinimumFeatureLevel), " not supported");
++    return E_INVALIDARG;
++  }
++
+   HRESULT hr;
+ 
+   if (!pAdapter) {

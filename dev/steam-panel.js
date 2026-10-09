@@ -20,6 +20,8 @@
       choices: [['', 'Default for this game'], ['fast', 'Fast'], ['strict', 'Strict (slower, for threading bugs)']] },
     { key: 'NEUTRON_NATIVE_FULLSCREEN', label: 'macOS fullscreen and Game Mode',
       choices: [['', 'On'], ['0', 'Off']] },
+    { key: 'NEUTRON_D3D12_SM6', label: 'DirectX 12 shader model 6 (Unreal 5)',
+      choices: [['', 'Off'], ['1', 'On (experimental)']] },
     { key: 'NEUTRON_FPS_LOG', label: 'FPS log',
       choices: [['', 'Off'], ['1', 'On (~/Library/Logs/neutron)']] },
     { key: 'NEUTRON_SANDBOX', label: 'Sandbox (game cannot read your files or start programs)',
