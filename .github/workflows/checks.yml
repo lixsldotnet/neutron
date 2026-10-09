@@ -1,0 +1,58 @@
+# Fast checks on every pull request and on main: script lint, all patches apply to
+# the pinned upstreams, and every commit is signed off (DCO, see CONTRIBUTING.md).
+name: checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: shellcheck
+        run: git ls-files -z '*.sh' tool/neutron | xargs -0 shellcheck -S warning
+      - name: bash -n
+        run: for f in $(git ls-files '*.sh' tool/neutron); do bash -n "$f"; done
+      - name: node --check
+        run: for f in $(git ls-files 'dev/*.js' 'dev/*.mjs'); do node --check "$f"; done
+
+  patches:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply all patches to the pinned upstreams
+        run: dev/check-patches.sh
+
+  dco:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Signed-off-by on every commit
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          missing=0
+          for c in $(git rev-list --no-merges "$BASE..$HEAD"); do
+            if ! git log -1 --format=%B "$c" | grep -q '^Signed-off-by: '; then
+              echo "::error::$(git log -1 --format='%h %s' "$c"): no Signed-off-by line, commit with git commit -s"
+              missing=1
+            fi
+          done
+          exit "$missing"

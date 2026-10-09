@@ -1,0 +1,112 @@
+# Full build from scratch on a macOS arm64 runner (build.sh), then the CPU-only
+# Windows tests that do not need a GPU (the runners have no Metal acceleration).
+# Takes about an hour, so it runs only for pull requests with the label "build", for
+# version tags, weekly and by hand. For a version tag (v*) it then publishes the
+# download: the repo files plus the built tool as neutron-macos-arm64.tar.xz in a
+# GitHub release of that tag.
+name: build
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  push:
+    tags: ['v*']
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'build')
+    runs-on: macos-15
+    timeout-minutes: 300
+    permissions:
+      contents: write   # the release of a version tag
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Newest Xcode and the Metal toolchain
+        run: |
+          xcode="$(find /Applications -maxdepth 1 -name 'Xcode_*.app' | sort -V | tail -1)"
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+          xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
+      - name: Homebrew packages
+        run: brew install bison flex autoconf cmake ninja meson pkgconf gnutls freetype
+      - name: Disk and CPUs
+        run: df -h . && sysctl -n hw.ncpu hw.memsize
+      - name: LLVM cache key
+        id: llvm
+        run: echo "key=llvm-$(sed -n '/LLVM_VERSION=/p;/llvm-darwin-arm64" \]; then/,/^fi/p' build.sh | shasum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: .native-build/toolchains/llvm-darwin-arm64
+          key: ${{ steps.llvm.outputs.key }}
+      - name: build.sh
+        run: ./build.sh
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            .native-build/**/*.log
+          if-no-files-found: ignore
+      - name: macOS version
+        run: sw_vers
+      - name: Wine sync semantics with and without msync
+        run: |
+          set -euo pipefail
+          dist="$PWD/.native-build/dist/neutron"
+          cc="$(find .native-build/toolchains -maxdepth 3 -path '*/bin/x86_64-w64-mingw32-clang' | head -1)"
+          "$cc" -O2 -o sync_semantics.exe tests/sync_semantics.c
+          for msync in 0 1; do
+            data="$RUNNER_TEMP/data-$msync"
+            mkdir -p "$data"
+            env SteamAppId=ci STEAM_COMPAT_DATA_PATH="$data" NEUTRON_FILES="$dist/files" NEUTRON_MSYNC=$msync \
+              "$dist/neutron" runinprefix "$PWD/sync_semantics.exe" | tr -d '\r' | tee "sync-$msync.txt" || true
+            # "sync_semantics: <passed>/<total> passed"
+            awk '/^sync_semantics:/ { split($2, n, "/"); ok = (n[1] == n[2]) } END { exit !ok }' "sync-$msync.txt"
+            WINEPREFIX="$data/pfx" "$dist/files/bin/wineserver" -k || true
+          done
+      - name: neutron log
+        if: always()
+        run: tail -n 80 "$HOME/Library/Logs/neutron/neutron-ci.log" || true
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: ~/Library/Logs/neutron/
+          if-no-files-found: ignore
+      - name: Package
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          pkg="$RUNNER_TEMP/pkg/neutron"
+          mkdir -p "$pkg/dist"
+          git archive HEAD | tar -x -C "$pkg"
+          cp -R .native-build/dist/neutron "$pkg/dist/neutron"
+          XZ_OPT=-T0 tar -C "$RUNNER_TEMP/pkg" -cJf neutron-macos-arm64.tar.xz neutron
+          shasum -a 256 neutron-macos-arm64.tar.xz > neutron-macos-arm64.tar.xz.sha256
+          ls -la neutron-macos-arm64.tar.xz
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          notes="neutron ${TAG}, built by GitHub Actions from ${commit:0:7}. Download neutron-macos-arm64.tar.xz, extract it and run ./install.sh in the neutron folder (needs Mac Steam and node 22: brew install node). Source of this build: https://github.com/${GITHUB_REPOSITORY}/tree/${commit} (build.sh pins the upstream versions, patches/ holds every change, NOTICES.md lists the licenses)."
+          gh release create "$TAG" --title "neutron $TAG" --notes "$notes" --prerelease \
+            neutron-macos-arm64.tar.xz neutron-macos-arm64.tar.xz.sha256

@@ -209,6 +209,8 @@ game() {
       STEAM_COMPAT_APP_ID="$appid" NEUTRON_FILES="$FILES" NEUTRON_FPS_LOG=1
     # GAME_ENV: extra "VAR=value" words for this profile (gwyfs: strict TSO)
     # shellcheck disable=SC2086
+    # GAME_ENV is a list of VAR=value words
+    # shellcheck disable=SC2086,SC2163
     [ -z "${GAME_ENV:-}" ] || export $GAME_ENV
     exec "$TOOL" waitforexitandrun "$game_dir/$exe" "$@"
   ) > /dev/null 2>&1 &

@@ -17,6 +17,10 @@ version and Mac you use. "Works" reports help too (which settings, how it runs).
    (game, appid, `tests/` program, benchmark numbers before and after).
 
 `main` only changes through pull requests; they are merged as one squash commit.
+Every pull request runs the quick checks (script lint, all patches apply, sign-off).
+The full macOS build takes about an hour on GitHub's runners, so it only runs when
+the pull request has the label `build` (maintainers set it for bigger patch
+changes), for version tags and once a week.
 
 ## AI tools
 

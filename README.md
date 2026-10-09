@@ -42,11 +42,21 @@ The Mac Steam client has Steam Play compiled in, it is only hidden. neutron turn
 
 More details are in [docs/neutron.md](docs/neutron.md).
 
-## Requirements
+## Download and install
 
-You need a Mac with Apple Silicon and macOS 15 or newer (tested only on macOS 27), and Mac Steam in `/Applications`, started once and logged in.
+Every version gets built by GitHub Actions. Download `neutron-macos-arm64.tar.xz` from the newest [release](https://github.com/lixsldotnet/neutron/releases), extract it and run the installer:
 
-For the build you need the full Xcode, not only the Command Line Tools, plus the Metal toolchain because DXMT compiles its shaders with it:
+```sh
+tar xf neutron-macos-arm64.tar.xz
+cd neutron
+./install.sh
+```
+
+You need a Mac with Apple Silicon and macOS 15 or newer (tested only on macOS 27), Mac Steam in `/Applications`, started once and logged in, and Node 22 or newer for the Steam hook (`brew install node`).
+
+## Requirements for building
+
+If you want to build it yourself you need the full Xcode, not only the Command Line Tools, plus the Metal toolchain because DXMT compiles its shaders with it:
 
 ```sh
 xcodebuild -downloadComponent MetalToolchain
@@ -66,7 +76,7 @@ The script downloads pinned versions of Wine, Proton (lsteamclient, steam_helper
 ## Install and uninstall
 
 ```sh
-./install.sh                     # installs .native-build/dist/neutron
+./install.sh                     # installs the download (dist/neutron) or your build (.native-build/dist/neutron)
 ./install.sh --dist <dir>        # installs another build
 ./install.sh --uninstall         # puts Steam.app back and removes neutron
 ```
@@ -172,7 +182,7 @@ The patches in `patches/` have the license of the project they patch. Wine and D
 
 The own files of the repo (scripts, the tool, tests, docs) are under the GNU Lesser General Public License 2.1 or later, see `LICENSE`. If you change neutron and give it to others, you have to publish your changes under the same license.
 
-I dont distribute binaries because of the lsteamclient license, please build neutron from source.
+The download contains the built parts of all these projects, also Valve's lsteamclient, like every Proton release does. `NOTICES.md` lists every part with its license and source, and the release notes name the commit the download was built from.
 
 ## Contributing
 

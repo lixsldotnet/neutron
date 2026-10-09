@@ -93,7 +93,6 @@ mach_steam_ipctool ALLOWED ALLOWED
 unix_other_socket ALLOWED DENIED
 "
 
-declare -a RES0 RES1
 for sb in 0 1; do
   rm -f /private/tmp/neutron-sbtest-exec-sh /private/tmp/neutron-sbtest-exec-start
   out="$(run "sb$sb" "$sb" "$HERE/sbtest.exe" "$HOME" "$STEAM_ROOT" "$CEF_PORT" "$OPEN_PORT" "$HERE/probe" 2>/dev/null | tr -d '\r')"

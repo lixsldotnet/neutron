@@ -19,7 +19,8 @@
 #
 # Usage: ./install.sh [--dist <dist/neutron>] [--dev] [--no-start] [--cef-port <port>]
 #        ./install.sh --uninstall      (puts Steam.app back, removes neutron, keeps game prefixes)
-#   --dist      tool folder from build.sh (default .native-build/dist/neutron)
+#   --dist      tool folder (default: dist/neutron in a release download,
+#               else .native-build/dist/neutron from build.sh)
 #   --dev       links tool/neutron from this repo instead of copying it (see below)
 #   --cef-port  CEF debug port of Steam (default 8080), the helper scripts read it
 #               from the start script
@@ -39,7 +40,9 @@ LOGS="$HOME/Library/Logs/neutron"
 STEAM_APP="/Applications/Steam.app"
 STEAM_BIN="$HOME/Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/MacOS"
 
+# A release download has the tool in dist/neutron, a source build in .native-build/dist/neutron.
 DIST="$ROOT/.native-build/dist/neutron"
+[ -d "$ROOT/dist/neutron" ] && DIST="$ROOT/dist/neutron"
 CEF_PORT=8080
 DEV=0 START=1 UNINSTALL=0
 
@@ -156,6 +159,8 @@ else
   [ -x "$DIST/neutron" ] && [ -d "$DIST/files" ] || die "no build at $DIST (run ./build.sh, or --dev)"
   cp -R "$DIST/files" "$TOOL_DIR/files"
   cp "$DIST/neutron" "$DIST/neutron.sb" "$DIST/peicon.py" "$DIST/compatibilitytool.vdf" "$DIST/toolmanifest.vdf" "$TOOL_DIR/"
+  # Downloaded files carry the quarantine flag, then Gatekeeper refuses Wine's libraries.
+  xattr -dr com.apple.quarantine "$TOOL_DIR" 2>/dev/null || true
 fi
 [ -f "$TOOL_DIR/neutron.env" ] || printf '# KEY=value lines for all games, e.g. NEUTRON_HUD=1\n' > "$TOOL_DIR/neutron.env"
 
