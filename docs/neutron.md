@@ -396,6 +396,38 @@ a user-space copy of the ntsync driver:
   ends; 512K objects, 32K threads. Off unless `NEUTRON_MSYNC=1` until tested with
   more games.
 
+## D3D11 CPU cost
+
+`dev/bench/d3d11_headless.c` renders offscreen like an engine (per draw a
+`Map(WRITE_DISCARD)` of a constant buffer, shader, texture, state switches;
+variants for `UpdateSubresource`, many bindings, instancing, per-draw state,
+deferred contexts) and prints app-thread submit time, process CPU per frame and an
+image hash. Profiled with xctrace (Time Profiler) and PE symbols. DXMT patches
+0019-0027, measured at 5000 draws per frame (median of 7 interleaved runs):
+app-thread time per frame 45 to 80% lower, FPS 2 to 6 times, images identical.
+
+- 0019: dynamic buffers and textures are no longer write-combined. The game's
+  x86 float code writes the mapped constant buffer, and FEX's FPCR write on the
+  next call into the ARM64EC DLL stalled on the write-combined stores (83% of the
+  app thread). Apple GPUs are cache coherent. `NEUTRON_DXMT_WRITE_COMBINED=1`
+  restores the old mode. Base variant: 2.66 to 0.62 ms per frame.
+- 0020: renames of small DEFAULT constant, vertex and index buffers
+  (`UpdateSubresource`) come from page suballocations instead of a new MTLBuffer
+  and a unix call each (thousands of `useResource` per frame, slow submits).
+- 0021, 0022: fewer refcount operations between the app and encoder threads;
+  replaced bindings are released once per chunk (`Texture::decRef` was 32% of the
+  encoder thread with many bindings).
+- 0023, 0027: the pipeline key hashes the blend state; a 64-entry per-context
+  cache sits in front of the device's pipeline map.
+- 0024: command data comes from a 64 KB span per chunk.
+- 0025, 0026: unchanged input layout, depth-stencil state and blend factor emit no
+  command; state setters use `static_cast` instead of a QueryInterface.
+- Left: FEX's FPCR toggling on every x64 to ARM64EC call after float code (26.7 ns
+  against 4.7 ns from integer code, 14-20% of the app thread); Wine's
+  `arm64x_check_call` on every indirect call in ARM64EC DLLs (4-7%); the syscall
+  dispatcher saving q0-q31 on every unix call; DXMT's encoder thread at about
+  120 ns per draw, half of it in the AGX driver.
+
 ## GPU passes
 
 Apple GPUs are tile based: every render pass boundary loads and stores the tiles it

@@ -1,0 +1,90 @@
+Map dynamic buffers and textures with the default CPU cache mode instead of write-combined.
+The game's x86_64 stores into write-combined memory stall FEX's FPCR write on the next call into
+the ARM64EC DLLs: headless bench 2.66 -> 0.62 ms submit per 5000 draws. NEUTRON_DXMT_WRITE_COMBINED=1 restores it.
+
+diff --git a/src/d3d11/d3d11_resource_helper.cpp b/src/d3d11/d3d11_resource_helper.cpp
+index a577e26..b95c893 100644
+--- a/src/d3d11/d3d11_resource_helper.cpp
++++ b/src/d3d11/d3d11_resource_helper.cpp
+@@ -415,7 +415,7 @@ CreateMTLTextureDescriptorInternal(
+     break;
+   case D3D11_USAGE_DYNAMIC:
+     options |=
+-        WMTResourceStorageModeShared | WMTResourceCPUCacheModeWriteCombined;
++        WMTResourceStorageModeShared | CpuWriteCombinedOption();
+     break;
+   case D3D11_USAGE_STAGING:
+     options |= WMTResourceStorageModeShared;
+diff --git a/src/dxmt/dxmt_allocation.hpp b/src/dxmt/dxmt_allocation.hpp
+index 327946d..3fc3990 100644
+--- a/src/dxmt/dxmt_allocation.hpp
++++ b/src/dxmt/dxmt_allocation.hpp
+@@ -20,9 +20,24 @@
+ 
+ #include <atomic>
+ #include <cstdint>
++#include <cstdlib>
++#include "winemetal.h"
+ 
+ namespace dxmt {
+ 
++/* neutron: CPU cache mode for resources the application maps (dynamic buffers and textures).
++   Write-combined memory makes the game's x86_64 stores (translated by FEX) followed by the next
++   call into the ARM64EC DLLs about 4x slower per draw; Apple GPUs are cache coherent, so the
++   default cache mode is correct too. NEUTRON_DXMT_WRITE_COMBINED=1 restores write-combined. */
++inline WMTResourceOptions
++CpuWriteCombinedOption() {
++  static const bool wc = [] {
++    const char *e = getenv("NEUTRON_DXMT_WRITE_COMBINED");
++    return e && *e == '1';
++  }();
++  return wc ? WMTResourceOptionCPUCacheModeWriteCombined : (WMTResourceOptions)0;
++}
++
+ class Allocation {
+ public:
+   void incRef();
+diff --git a/src/dxmt/dxmt_buffer.cpp b/src/dxmt/dxmt_buffer.cpp
+index 9a4139d..4df883d 100644
+--- a/src/dxmt/dxmt_buffer.cpp
++++ b/src/dxmt/dxmt_buffer.cpp
+@@ -172,7 +172,7 @@ Rc<BufferAllocation>
+ Buffer::allocate(Flags<BufferAllocationFlag> flags) {
+   WMTResourceOptions options = WMTResourceHazardTrackingModeUntracked;
+   if (flags.test(BufferAllocationFlag::CpuWriteCombined)) {
+-    options |= WMTResourceOptionCPUCacheModeWriteCombined;
++    options |= CpuWriteCombinedOption();
+   }
+   if (flags.test(BufferAllocationFlag::CpuInvisible)) {
+     options |= WMTResourceStorageModePrivate;
+@@ -191,7 +191,7 @@ Rc<BufferAllocation>
+ Buffer::allocate(Flags<BufferAllocationFlag> flags, WMT::Heap heap, uint64_t heap_offset) {
+   WMTResourceOptions options = WMTResourceHazardTrackingModeUntracked;
+   if (flags.test(BufferAllocationFlag::CpuWriteCombined)) {
+-    options |= WMTResourceOptionCPUCacheModeWriteCombined;
++    options |= CpuWriteCombinedOption();
+   }
+   if (flags.test(BufferAllocationFlag::CpuInvisible)) {
+     options |= WMTResourceStorageModePrivate;
+diff --git a/src/dxmt/dxmt_texture.cpp b/src/dxmt/dxmt_texture.cpp
+index 0e5b4bd..667ef65 100644
+--- a/src/dxmt/dxmt_texture.cpp
++++ b/src/dxmt/dxmt_texture.cpp
+@@ -179,7 +179,7 @@ Texture::allocate(Flags<TextureAllocationFlag> flags) {
+   WMTTextureInfo info = info_; // copy
+   info.mach_port = 0;
+   if (flags.test(TextureAllocationFlag::CpuWriteCombined)) {
+-    options |= WMTResourceOptionCPUCacheModeWriteCombined;
++    options |= CpuWriteCombinedOption();
+   }
+   if (flags.test(TextureAllocationFlag::CpuInvisible)) {
+     options |= WMTResourceStorageModePrivate;
+@@ -209,7 +209,7 @@ Texture::allocate(Flags<TextureAllocationFlag> flags, WMT::Heap heap, uint64_t h
+   WMTTextureInfo info = info_; // copy
+   info.mach_port = 0;
+   if (flags.test(TextureAllocationFlag::CpuWriteCombined)) {
+-    options |= WMTResourceOptionCPUCacheModeWriteCombined;
++    options |= CpuWriteCombinedOption();
+   }
+   if (flags.test(TextureAllocationFlag::CpuInvisible)) {
+     options |= WMTResourceStorageModePrivate;

@@ -26,6 +26,8 @@
 #   NEUTRON_RAW_MOUSE=0         raw input (mouse look) from the accelerated macOS
 #                               cursor deltas instead of the GCMouse device deltas
 #   NEUTRON_PRECISE_TIMERS=0    Sleep() through select() again instead of a kqueue timer
+#   NEUTRON_DXMT_WRITE_COMBINED=1  dynamic D3D11 buffers write-combined again (DXMT
+#                               patch 0019 turned it off, it stalled the game thread)
 #   NEUTRON_D3D12_SM6=1         D3D12 with shader model 6.6 / feature level 12_0 (DXIL shaders,
 #                               Unreal 5 -dx12); also lifts a game's forced -dx11
 #   NEUTRON_MSYNC=1             events, semaphores and mutexes in the game process (shared

@@ -1,0 +1,88 @@
+The graphics pipeline key hash left the blend state out, so all blend variants of a shader set shared
+one hash and a lookup compared blend descs by value (two GetDesc1 copies). Blend states now carry a
+hash of the compared fields; pixel shader + blend switch per draw: pipeline lookup 16% -> 6% of the app thread.
+
+diff --git a/src/d3d11/d3d11_pipeline.hpp b/src/d3d11/d3d11_pipeline.hpp
+index 1a9c4f4..c703abf 100644
+--- a/src/d3d11/d3d11_pipeline.hpp
++++ b/src/d3d11/d3d11_pipeline.hpp
+@@ -58,6 +58,10 @@ template <> struct hash<MTL_GRAPHICS_PIPELINE_DESC> {
+     state.add((size_t)v.InputLayout);
+     /* don't add blend */
+     // state.add((size_t)v.BlendState);
++    /* neutron: but its content: with pixel shader and blend state switching per draw, all blend
++       variants of a shader set shared one bucket and every lookup compared blend descs by value */
++    if (v.BlendState)
++      state.add(v.BlendState->GetPipelineHash(v.NumColorAttachments));
+     state.add((size_t)v.DepthStencilFormat);
+     state.add((size_t)v.TopologyClass);
+     state.add((size_t)v.IndexBufferFormat);
+diff --git a/src/d3d11/d3d11_state_object.cpp b/src/d3d11/d3d11_state_object.cpp
+index 403e42b..41fb2c2 100644
+--- a/src/d3d11/d3d11_state_object.cpp
++++ b/src/d3d11/d3d11_state_object.cpp
+@@ -261,9 +261,42 @@ public:
+          desc_.RenderTarget[0].SrcBlendAlpha >= D3D11_BLEND_SRC1_COLOR ||
+          desc_.RenderTarget[0].DestBlendAlpha >= D3D11_BLEND_SRC1_COLOR ||
+          desc_.RenderTarget[0].DestBlend >= D3D11_BLEND_SRC1_COLOR);
++    /* neutron: precompute the pipeline key hash. Only fields that equal_to<MTL_GRAPHICS_PIPELINE_DESC>
++       compares go in: the flags always, render target 0 unless independent blending with no color
++       attachment (then no target is compared); the other targets are left out, they are only
++       compared with independent blending. */
++    HashState flags;
++    flags.add(desc_.IndependentBlendEnable);
++    flags.add(desc_.AlphaToCoverageEnable);
++    pipeline_hash_flags_ = flags;
++    auto &rt = desc_.RenderTarget[0];
++    HashState rt0;
++    rt0.add(rt.RenderTargetWriteMask);
++    rt0.add(rt.BlendEnable);
++    rt0.add(rt.LogicOpEnable);
++    if (rt.BlendEnable) {
++      rt0.add(rt.BlendOp);
++      rt0.add(rt.BlendOpAlpha);
++      rt0.add(rt.SrcBlend);
++      rt0.add(rt.SrcBlendAlpha);
++      rt0.add(rt.DestBlend);
++      rt0.add(rt.DestBlendAlpha);
++    }
++    if (rt.LogicOpEnable)
++      rt0.add(rt.LogicOp);
++    pipeline_hash_rt0_ = rt0;
+   }
+   ~MTLD3D11BlendState() {}
+ 
++  size_t GetPipelineHash(uint32_t num_color_attachments) final {
++    if (desc_.IndependentBlendEnable && !num_color_attachments)
++      return pipeline_hash_flags_;
++    HashState state;
++    state.add(pipeline_hash_flags_);
++    state.add(pipeline_hash_rt0_);
++    return state;
++  }
++
+   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
+                                            void **ppvObject) final {
+     if (ppvObject == nullptr)
+@@ -358,6 +391,8 @@ public:
+ private:
+   const D3D11_BLEND_DESC1 desc_;
+   bool dual_source_blending_;
++  size_t pipeline_hash_flags_;
++  size_t pipeline_hash_rt0_;
+   MTLD3D10BlendState d3d10_;
+ };
+ 
+diff --git a/src/d3d11/d3d11_state_object.hpp b/src/d3d11/d3d11_state_object.hpp
+index f7c260e..82aedf4 100644
+--- a/src/d3d11/d3d11_state_object.hpp
++++ b/src/d3d11/d3d11_state_object.hpp
+@@ -28,6 +28,8 @@ DEFINE_COM_INTERFACE("279a1d66-2fc1-460c-a0a7-a7a5f2b7a48f",
+     : public ID3D11BlendState1 {
+   virtual bool IsDualSourceBlending() = 0;
+   virtual void SetupMetalPipelineDescriptor(WMTRenderPipelineBlendInfo* blend_info, uint32_t num_rt, uint32_t valid_rt) = 0;
++  /* neutron: hash of the fields equal_to<MTL_GRAPHICS_PIPELINE_DESC> compares */
++  virtual size_t GetPipelineHash(uint32_t num_color_attachments) = 0;
+ };
+ 
+ namespace std {

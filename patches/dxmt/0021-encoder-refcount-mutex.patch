@@ -1,0 +1,79 @@
+The encoder copied an Rc per constant buffer and per sampler bind (two atomics each), and the device
+mutex check was an out-of-line call twice per API call. Headless bench: +10% FPS, -12% process CPU.
+
+diff --git a/src/d3d11/d3d11_multithread.cpp b/src/d3d11/d3d11_multithread.cpp
+index df83a94..bbce467 100644
+--- a/src/d3d11/d3d11_multithread.cpp
++++ b/src/d3d11/d3d11_multithread.cpp
+@@ -6,9 +6,7 @@
+ 
+ namespace dxmt {
+ 
+-void d3d11_device_mutex::lock() {
+-  if (!protected_)
+-    return;
++void d3d11_device_mutex::lock_protected() {
+   uint32_t tid = dxmt::this_thread::get_id();
+   uint32_t expected = 0;
+   while(!owner_.compare_exchange_weak(expected, tid, std::memory_order_acquire)) {
+@@ -28,9 +26,7 @@ void d3d11_device_mutex::lock() {
+   }
+   counter_++;
+ }
+-void d3d11_device_mutex::unlock() noexcept {
+-  if (!protected_)
+-    return;
++void d3d11_device_mutex::unlock_protected() noexcept {
+   counter_--;
+   if (likely(counter_ == 0))
+     owner_.store(0, std::memory_order_release);
+diff --git a/src/d3d11/d3d11_multithread.hpp b/src/d3d11/d3d11_multithread.hpp
+index d863fa4..ea2b0c6 100644
+--- a/src/d3d11/d3d11_multithread.hpp
++++ b/src/d3d11/d3d11_multithread.hpp
+@@ -6,8 +6,17 @@ namespace dxmt {
+ 
+ class d3d11_device_mutex {
+ public:
+-  void lock();
+-  void unlock() noexcept;
++  /* neutron: inline the check for an unprotected device (the usual case), it runs twice per API call */
++  void lock() {
++    if (protected_)
++      lock_protected();
++  }
++  void unlock() noexcept {
++    if (protected_)
++      unlock_protected();
++  }
++  void lock_protected();
++  void unlock_protected() noexcept;
+ 
+   bool set_protected(bool Protected);
+   bool get_protected();
+diff --git a/src/dxmt/dxmt_context.cpp b/src/dxmt/dxmt_context.cpp
+index 0b7a0e5..b7298e2 100644
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -221,7 +221,7 @@ ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *refl
+         makeResident<stage, kind>(dummy_cbuffer_, GetResidencyMask<kind>(stage, true, false));
+         continue;
+       }
+-      auto argbuf = cbuf.buffer;
++      auto &argbuf = cbuf.buffer; /* neutron: no Rc copy, saves two atomics per constant buffer and draw */
+       auto valid_length = argbuf->length() > cbuf.offset ? argbuf->length() - cbuf.offset : 0;
+       auto [argbuf_alloc, argbuf_offset] = access<stage>(argbuf, cbuf.offset, valid_length, ResourceAccess::Read);
+       encoded_buffer[arg.StructurePtrOffset] = argbuf_alloc->gpuAddress() + argbuf_offset + cbuf.offset;
+diff --git a/src/dxmt/dxmt_context.hpp b/src/dxmt/dxmt_context.hpp
+index f744e21..2c60648 100644
+--- a/src/dxmt/dxmt_context.hpp
++++ b/src/dxmt/dxmt_context.hpp
+@@ -449,7 +449,7 @@ public:
+   bindSampler(unsigned slot, Rc<Sampler> sampler) {
+     unsigned idx = slot + 16 * unsigned(stage);
+     auto &entry = sampler_[idx];
+-    entry.sampler = sampler;
++    entry.sampler = std::move(sampler); /* neutron: move, a copy cost two more atomics per bind */
+   }
+ 
+   template <PipelineStage stage>
