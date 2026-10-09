@@ -26,6 +26,8 @@ LLVM_MINGW_VERSION="20260908"
 LLVM_MINGW_DIR="llvm-mingw-$LLVM_MINGW_VERSION-ucrt-macos-universal"
 MINGW_W64_REF="9f55f4a2d3b9783dab76d9808be3d6279b99ec2a" # the CRT llvm-mingw 20260908 was built from
 MONO_VERSION="11.3.0"                                   # MONO_VERSION in Wine's dlls/appwiz.cpl/addons.c
+SDL3_VERSION="3.4.18"                                   # game controllers for winebus (HIDAPI, GameController)
+SDL2_COMPAT_VERSION="2.32.74"                           # the SDL2 API winebus uses, on top of SDL3
 
 # The TEB lives in a pthread TSD slot (macOS clears x18), Wine publishes the slot
 # offset next to KUSER_SHARED_DATA, which has to sit above the 4 GB __PAGEZERO.
@@ -110,6 +112,34 @@ if [ ! -d "$LM" ]; then
 fi
 
 #-------------------------------------------------------------------------------
+#  SDL3 + sdl2-compat: winebus' SDL backend for game controllers
+#-------------------------------------------------------------------------------
+
+# winebus dlopens libSDL2-2.0.0.dylib and maps every pad SDL knows (Xbox, PlayStation,
+# Switch, MFi and its controller database) to an XInput gamepad, with rumble. Built
+# here for the deployment target (Homebrew bottles need the newest macOS) and bundled.
+SDLI="$WORK/sdl-install"
+if [ ! -f "$SDLI/lib/libSDL2-2.0.0.dylib" ]; then
+  mkdir -p "$SRC/sdl"
+  for p in "SDL/releases/download/release-$SDL3_VERSION/SDL3-$SDL3_VERSION" \
+           "sdl2-compat/releases/download/release-$SDL2_COMPAT_VERSION/sdl2-compat-$SDL2_COMPAT_VERSION"; do
+    [ -d "$SRC/sdl/${p##*/}" ] || { say "Fetching ${p##*/}"; curl -sfL "https://github.com/libsdl-org/$p.tar.gz" | tar xz -C "$SRC/sdl"; }
+  done
+  say "Building SDL3 and sdl2-compat (log: $WORK/sdl-build.log)"
+  sdl_cmake() {  # sdl_cmake <name> <cmake args...>
+    local name="$1"; shift
+    cmake -S "$SRC/sdl/$name" -B "$WORK/sdl-build/$name" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
+      -DCMAKE_INSTALL_PREFIX="$SDLI" -DCMAKE_PREFIX_PATH="$SDLI" "$@" \
+      && cmake --build "$WORK/sdl-build/$name" && cmake --install "$WORK/sdl-build/$name"
+  }
+  { sdl_cmake "SDL3-$SDL3_VERSION" -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TEST_LIBRARY=OFF \
+      -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF \
+    && sdl_cmake "sdl2-compat-$SDL2_COMPAT_VERSION" -DSDL2COMPAT_TESTS=OFF; } \
+    > "$WORK/sdl-build.log" 2>&1 || die "SDL build failed, see $WORK/sdl-build.log"
+fi
+
+#-------------------------------------------------------------------------------
 #  Wine (arm64 unix side, ARM64EC + aarch64 PE side) with lsteamclient
 #-------------------------------------------------------------------------------
 
@@ -144,8 +174,10 @@ if [ ! -f "$B/Makefile" ]; then
   (cd "$B" && "$W/configure" --enable-archs=arm64ec,aarch64 --without-x --without-gstreamer \
       --without-cups --without-sane --without-gphoto --without-krb5 --without-pcap --without-usb \
       --without-v4l2 --without-pulse --without-capi --without-opencl --without-inotify \
-      CFLAGS="-g -O2 $NATIVE_DEFS" CROSSCFLAGS="-g -O2 $NATIVE_DEFS" > configure.log 2>&1) \
+      CFLAGS="-g -O2 $NATIVE_DEFS" CROSSCFLAGS="-g -O2 $NATIVE_DEFS" \
+      SDL2_CFLAGS="-I$SDLI/include/SDL2" SDL2_LIBS="-L$SDLI/lib -lSDL2" > configure.log 2>&1) \
     || die "configure failed, see $B/configure.log"
+  grep -q '^#define SONAME_LIBSDL2 ' "$B/include/config.h" || die "configure did not find SDL2, see $B/configure.log"
 fi
 say "Building Wine (log: $B/make.log)"
 make -C "$B" -j"$JOBS" > "$B/make.log" 2>&1 || die "Wine build failed, see $B/make.log"
@@ -246,6 +278,9 @@ bundle_dylib() {  # bundle_dylib <path>
 }
 bundle_dylib "$(brew --prefix gnutls)/lib/libgnutls.30.dylib"
 bundle_dylib "$(brew --prefix freetype)/lib/libfreetype.6.dylib"
+# sdl2-compat dlopens SDL3 as libSDL3.dylib next to itself.
+cp "$SDLI/lib/libSDL2-2.0.0.dylib" "$SDLI/lib/libSDL3.0.dylib" "$FILES/lib/"
+ln -sf libSDL3.0.dylib "$FILES/lib/libSDL3.dylib"
 
 # Wine Mono, unpacked into share/wine/mono: Wine uses it from there without the
 # download prompt (a prompt nobody sees blocks the first start of a prefix).

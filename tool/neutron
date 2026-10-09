@@ -25,6 +25,10 @@
 #                               borderless fullscreen windows (default 1)
 #   NEUTRON_RAW_MOUSE=0         raw input (mouse look) from the accelerated macOS
 #                               cursor deltas instead of the GCMouse device deltas
+#   NEUTRON_PAD_HIDRAW=1        PlayStation and Switch pads as raw HID devices for games
+#                               with own support for them, not as XInput pads (winebus)
+#   NEUTRON_PAD_SYSTEM_GESTURES=1  Home/PS and Share buttons of pads do the macOS gestures
+#                               (Launchpad, Game Overlay, screenshot) instead of going to the game
 #   NEUTRON_PRECISE_TIMERS=0    Sleep() through select() again instead of a kqueue timer
 #   NEUTRON_FAST_QPC=0          QueryPerformanceCounter through the NT syscall again instead
 #                               of reading the counter in the game process
@@ -63,6 +67,8 @@
 #                               in screen pixels
 #   NEUTRON_BENCH_NOVSYNC=1     benchmarks only: DXMT draws the present pass offscreen
 #                               and never presents (dev/bench/run.sh)
+#   NEUTRON_PAD_VIRTUAL=1|<vid>:<pid>  tests only: winebus attaches a scripted SDL virtual
+#                               pad (tests/gamepad_list.c selftest)
 #
 # Set here for Wine and DXMT, not settings: NEUTRON_HUD_INFO, NEUTRON_APP_BUNDLE,
 # NEUTRON_NTDLL.

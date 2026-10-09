@@ -71,7 +71,7 @@ Node has to be version 22 or newer, the Steam hook uses its built-in WebSocket. 
 ./build.sh
 ```
 
-The script downloads pinned versions of Wine, Proton (lsteamclient, steam_helper), FEX, DXMT, LLVM 15 (for the shader converter of DXMT), llvm-mingw and Wine Mono, applies the patches from `patches/` and builds everything into `.native-build`. The result is the tool folder `.native-build/dist/neutron`. Steps that are done already get skipped, if you want to redo one delete its folder in `.native-build`. With `./build.sh <dir>` it uses another work dir.
+The script downloads pinned versions of Wine, Proton (lsteamclient, steam_helper), FEX, DXMT, LLVM 15 (for the shader converter of DXMT), llvm-mingw, Wine Mono and SDL (SDL3 with sdl2-compat, for game controllers), applies the patches from `patches/` and builds everything into `.native-build`. The result is the tool folder `.native-build/dist/neutron`. Steps that are done already get skipped, if you want to redo one delete its folder in `.native-build`. With `./build.sh <dir>` it uses another work dir.
 
 ## Install and uninstall
 
@@ -131,6 +131,8 @@ For one game use the Compatibility tab or put `NEUTRON_<NAME>=<value>` words int
 | `NEUTRON_NATIVE_FULLSCREEN` | `1` | Borderless fullscreen games get macOS native fullscreen and Game Mode. In the tab. |
 | `NEUTRON_FPS_LOG` | off | `1`: FPS and the slowest frame of every second in the game log. In the tab. |
 | `NEUTRON_RAW_MOUSE` | `1` | Mouse look from the device deltas of the mouse (no macOS acceleration). `0`: the cursor deltas of Wine. |
+| `NEUTRON_PAD_HIDRAW` | off | `1`: PlayStation and Switch pads reach the game as raw HID devices (like Proton without Steam Input), for games with own support for them (light bar, touchpad, gyro, adaptive triggers, PlayStation buttons in the UI). Then they are no XInput pad anymore, so games that only know XInput dont see them. Off: every pad is a XInput pad. |
+| `NEUTRON_PAD_SYSTEM_GESTURES` | off | `1`: the Home/PS and Share button of a pad do what macOS wants again (Launchpad, Game Overlay, screenshot) while the game is in front. Off: the game gets these buttons. |
 | `NEUTRON_PRECISE_TIMERS` | `1` | Precise `Sleep()` through kqueue timers. `0` turns it off. |
 | `NEUTRON_D3D12_SM6` | off | `1`: D3D12 reports shader model 6.6 and feature level 12_0 and DXIL shaders get translated (Unreal 5 games with `-dx12`). Also removes a forced `-dx11` of a game. Experimental. In the tab. |
 | `NEUTRON_MSYNC` | off | `1`: Windows events, semaphores and mutexes work inside the game process instead of going through wineserver (30 to 290 times faster). Experimental, set it in `neutron.env`. |
@@ -175,7 +177,7 @@ For bug reports please use the issue template and attach both logs.
 
 ## Credits
 
-neutron is mostly glue and patches around the work of other people. Big thx to [Wine](https://www.winehq.org), [FEX](https://github.com/FEX-Emu/FEX), [DXMT](https://github.com/3Shain/dxmt), [Proton](https://github.com/ValveSoftware/Proton) (lsteamclient, steam_helper), [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) and [mingw-w64](https://www.mingw-w64.org), [LLVM](https://llvm.org), [Wine Mono](https://github.com/madewokherd/wine-mono), and [GnuTLS](https://www.gnutls.org) and [FreeType](https://freetype.org) which are bundled into the runtime. The idea to put settings into the launch options comes from [NotProton](https://github.com/NotProtonNot/NotProton), and [Madeira](https://github.com/willfaust/Madeira) was my reference for running this stack on Darwin.
+neutron is mostly glue and patches around the work of other people. Big thx to [Wine](https://www.winehq.org), [FEX](https://github.com/FEX-Emu/FEX), [DXMT](https://github.com/3Shain/dxmt), [Proton](https://github.com/ValveSoftware/Proton) (lsteamclient, steam_helper), [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) and [mingw-w64](https://www.mingw-w64.org), [LLVM](https://llvm.org), [Wine Mono](https://github.com/madewokherd/wine-mono), and [GnuTLS](https://www.gnutls.org), [FreeType](https://freetype.org) and [SDL](https://www.libsdl.org) (SDL3 with [sdl2-compat](https://github.com/libsdl-org/sdl2-compat), for game controllers) which are bundled into the runtime. The idea to put settings into the launch options comes from [NotProton](https://github.com/NotProtonNot/NotProton), and [Madeira](https://github.com/willfaust/Madeira) was my reference for running this stack on Darwin.
 
 ## License
 

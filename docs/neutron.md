@@ -644,6 +644,80 @@ command buffer; the waste came from frames cut into several command buffers.
   Metal program reproduces it without DXMT. Compare images on an otherwise idle
   GPU.
 
+## Game controllers
+
+Games read pads through XInput (most), DirectInput, raw HID (SDL's and Unity's HID
+drivers, games with own PlayStation support) or Windows.Gaming.Input. In Wine all
+four sit on winebus.sys, which runs in `winedevice.exe` and has three backends:
+SDL, udev (Linux only) and IOHID (macOS). SDL maps every pad it knows to a HID
+gamepad with the XInput layout (winexinput.sys then makes the XInput device, VID/PID
+of the pad, name "Controller (XBOX 360 For Windows)" like on Windows); IOHID passes
+the raw HID device through. winebus keeps only one of the two per pad
+(`is_hidraw_enabled`): raw for DualShock 4, DualSense, Switch Pro and Joy-Cons and
+a list of flight sticks and wheels, SDL for the rest.
+
+Before: Wine was configured against whatever SDL2 headers Homebrew had (sdl2 is not
+in the build's package list) and dlopens `libSDL2-2.0.0.dylib`. On a Mac without
+Homebrew SDL `sdl_bus_init` logs "could not load libSDL2-2.0.0.dylib"; winebus still
+expects SDL to take Xbox and generic pads and dropped their IOHID devices ("ignoring
+hidraw device"), so they did not reach the game at all. PlayStation and Switch pads
+came through as raw HID only, which XInput-only games do not see (Proton relies on
+Steam Input for them, which the Mac client does not have for Windows games). With
+Homebrew's sdl2-compat it worked by chance, with bottles built for the newest macOS
+only.
+
+Now (`wine/pending-gamepad.diff`, `build.sh`):
+
+- SDL3 and sdl2-compat are built from pinned releases for the deployment target and
+  bundled (`files/lib`: `libSDL2-2.0.0.dylib`, `libSDL3.0.dylib`, `libSDL3.dylib`
+  link; sdl2-compat loads SDL3 from its own folder). configure gets their headers,
+  build.sh stops when Wine was configured without SDL. SDL drives Xbox (Bluetooth
+  and USB), DualShock 4, DualSense, Switch Pro and Joy-Con pairs through its HIDAPI
+  drivers (IOKit), MFi and other GameController pads through GameController, and
+  generic HID pads through IOKit with its controller database (unknown pads become
+  DirectInput joysticks). Rumble, trigger rumble (WGI impulse triggers) and the
+  macOS controller remapping (GameController pads) come with it. SDL environment
+  variables (`SDL_GAMECONTROLLERCONFIG` and the `SDL_JOYSTICK_*` hints) work from
+  `neutron.env`. SDL init costs about 40 ms in winedevice at prefix start.
+- PlayStation and Nintendo pads go through SDL as XInput pads too.
+  `NEUTRON_PAD_HIDRAW=1` gives the raw HID devices instead (Wine's default), for games
+  with own support (light bar, touchpad, gyro, adaptive triggers, glyphs).
+  services.exe starts winedevice with a fresh Windows environment, so the SDL bus
+  reads the variable from the Unix environment (`bus_options.pad_hidraw`).
+- Without libSDL2 winebus now takes the IOHID devices of all pads (SDL counts as
+  disabled when it fails to load), Xbox pads get XInput from their raw HID reports.
+- XInput rumble lasted 1 s: Wine's HID haptics have a 1000 ms cutoff and XInput only
+  sends changes, SDL stopped the motors when the duration ran out. On Windows it
+  lasts until the game changes it. The SDL backend passes duration 0 (until changed)
+  for cutoffs of 1 s or more.
+- `XInputGetBatteryInformation` returned `ERROR_NOT_SUPPORTED`; now wired/full for the
+  gamepad (no battery report through HID), disconnected for the headset.
+- `SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1`: winedevice never has the focus. SDL itself
+  sets `GCController.shouldMonitorBackgroundEvents` for its GameController pads.
+- Home/PS and Share buttons: macOS binds them to system gestures (Launchpad, Game
+  Overlay, screenshots) and applies them for the frontmost app, which is the game,
+  not winedevice. winemac.drv (`cocoa_gamepad.m`) sets
+  `preferredSystemGestureState = Disabled` on every button `isBoundToSystemGesture`
+  of every connected pad, so the game gets the guide button (`XInputGetStateEx`,
+  WGI) and macOS does not take the game out of fullscreen.
+  `NEUTRON_PAD_SYSTEM_GESTURES=1` keeps the macOS gestures.
+- Button layout: sdl2-compat keeps SDL2's default `SDL_GAMECONTROLLER_USE_BUTTON_LABELS=1`,
+  so on Nintendo pads the button labeled A is XInput A (by label, not by position).
+  `SDL_GAMECONTROLLER_USE_BUTTON_LABELS=0` in `neutron.env` maps by position.
+
+Testing without a pad: a virtual IOHID device (`IOHIDUserDeviceCreateWithProperties`)
+needs the restricted `com.apple.developer.hid.virtual.device` entitlement: unsigned it
+returns NULL, ad-hoc signed with the entitlement AMFI kills the process. So winebus
+has a test hook instead: `NEUTRON_PAD_VIRTUAL=1` (or `=<vid>:<pid>`) attaches an SDL
+virtual gamepad that runs a fixed button and axis sequence, echoes rumble as stick
+and trigger input and unplugs itself for a second on a magic rumble value.
+`tests/gamepad_list.c selftest` checks it in XInput, DirectInput, raw input and WGI,
+including hotplug and rumble held over 1 s (fails without the rumble fix);
+`selftest absent` with `054c:0ce6` and `NEUTRON_PAD_HIDRAW=1` checks the PlayStation
+policy. Real pads: `gamepad_list.exe`, `watch` and `rumble`. (sdl2-compat 2.32.74
+passes the SDL2 return value of a virtual pad's rumble callback to SDL3 as a bool, so
+the hook returns 1 for success.)
+
 ## Patches
 
 All third-party code is fetched at build time at a pinned version and patched
@@ -659,6 +733,7 @@ DXMT patches with `git apply`, all in file name order.
 | LLVM (for DXMT airconv) | 15.0.7 |
 | llvm-mingw | 20260908, CRT startup objects rebuilt from mingw-w64 9f55f4a |
 | Wine Mono | 11.3.0 |
+| SDL3, sdl2-compat | 3.4.18, 2.32.74 |
 
 | Patch | What |
 |---|---|
@@ -676,6 +751,7 @@ DXMT patches with `git apply`, all in file name order.
 | `wine/0012-server-qos-precise-timers` | Wineserver QoS, latency tier, kqueue sleep timers |
 | `wine/0013-win32u-recursive-display-lock` | Display lock recursive for its owner |
 | `wine/0014-winemac-raw-mouse` | Raw mouse input from GameController `GCMouse` |
+| `wine/pending-gamepad.diff` | Game controllers: PlayStation/Nintendo pads as XInput through SDL (`NEUTRON_PAD_HIDRAW`), IOHID pads without SDL, XInput rumble held, battery, Home/Share gestures off (`NEUTRON_PAD_SYSTEM_GESTURES`), `NEUTRON_PAD_VIRTUAL` (to be split into the series) |
 | `wine/pending-qpc.diff` | QPC in PE code from the commpage, no OpenGL load for the GPU list, faster font enumeration (to be split into the series) |
 | `proton/0001-lsteamclient-macos` | lsteamclient on macOS: optional exports, libc++, key map, `NEUTRON_STEAMCLIENT_DYLIB` |
 | `proton/0002-lsteamclient-link-libcxx` | Links lsteamclient.so against libc++ |
@@ -711,3 +787,9 @@ DXMT patches with `git apply`, all in file name order.
 - Direct presentation: the changes in dxmt 0010 and 0011 still need to be
   verified on screen with `dev/direct-test.sh`.
 - D3D12 support is being worked on; a section on it will follow.
+- Game controllers are only tested with SDL's virtual pad so far. Open with real
+  pads: Xbox over USB and other pads SDL reads through GameController (winedevice is
+  a background process, SDL sets `shouldMonitorBackgroundEvents`), whether the
+  disabled Home button gesture holds in native fullscreen, DualSense and Switch Pro
+  rumble through SDL's HIDAPI drivers, `NEUTRON_PAD_HIDRAW=1` with a game that has own
+  PlayStation support.
