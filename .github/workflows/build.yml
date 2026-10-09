@@ -1,13 +1,14 @@
 # Full build from scratch on a macOS arm64 runner (build.sh), then the CPU-only
 # Windows tests that do not need a GPU (the runners have no Metal acceleration).
-# Runs for pull requests that change the build, the patches or the tool, weekly, and
-# by hand. For a version tag (v*) it then publishes the download: the repo files plus
-# the built tool as neutron-macos-arm64.tar.xz in a GitHub release of that tag.
+# Takes about an hour, so it runs only for pull requests with the label "build", for
+# version tags, weekly and by hand. For a version tag (v*) it then publishes the
+# download: the repo files plus the built tool as neutron-macos-arm64.tar.xz in a
+# GitHub release of that tag.
 name: build
 
 on:
   pull_request:
-    paths: ['build.sh', 'patches/**', 'tool/**', 'tests/sync_semantics.c', '.github/workflows/build.yml']
+    types: [opened, synchronize, reopened, labeled]
   push:
     tags: ['v*']
   schedule:
@@ -23,6 +24,7 @@ concurrency:
 
 jobs:
   build:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'build')
     runs-on: macos-15
     timeout-minutes: 300
     permissions:
