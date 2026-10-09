@@ -482,6 +482,9 @@ setup_app_bundle() {
        && sips -z 256 256 "$tmp/icon.png" --out "$tmp/icon.png" >/dev/null 2>&1 \
        && sips -s format icns "$tmp/icon.png" --out "$app/Contents/Resources/AppIcon.icns" >/dev/null 2>&1; then
       plutil -replace CFBundleIconFile -string AppIcon "$app/Contents/Info.plist"
+    elif [ -f "$src/Contents/Resources/AppIcon.icns" ]; then
+      # no icon in the exe: the neutron icon of the runtime's bundle
+      cp "$src/Contents/Resources/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
     fi
     rm -rf "$tmp"
     printf '%s' "$stamp" > "$app/neutron-stamp"

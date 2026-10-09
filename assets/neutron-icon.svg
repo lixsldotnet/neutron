@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- neutron app icon: macOS tile (824 px, 100 px margin), one particle with an orbit -->
+  <defs>
+    <radialGradient id="bg" cx="0.5" cy="0.42" r="0.68">
+      <stop offset="0" stop-color="#2a3752"/>
+      <stop offset="1" stop-color="#0a0e16"/>
+    </radialGradient>
+    <radialGradient id="core" cx="0.42" cy="0.38" r="0.7">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#dfe6f5"/>
+    </radialGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <circle cx="512" cy="512" r="250" fill="none" stroke="#3c4c6a" stroke-width="17"/>
+  <path d="M512 262 A250 250 0 0 1 740 410" fill="none" stroke="#9fb4ff" stroke-width="17" stroke-linecap="round"/>
+  <circle cx="679" cy="326" r="37" fill="#9fb4ff"/>
+  <circle cx="512" cy="512" r="163" fill="url(#core)"/>
+  <circle cx="512" cy="512" r="163" fill="none" stroke="#9fb4ff" stroke-width="17"/>
+</svg>

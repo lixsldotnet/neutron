@@ -225,6 +225,107 @@
 
   g_PopupManager.AddPopupCreatedCallback(popup => setTimeout(() => watch(popup), 0));
   for (const popup of g_PopupManager.m_mapPopups.values()) watch(popup);
+
+  // In the library list, a small icon right of each game name: the neutron logo when
+  // the game runs through neutron, the Apple logo for a native Mac game. The list is
+  // virtualized (Steam reuses rows when scrolling), so a tick once a second checks the
+  // visible rows; a MutationObserver on Steam's main window kept its UI thread busy
+  // before. Kinds come from the app details, cached for 30 s.
+  // The neutron app icon drawn for row height (16 px grid): its tile, the orbit with the
+  // blue arc and electron, the white core. The Apple badge uses the same 16 px tile.
+  // Colors as inline !important styles: Steam's library CSS paints every circle and
+  // path in the list semi-transparent white, which beats presentation attributes.
+  const paint = (fill, stroke) => `style="fill:${fill} !important;stroke:${stroke} !important"`;
+  const MARK = '<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" style="display:block">' +
+    `<rect width="16" height="16" rx="4" ${paint('#2a3752', 'none')}/>` +
+    `<circle cx="8" cy="8" r="5.3" stroke-width="1.3" ${paint('none', '#6a7ca0')}/>` +
+    `<path d="M8 2.7 A5.3 5.3 0 0 1 12.9 5.8" stroke-width="1.3" stroke-linecap="round" ${paint('none', '#9fb4ff')}/>` +
+    `<circle cx="11.75" cy="4.25" r="1.45" ${paint('#9fb4ff', 'none')}/>` +
+    `<circle cx="8" cy="8" r="3" ${paint('#f5f7fb', 'none')}/></svg>`;
+  const kinds = new Map();   // appid -> { kind: 'neutron' | 'mac' | '', at }
+  const pending = new Set();
+  const kindOf = appid => {
+    const hit = kinds.get(appid);
+    if (hit && Date.now() - hit.at < 30000) return hit.kind;
+    if (!pending.has(appid)) {
+      pending.add(appid);
+      details(appid).then(d => {
+        const kind = isNeutron(d.strCompatToolName) ? 'neutron'
+          : (d.vecPlatforms || []).includes('osx') && !d.strCompatToolName ? 'mac' : '';
+        kinds.set(appid, { kind, at: Date.now() });
+      }).finally(() => pending.delete(appid));
+    }
+    return hit ? hit.kind : null;
+  };
+  const rowAppid = row => {
+    const fk = Object.keys(row).find(k => k.startsWith('__reactFiber'));
+    for (let f = fk && row[fk], n = 0; f && n < 4; f = f.return, n++) {
+      const p = f.memoizedProps;
+      if (p && typeof p === 'object' && typeof p.appid === 'number') return p.appid;
+    }
+    return 0;
+  };
+  const listTick = () => {
+    const main = [...g_PopupManager.m_mapPopups.values()].find(p => /^SP Desktop/.test(p.m_strName || ''));
+    const doc = main && main.m_popup && main.m_popup.document;
+    if (!doc) return;
+    for (const grid of doc.querySelectorAll('.ReactVirtualized__Grid__innerScrollContainer')) {
+      // redraw right on scroll (one tick per frame), the 1 s tick stays as a fallback
+      const scroller = grid.parentElement;
+      if (scroller && !scroller.__neutronScroll) {
+        scroller.__neutronScroll = true;
+        let queued = false;
+        scroller.addEventListener('scroll', () => {
+          if (queued) return;
+          queued = true;
+          main.m_popup.requestAnimationFrame(() => { queued = false; try { listTick(); } catch (e) { /* list changed */ } });
+        }, { passive: true });
+      }
+      for (const panel of grid.children) {
+        // a game row: Panel > div > div > row (icon, name, status); category rows have no appid
+        const row = panel.firstElementChild && panel.firstElementChild.firstElementChild &&
+          panel.firstElementChild.firstElementChild.firstElementChild;
+        if (!row) continue;
+        const appid = rowAppid(row);
+        let icon = row.querySelector(':scope > [data-neutron-kind]');
+        const kind = appid ? kindOf(appid) : '';
+        if (kind === null) continue;   // details pending, next tick
+        if (icon && (icon.dataset.neutronApp !== String(appid) || icon.dataset.neutronKind !== kind)) { icon.remove(); icon = null; }
+        if (icon || !kind) continue;
+        // a small tile, the same for both kinds: 16 px, the glyph centered at 12 px
+        icon = doc.createElement('span');
+        icon.dataset.neutronApp = String(appid);
+        icon.dataset.neutronKind = kind;
+        icon.style.cssText = 'margin-left:auto;margin-right:8px;flex:none;width:16px;height:16px;' +
+          'display:flex;align-items:center;justify-content:center;border-radius:4px;' +
+          'background:rgba(255,255,255,0.08);color:#b8c1cc';
+        if (kind === 'neutron') {
+          icon.innerHTML = MARK;
+          icon.style.background = 'none';
+          icon.title = 'Runs through neutron';
+        } else {
+          icon.textContent = '\uF8FF';   // Apple logo in the macOS system font
+          icon.style.font = '12px/1 -apple-system, "SF Pro Text", sans-serif';
+          icon.style.paddingBottom = '1px';
+          icon.title = 'Native Mac game';
+        }
+        row.appendChild(icon);
+      }
+    }
+  };
+  // Kinds of the whole library in the background at start, so rows that scroll into
+  // view have their icon right away.
+  (async () => {
+    const all = (window.collectionStore?.allGamesCollection?.allApps || []).map(a => a.appid);
+    for (let i = 0; i < all.length; i += 8) {
+      await Promise.all(all.slice(i, i + 8).map(id => {
+        kindOf(id);
+        return new Promise(r => setTimeout(r, 30));
+      }));
+    }
+  })();
+  window.__neutronList = setInterval(() => { try { listTick(); } catch (e) { /* list changed meanwhile */ } }, 1000);
+
   window.__neutronPanel = true;
   return 'installed';
 })()

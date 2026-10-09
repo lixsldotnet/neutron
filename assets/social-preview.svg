@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640">
+  <!-- GitHub social preview (Settings, General, Social preview) -->
+  <defs>
+    <radialGradient id="bg" cx="0.3" cy="0.4" r="0.9">
+      <stop offset="0" stop-color="#1f2a40"/>
+      <stop offset="1" stop-color="#080b11"/>
+    </radialGradient>
+  </defs>
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <g transform="translate(130 150) scale(0.53)">
+    <circle cx="320" cy="320" r="300" fill="none" stroke="#5a6b8c" stroke-width="20"/>
+    <path d="M320 20 A300 300 0 0 1 594 198" fill="none" stroke="#9fb4ff" stroke-width="20" stroke-linecap="round"/>
+    <circle cx="521" cy="97" r="44" fill="#9fb4ff"/>
+    <circle cx="320" cy="320" r="196" fill="#f5f7fb"/>
+    <circle cx="320" cy="320" r="196" fill="none" stroke="#9fb4ff" stroke-width="20"/>
+  </g>
+  <text x="560" y="300" fill="#f5f7fb" font-family="-apple-system, Helvetica Neue, Helvetica, Arial, sans-serif" font-size="112" font-weight="600">neutron</text>
+  <text x="564" y="372" fill="#9fb4ff" font-family="-apple-system, Helvetica Neue, Helvetica, Arial, sans-serif" font-size="34">Windows games in the Mac Steam client</text>
+  <text x="564" y="420" fill="#8b97ad" font-family="-apple-system, Helvetica Neue, Helvetica, Arial, sans-serif" font-size="28">Apple Silicon, no Rosetta, open source</text>
+</svg>

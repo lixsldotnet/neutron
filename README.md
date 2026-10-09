@@ -1,6 +1,8 @@
-# neutron
+<p align="center"><img src="assets/neutron-icon.svg" width="160" alt="neutron logo"></p>
 
-A Proton-style Steam compat tool for macOS on Apple Silicon.
+<h1 align="center">neutron</h1>
+
+<p align="center">A Proton-style Steam compat tool for macOS on Apple Silicon.</p>
 
 With neutron the normal Mac Steam client can install and run Windows games, like Proton does on Linux and the Steam Deck. Steam downloads the Windows version of the game and starts it through neutron. Under the hood its arm64 Wine with ARM64EC system DLLs, FEX for the x86_64 code of the game, DXMT for Direct3D on Metal and the Steam bridge from Proton, which talks to the Steam client you already run. There is no second Windows Steam inside Wine and no Rosetta. neutron is my own project, it is not Valve's Proton.
 
@@ -113,7 +115,7 @@ In the sandbox Documents, Desktop and the other user folders of the game become 
 
 Games without a Mac version get mapped to neutron automatically, at every Steam start and every 30 seconds while Steam runs. If you set a game back to none it stays none. Mac games are not touched. Installed neutron games get the Steam setting "only update this game when I launch it", because Steam would otherwise delete and download them again at every start (see docs). They still get their updates at every Steam start, the hook starts them.
 
-The Properties dialog of every game has a Compatibility tab (the hook adds it) where you pick the compat tool for the game (Neutron or none) and the neutron settings.
+The Properties dialog of every game has a Compatibility tab (the hook adds it) where you pick the compat tool for the game (Neutron or none) and the neutron settings. In the library list every game that runs through neutron has a small neutron logo right of its name, native Mac games the Apple logo.
 
 Careful: if you set a installed game without Mac version to none, Steam deletes its files, because there is no Mac version to keep. Uninstall the game first if thats what you want.
 

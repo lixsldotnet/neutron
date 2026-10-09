@@ -270,6 +270,8 @@ cp "$WORK/fex-unixlib/libarm64ecfex.so" "$UNIX/"
 mkdir -p "$UNIX/Neutron.app/Contents/MacOS"
 cp "$UNIX/wine" "$UNIX/Neutron.app/Contents/MacOS/wine"
 cp "$ROOT/tool/Neutron-Info.plist" "$UNIX/Neutron.app/Contents/Info.plist"
+mkdir -p "$UNIX/Neutron.app/Contents/Resources"
+cp "$ROOT/tool/neutron.icns" "$UNIX/Neutron.app/Contents/Resources/AppIcon.icns"
 
 # Wine dlopens GnuTLS and FreeType by soname. Bundle them with their Homebrew
 # dependencies; the tool puts files/lib first in DYLD_FALLBACK_LIBRARY_PATH,

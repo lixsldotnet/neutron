@@ -105,6 +105,13 @@ and `dev/steam-hook.sh` do the following at every Steam start:
    game properties through `g_PopupManager` popup callbacks: the tool for the
    game (Neutron or none) and the neutron settings. If Steam shows its own
    Compatibility page, the settings go into that page instead.
+   The same script marks the library list: right of each game name a 16 px
+   badge, the neutron icon for games mapped to neutron and the Apple logo (system
+   font glyph) for native Mac games. The list is virtualized, so a tick once a
+   second plus a scroll listener fix the visible rows; the kinds of the whole
+   library are loaded in the background at start. Steam's library CSS paints every
+   SVG circle and path semi-transparent white, so the icon colors are inline
+   `!important` styles.
 9. **UI reloads.** Steam reloads its SharedJSContext now and then (new
    `CLIENT_SESSION`), which drops the tab and the new-game watch.
    `steam-hook.sh` keeps running while Steam runs and injects both again
