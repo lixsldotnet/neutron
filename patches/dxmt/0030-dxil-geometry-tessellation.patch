@@ -52,7 +52,7 @@ index 726110e..e80c537 100644
      const ShaderInfo *shader_info, air::FunctionSignatureBuilder &func_signature, llvm::Module &module,
      uint32_t argbuffer_constant_slot = SM50_BINDING_INDEX_CONSTANT_BUFFER, uint32_t argbuffer_slot = SM50_BINDING_INDEX_ARGUMENT_TABLE
 diff --git a/src/airconv/dxbc_converter_gs.cpp b/src/airconv/dxbc_converter_gs.cpp
-index d237b9d..a792a6a 100644
+index d237b9d..14c7580 100644
 --- a/src/airconv/dxbc_converter_gs.cpp
 +++ b/src/airconv/dxbc_converter_gs.cpp
 @@ -496,7 +496,7 @@ convert_dxbc_geometry_shader(
@@ -64,12 +64,13 @@ index d237b9d..a792a6a 100644
    if (auto err = real_entry.takeError()) {
      return err;
    }
-@@ -778,7 +778,7 @@ convert_dxbc_vertex_for_geometry_shader(
+@@ -778,7 +778,8 @@ convert_dxbc_vertex_for_geometry_shader(
      return err;
    }
  
 -  auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
-+  auto real_entry = convert_body(const_cast<SM50ShaderInternal *>(pShaderInternal), ctx, epilogue_bb); /* neutron: or DXIL */
++  /* neutron: or DXIL */
++  auto real_entry = convert_body(const_cast<SM50ShaderInternal *>(pShaderInternal), ctx, epilogue_bb);
    if (auto err = real_entry.takeError()) {
      return err;
    }
@@ -105,7 +106,7 @@ index fc907cb..c6d09dd 100644
      return err;
    }
 diff --git a/src/airconv/dxil_converter.cpp b/src/airconv/dxil_converter.cpp
-index 0736ac7..5c715ad 100644
+index 0736ac7..db4a802 100644
 --- a/src/airconv/dxil_converter.cpp
 +++ b/src/airconv/dxil_converter.cpp
 @@ -159,6 +159,16 @@ enum : uint32_t {
@@ -414,7 +415,7 @@ index 0736ac7..5c715ad 100644
        v = B.CreateLoad(B.getInt32Ty(), ptr);
      }
      if (ty->isFloatTy())
-@@ -1973,7 +2181,69 @@ private:
+@@ -1973,7 +2181,74 @@ private:
      auto reg = B.CreateAdd(B.getInt32(e->start_row), call->getArgOperand(2));
      auto col = B.CreateAdd(B.getInt32(e->start_col), B.CreateZExt(call->getArgOperand(3), B.getInt32Ty()));
      auto file_ty = ctx->resource.output.ptr_int4->getType()->getNonOpaquePointerElementType();
@@ -422,7 +423,9 @@ index 0736ac7..5c715ad 100644
 +    /* neutron: hull control point outputs are [control point][register] */
 +    if (llvm::cast<llvm::ArrayType>(file_ty)->getElementType()->isArrayTy())
 +      B.CreateStore(
-+          v, B.CreateGEP(file_ty, ctx->resource.output.ptr_int4, {B.getInt32(0), ctx->resource.thread_id_in_patch, reg, col})
++          v, B.CreateGEP(
++                 file_ty, ctx->resource.output.ptr_int4, {B.getInt32(0), ctx->resource.thread_id_in_patch, reg, col}
++             )
 +      );
 +    else
 +      B.CreateStore(v, B.CreateGEP(file_ty, ctx->resource.output.ptr_int4, {B.getInt32(0), reg, col}));
@@ -442,7 +445,8 @@ index 0736ac7..5c715ad 100644
 +
 +  llvm::Error
 +  load_register(
-+      llvm::CallInst *call, const std::vector<SigElement> *list, llvm::Value *file, llvm::Value *cp, llvm::Value *&result
++      llvm::CallInst *call, const std::vector<SigElement> *list, llvm::Value *file, llvm::Value *cp,
++      llvm::Value *&result
 +  ) {
 +    auto e = find_element(list, (uint32_t)llvm::cast<llvm::ConstantInt>(call->getArgOperand(1))->getZExtValue());
 +    if (!e || e->start_row < 0 || !file)
@@ -450,7 +454,8 @@ index 0736ac7..5c715ad 100644
 +    auto reg = B.CreateAdd(B.getInt32(e->start_row), call->getArgOperand(2));
 +    auto col = B.CreateAdd(B.getInt32(e->start_col), B.CreateZExt(call->getArgOperand(3), B.getInt32Ty()));
 +    auto file_ty = file->getType()->getNonOpaquePointerElementType();
-+    auto ptr = cp ? B.CreateGEP(file_ty, file, {B.getInt32(0), cp, reg, col}) : B.CreateGEP(file_ty, file, {B.getInt32(0), reg, col});
++    auto ptr = cp ? B.CreateGEP(file_ty, file, {B.getInt32(0), cp, reg, col})
++                  : B.CreateGEP(file_ty, file, {B.getInt32(0), reg, col});
 +    llvm::Value *v = B.CreateLoad(B.getInt32Ty(), ptr);
 +    auto ty = call->getType();
 +    if (ty->isFloatTy())
@@ -467,7 +472,8 @@ index 0736ac7..5c715ad 100644
 +
 +  llvm::Error
 +  store_patch_constant(llvm::CallInst *call) {
-+    auto e = find_element(patch_constants, (uint32_t)llvm::cast<llvm::ConstantInt>(call->getArgOperand(1))->getZExtValue());
++    auto id = (uint32_t)llvm::cast<llvm::ConstantInt>(call->getArgOperand(1))->getZExtValue();
++    auto e = find_element(patch_constants, id);
 +    auto file = ctx->resource.patch_constant_output.ptr_int4;
 +    if (!e || e->start_row < 0 || !file)
 +      return unsupported("storePatchConstant: unknown signature element");
@@ -485,7 +491,7 @@ index 0736ac7..5c715ad 100644
      return llvm::Error::success();
    }
  
-@@ -2661,11 +2931,13 @@ EmitBody(SM50ShaderInternal *shader, struct dxbc::context &ctx, llvm::BasicBlock
+@@ -2661,11 +2936,13 @@ EmitBody(SM50ShaderInternal *shader, struct dxbc::context &ctx, llvm::BasicBlock
      if (auto err = read_resources(dmod, &scratch, table))
        return std::move(err);
    }
@@ -500,7 +506,7 @@ index 0736ac7..5c715ad 100644
      }
    }
  
-@@ -2685,32 +2957,76 @@ EmitBody(SM50ShaderInternal *shader, struct dxbc::context &ctx, llvm::BasicBlock
+@@ -2685,32 +2962,78 @@ EmitBody(SM50ShaderInternal *shader, struct dxbc::context &ctx, llvm::BasicBlock
      gv.replaceAllUsesWith(ngv);
    }
  
@@ -583,7 +589,9 @@ index 0736ac7..5c715ad 100644
 +    builder.SetInsertPoint(write_cp);
 +    auto src = res.hull_cp_passthrough_src;
 +    if (src->getType()->getNonOpaquePointerElementType() != res.hull_cp_passthrough_type)
-+      src = builder.CreateBitCast(src, res.hull_cp_passthrough_type->getPointerTo(src->getType()->getPointerAddressSpace()));
++      src = builder.CreateBitCast(
++          src, res.hull_cp_passthrough_type->getPointerTo(src->getType()->getPointerAddressSpace())
++      );
 +    builder.CreateStore(builder.CreateLoad(res.hull_cp_passthrough_type, src), res.hull_cp_passthrough_dst);
 +    builder.CreateBr(write_end);
 +    builder.SetInsertPoint(write_end);
@@ -598,7 +606,7 @@ index 0736ac7..5c715ad 100644
    auto saved_ip = builder.saveIP();
  
    /* static globals: constant ones go to the constant address space, mutable
-@@ -2741,6 +3057,7 @@ EmitBody(SM50ShaderInternal *shader, struct dxbc::context &ctx, llvm::BasicBlock
+@@ -2741,6 +3064,7 @@ EmitBody(SM50ShaderInternal *shader, struct dxbc::context &ctx, llvm::BasicBlock
    lowering.ctx = &ctx;
    lowering.inputs = &inputs;
    lowering.outputs = &outputs;

@@ -359,13 +359,44 @@ supported on your system".
 - 0015: `d3d12.shaderModel = 66` (DXMT config, `NEUTRON_D3D12_SM6=1` in the tool)
   reports FL 12_0, SM 6.6, binding tier 3, wave ops, Int64 and Atomic64. Default
   stays SM 5.1.
+- 0029: geometry, hull and domain shaders, emulated like DXMT's D3D11 does: a Metal
+  mesh pipeline with the VS (or VS+HS) as object function and the GS (or DS) as mesh
+  function. The object function depends on the draw (index format, strip topology), so
+  a PSO builds these variants on first use (the non-indexed list one at creation, so a
+  shader the emulation cannot handle fails `CreateGraphicsPipelineState`). A GS that
+  only passes through the render target array or viewport index is folded into the VS.
+  Root parameters with GEOMETRY, HULL or DOMAIN visibility go to the object and mesh
+  stages.
+- 0030: the same for DXIL: GS emit, cut, `SV_GSInstanceID` and `SV_PrimitiveID`; HS with
+  the control point function on the threads of a patch and the patch constant function
+  on its first thread after a barrier; DS domain location and patch constants.
+- 0028: hull shaders from vkd3d-shader (Wine's `D3DCompile`, which games that compile
+  HLSL at run time get) index control points with `vOutputControlPointID` itself; the
+  converter crashed on them, D3D11 included.
+- 0031: queries, bundles and the command list methods that aborted. Occlusion and
+  binary occlusion count into the query heap's buffer, used as visibility result buffer
+  of the render pass (slot 0 stays unused: every such pass also writes offset 0).
+  Timestamps: a blit pass samples the GPU clock (nanoseconds, matches
+  `GetTimestampFrequency`) into a counter sample buffer; Metal fills the samples only
+  once their command buffer has completed, so a timestamp `ResolveQueryData` waits on
+  an event the queue signals after that completion (a GPU bubble when it is in the same
+  frame). Pipeline and stream output statistics resolve to zeros. `ExecuteBundle`
+  replays the bundle's calls on the calling list. Buffer to buffer `CopyTextureRegion`,
+  `WriteBufferImmediate`, `ResolveSubresourceRegion` for whole regions, and
+  `DiscardResource` (DontCare store of the pass that just wrote the texture and load in
+  the pass right after, like D3D11's 0016).
 - Tests (headless): `tests/d3d12_caps.c` reproduces Unreal 5's adapter checks,
   `tests/d3d12_dxil_*.c` cover compute, draw, MRT, ops, descriptor heap indexing,
-  64-bit atomics and PSO creation. 204 of 243 vkd3d-proton SM6 test shaders convert.
-- Missing: geometry, hull and domain shaders in DXMT's D3D12 (DXBC too), 16-bit
-  shader types, doubles, other 64-bit atomics, SM 6.7+, mesh shaders, ray tracing;
-  `ResolveQueryData` is a no-op; no D3D12 shader cache (DXIL is converted for every
-  PSO). Not yet run with a real Unreal 5 game.
+  64-bit atomics, PSO creation, geometry and tessellation shaders; `tests/d3d12_gs.c`,
+  `tests/d3d12_tess.c` (DXBC), `tests/d3d12_queries.c` and `tests/d3d12_cmdlist.c`.
+  204 of 243 vkd3d-proton SM6 test shaders convert.
+- Missing: stream output, a GS after tessellation (unless pass-through), tessellator
+  point and line output, isolines, `ExecuteIndirect` with GS or tessellation pipelines
+  (skipped with a warning), 16-bit shader types, doubles, other 64-bit atomics, SM 6.7+,
+  mesh shaders, ray tracing; no D3D12 shader cache (DXIL is converted for every PSO).
+  An occlusion query that spans render passes keeps only the count of the last one,
+  and queries of two heaps in one render pass count only the first heap. Partial
+  `ResolveSubresourceRegion` is skipped. Not yet run with a real Unreal 5 game.
 
 ## msync
 
