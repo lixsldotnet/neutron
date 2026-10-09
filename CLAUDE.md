@@ -64,6 +64,14 @@ work dir to redo a step.
 | `tests/` | Windows test programs: Steam bridge, D3D11, D3D12 |
 | `docs/neutron.md` | Architecture, Steam integration, macOS findings, patches, open points |
 
+## Workflow
+
+- `main` is protected: no direct pushes, no force pushes. Every change goes on a
+  feature branch (`feat/...`, `fix/...`, `perf/...`, `docs/...`) and into `main`
+  through a pull request on GitHub (`gh pr create`), merged as a squash commit.
+- Commits carry a `Signed-off-by:` line (`git commit -s`, see CONTRIBUTING.md).
+- The repo is LGPL-2.1-or-later; patches keep the license of what they patch.
+
 ## Conventions
 
 - Patches are unified diffs. Mark code changes with a `/* neutron: ... */`
