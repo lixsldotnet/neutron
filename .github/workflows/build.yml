@@ -1,15 +1,15 @@
 # Full build from scratch on a macOS arm64 runner (build.sh), then the CPU-only
 # Windows tests that do not need a GPU (the runners have no Metal acceleration).
-# Runs for changes to the build, the patches or the tool, weekly, and by hand.
-# Nothing built here is uploaded: lsteamclient's license does not allow binaries.
+# Runs for pull requests that change the build, the patches or the tool, weekly, and
+# by hand. For a version tag (v*) it then publishes the download: the repo files plus
+# the built tool as neutron-macos-arm64.tar.xz in a GitHub release of that tag.
 name: build
 
 on:
   pull_request:
     paths: ['build.sh', 'patches/**', 'tool/**', 'tests/sync_semantics.c', '.github/workflows/build.yml']
   push:
-    branches: [main]
-    paths: ['build.sh', 'patches/**', 'tool/**', 'tests/sync_semantics.c', '.github/workflows/build.yml']
+    tags: ['v*']
   schedule:
     - cron: '0 3 * * 1'
   workflow_dispatch:
@@ -25,6 +25,8 @@ jobs:
   build:
     runs-on: macos-15
     timeout-minutes: 300
+    permissions:
+      contents: write   # the release of a version tag
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -84,3 +86,25 @@ jobs:
           name: test-logs
           path: ~/Library/Logs/neutron/
           if-no-files-found: ignore
+      - name: Package
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          pkg="$RUNNER_TEMP/pkg/neutron"
+          mkdir -p "$pkg/dist"
+          git archive HEAD | tar -x -C "$pkg"
+          cp -R .native-build/dist/neutron "$pkg/dist/neutron"
+          XZ_OPT=-T0 tar -C "$RUNNER_TEMP/pkg" -cJf neutron-macos-arm64.tar.xz neutron
+          shasum -a 256 neutron-macos-arm64.tar.xz > neutron-macos-arm64.tar.xz.sha256
+          ls -la neutron-macos-arm64.tar.xz
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          notes="neutron ${TAG}, built by GitHub Actions from ${commit:0:7}. Download neutron-macos-arm64.tar.xz, extract it and run ./install.sh in the neutron folder (needs Mac Steam and node 22: brew install node). Source of this build: https://github.com/${GITHUB_REPOSITORY}/tree/${commit} (build.sh pins the upstream versions, patches/ holds every change, NOTICES.md lists the licenses)."
+          gh release create "$TAG" --title "neutron $TAG" --notes "$notes" --prerelease \
+            neutron-macos-arm64.tar.xz neutron-macos-arm64.tar.xz.sha256
