@@ -1,8 +1,8 @@
 NEUTRON_RENDER_SCALE: Windows sees a smaller screen (Windows pixels per Mac point like
-Retina mode), DXMT upscales with MetalFX. Also the raw mouse declarations and setting.
+Retina mode), DXMT upscales with MetalFX. Also the raw mouse declarations and setting, and the gamepad gesture parts of 0017.
 --- a/dlls/winemac.drv/macdrv_cocoa.h
 +++ b/dlls/winemac.drv/macdrv_cocoa.h
-@@ -117,14 +117,29 @@
+@@ -117,14 +117,32 @@
  extern bool retina_on;       /* Whether Retina mode is currently active (enabled and display is in default mode). */
  extern bool enable_app_nap;
  
@@ -14,6 +14,9 @@ Retina mode), DXMT upscales with MetalFX. Also the raw mouse declarations and se
 +/* neutron: raw input from GCMouse, see cocoa_rawmouse.m */
 +extern volatile bool neutron_raw_mouse;
 +extern void macdrv_start_raw_mouse(void);
++
++/* neutron: pad buttons bound to macOS system gestures go to the game, see cocoa_gamepad.m */
++extern void macdrv_start_gamepad_gestures(void);
 +
 +static inline double macdrv_win_scale(void)
 +{
@@ -37,7 +40,7 @@ Retina mode), DXMT upscales with MetalFX. Also the raw mouse declarations and se
      }
  
      return rect;
-@@ -132,12 +147,13 @@
+@@ -132,12 +150,13 @@
  
  static inline CGRect cgrect_win_from_mac(CGRect rect)
  {
@@ -56,7 +59,7 @@ Retina mode), DXMT upscales with MetalFX. Also the raw mouse declarations and se
      }
  
      return rect;
-@@ -145,10 +161,11 @@
+@@ -145,10 +164,11 @@
  
  static inline CGSize cgsize_mac_from_win(CGSize size)
  {
@@ -71,7 +74,7 @@ Retina mode), DXMT upscales with MetalFX. Also the raw mouse declarations and se
      }
  
      return size;
-@@ -156,10 +173,11 @@
+@@ -156,10 +176,11 @@
  
  static inline CGSize cgsize_win_from_mac(CGSize size)
  {
@@ -86,7 +89,7 @@ Retina mode), DXMT upscales with MetalFX. Also the raw mouse declarations and se
      }
  
      return size;
-@@ -167,10 +185,11 @@
+@@ -167,10 +188,11 @@
  
  static inline CGPoint cgpoint_mac_from_win(CGPoint point)
  {
@@ -101,7 +104,7 @@ Retina mode), DXMT upscales with MetalFX. Also the raw mouse declarations and se
      }
  
      return point;
-@@ -178,10 +197,11 @@
+@@ -178,10 +200,11 @@
  
  static inline CGPoint cgpoint_win_from_mac(CGPoint point)
  {
@@ -116,7 +119,7 @@ Retina mode), DXMT upscales with MetalFX. Also the raw mouse declarations and se
      }
  
      return point;
-@@ -265,6 +285,7 @@
+@@ -265,6 +288,7 @@
      MOUSE_BUTTON,
      MOUSE_MOVED_RELATIVE,
      MOUSE_MOVED_ABSOLUTE,
@@ -134,7 +137,7 @@ Retina mode), DXMT upscales with MetalFX. Also the raw mouse declarations and se
  bool right_command_is_ctrl = false;
  bool allow_software_rendering = false;
  bool allow_immovable_windows = true;
-@@ -367,6 +368,19 @@
+@@ -367,7 +368,26 @@
          retina_enabled = IS_OPTION_TRUE(buffer[0]);
  
      retina_on = retina_enabled;
@@ -152,8 +155,15 @@ Retina mode), DXMT upscales with MetalFX. Also the raw mouse declarations and se
 +        if (!env || strcmp(env, "0")) macdrv_start_raw_mouse();
 +    }
  
++    /* neutron: Home and Share buttons of pads to the game, see cocoa_gamepad.m */
++    {
++        const char *env = getenv("NEUTRON_PAD_SYSTEM_GESTURES");
++        if (!env || strcmp(env, "1")) macdrv_start_gamepad_gestures();
++    }
++
      if (appkey) NtClose(appkey);
      if (hkey) NtClose(hkey);
+ }
 --- a/dlls/winemac.drv/gdi.c
 +++ b/dlls/winemac.drv/gdi.c
 @@ -217,8 +217,8 @@

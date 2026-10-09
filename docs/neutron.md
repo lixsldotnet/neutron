@@ -755,7 +755,7 @@ neutron:
   would be scaled a second time). Without the setting the files are removed again
   (marker `neutron-dlss-files` in the prefix) and dxgi deletes the registry values, so
   the game sees the Apple GPU as before. The HUD shows "DLSS MetalFX temporal".
-- dxmt 0040:
+- dxmt 0033:
   - Games call the NGX parameter object through the vtable MSVC builds for
     `NVSDK_NGX_Parameter`: overloads grouped, each group in reverse declaration order
     (checked with `clang -target x86_64-pc-windows-msvc`). DXMT had the `Get` group
@@ -953,7 +953,7 @@ DXMT patches with `git apply`, all in file name order.
 | `dxmt/0009-no-display-mode-switch` | No real display mode switches |
 | `dxmt/0010-display-layer-format` | BGR10A2 layer for 10-bit backbuffers, `NEUTRON_LAYER_FORMAT` |
 | `dxmt/0011-native-drawable-size` | Drawable in screen pixels, `NEUTRON_NATIVE_DRAWABLE` |
-| `dxmt/0040-dlss-ngx-metalfx` | DLSS on MetalFX temporal: NGX parameter vtable, render subrect 0, signature override, D3D12 NGX |
+| `dxmt/0033-dlss-ngx-metalfx` | DLSS on MetalFX temporal: NGX parameter vtable, render subrect 0, signature override, D3D12 NGX |
 
 ## Open points
 

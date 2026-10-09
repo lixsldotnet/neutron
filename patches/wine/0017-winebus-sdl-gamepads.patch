@@ -2,9 +2,10 @@ Game controllers: PlayStation and Nintendo pads through SDL as XInput pads (NEUT
 keeps raw HID), IOHID pads kept when libSDL2 is missing, XInput rumble held until changed,
 XInput battery wired/full, Home/Share buttons of pads to the game instead of macOS gestures
 (NEUTRON_PAD_SYSTEM_GESTURES=1 keeps them), NEUTRON_PAD_VIRTUAL test pad in winebus.
+The winemac parts in macdrv_cocoa.h and macdrv_main.c are in 0010, Makefile.in in 0014.
 --- a/dlls/winebus.sys/main.c
 +++ b/dlls/winebus.sys/main.c
-@@ -473,6 +473,19 @@ static DWORD check_bus_option(const WCHAR *option, DWO
+@@ -473,6 +473,19 @@
      return default_value;
  }
  
@@ -24,7 +25,7 @@ XInput battery wired/full, Home/Share buttons of pads to the game instead of mac
  static BOOL is_hidraw_enabled(WORD vid, WORD pid, const USAGE_AND_PAGE *usages, UINT buttons)
  {
      char buffer[FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data[1024])];
-@@ -553,6 +566,9 @@ static BOOL is_hidraw_enabled(WORD vid, WORD pid, cons
+@@ -553,6 +566,9 @@
          if (pid == 0x2009) prefer_hidraw = TRUE; /* Pro Controller */
          break;
      }
@@ -34,7 +35,7 @@ XInput battery wired/full, Home/Share buttons of pads to the game instead of mac
  
      RtlInitUnicodeString(&str, L"EnableHidraw");
      if (!NtQueryValueKey(driver_key, &str, KeyValuePartialInformation, info,
-@@ -1208,7 +1224,7 @@ static void bus_options_cleanup(void)
+@@ -1208,7 +1224,7 @@
  {
      struct device_options *device, *next;
  
@@ -43,7 +44,7 @@ XInput battery wired/full, Home/Share buttons of pads to the game instead of mac
  
      LIST_FOR_EACH_ENTRY_SAFE(device, next, &options.devices, struct device_options, entry)
      {
-@@ -1275,7 +1291,10 @@ static NTSTATUS fdo_pnp_dispatch(DEVICE_OBJECT *device
+@@ -1275,7 +1291,10 @@
          keyboard_device_create();
  
          if (!sdl_driver_init()) options.disable_input = TRUE;
@@ -57,7 +58,7 @@ XInput battery wired/full, Home/Share buttons of pads to the game instead of mac
          irp->IoStatus.Status = STATUS_SUCCESS;
 --- a/dlls/winebus.sys/unixlib.h
 +++ b/dlls/winebus.sys/unixlib.h
-@@ -64,6 +64,7 @@ struct bus_options
+@@ -64,6 +64,7 @@
      BOOL disable_udevd;
      BOOL split_controllers;
      BOOL map_controllers;
@@ -67,7 +68,7 @@ XInput battery wired/full, Home/Share buttons of pads to the game instead of mac
      char **mappings;
 --- a/dlls/winebus.sys/bus_sdl.c
 +++ b/dlls/winebus.sys/bus_sdl.c
-@@ -122,6 +122,7 @@ static const char *(*pSDL_JoystickGetSerial)(SDL_Joyst
+@@ -122,6 +122,7 @@
  static Uint16 (*pSDL_JoystickGetVendor)(SDL_Joystick * joystick);
  static SDL_JoystickType (*pSDL_JoystickGetType)(SDL_Joystick * joystick);
  static const char *(*pSDL_JoystickGetSerial)(SDL_Joystick * joystick);
@@ -75,7 +76,7 @@ XInput battery wired/full, Home/Share buttons of pads to the game instead of mac
  
  /* internal bits for extended rumble support, SDL_Haptic types are 16-bits */
  #define WINE_SDL_JOYSTICK_RUMBLE  0x40000000 /* using SDL_JoystickRumble API */
-@@ -475,6 +476,10 @@ static NTSTATUS sdl_device_haptics_start(struct unix_d
+@@ -475,6 +476,10 @@
  
      if (impl->effect_support & WINE_SDL_JOYSTICK_RUMBLE)
      {
@@ -86,7 +87,7 @@ XInput battery wired/full, Home/Share buttons of pads to the game instead of mac
          pSDL_JoystickRumble(impl->sdl_joystick, rumble_intensity, buzz_intensity, duration_ms);
          if (pSDL_JoystickRumbleTriggers)
              pSDL_JoystickRumbleTriggers(impl->sdl_joystick, left_intensity, right_intensity, duration_ms);
-@@ -1069,17 +1074,141 @@ static void process_device_event(SDL_Event *event)
+@@ -1069,17 +1074,141 @@
      }
  
      pthread_mutex_unlock(&sdl_cs);
@@ -229,7 +230,7 @@ XInput battery wired/full, Home/Share buttons of pads to the game instead of mac
      if (!(sdl_handle = dlopen(SONAME_LIBSDL2, RTLD_NOW)))
      {
          WARN("could not load %s\n", SONAME_LIBSDL2);
-@@ -1146,7 +1275,12 @@ NTSTATUS sdl_bus_init(void *args)
+@@ -1146,7 +1275,12 @@
      pSDL_JoystickGetVendor = dlsym(sdl_handle, "SDL_JoystickGetVendor");
      pSDL_JoystickGetType = dlsym(sdl_handle, "SDL_JoystickGetType");
      pSDL_JoystickGetSerial = dlsym(sdl_handle, "SDL_JoystickGetSerial");
@@ -242,7 +243,7 @@ XInput battery wired/full, Home/Share buttons of pads to the game instead of mac
      if (pSDL_Init(SDL_INIT_GAMECONTROLLER | SDL_INIT_HAPTIC) < 0)
      {
          ERR("could not init SDL: %s\n", pSDL_GetError());
-@@ -1179,6 +1313,7 @@ NTSTATUS sdl_bus_init(void *args)
+@@ -1179,6 +1313,7 @@
          }
      }
  
@@ -250,7 +251,7 @@ XInput battery wired/full, Home/Share buttons of pads to the game instead of mac
      return STATUS_SUCCESS;
  
  failed:
-@@ -1198,6 +1333,7 @@ NTSTATUS sdl_bus_wait(void *args)
+@@ -1198,6 +1333,7 @@
      do
      {
          if (bus_event_queue_pop(&event_queue, result)) return STATUS_PENDING;
@@ -260,7 +261,7 @@ XInput battery wired/full, Home/Share buttons of pads to the game instead of mac
      } while (event.type != quit_event);
 --- a/dlls/xinput1_3/main.c
 +++ b/dlls/xinput1_3/main.c
-@@ -1146,8 +1146,16 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetBatteryInforma
+@@ -1146,8 +1146,16 @@
      if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
  
      EnterCriticalSection(&xinput_cs);
@@ -350,40 +351,3 @@ XInput battery wired/full, Home/Share buttons of pads to the game instead of mac
 +            disable_system_gestures(controller);
 +    });
 +}
---- a/dlls/winemac.drv/macdrv_cocoa.h
-+++ b/dlls/winemac.drv/macdrv_cocoa.h
-@@ -126,6 +126,9 @@ extern void macdrv_start_raw_mouse(void);
- extern volatile bool neutron_raw_mouse;
- extern void macdrv_start_raw_mouse(void);
- 
-+/* neutron: pad buttons bound to macOS system gestures go to the game, see cocoa_gamepad.m */
-+extern void macdrv_start_gamepad_gestures(void);
-+
- static inline double macdrv_win_scale(void)
- {
-     return (retina_on ? 2.0 : 1.0) * neutron_scale;
---- a/dlls/winemac.drv/macdrv_main.c
-+++ b/dlls/winemac.drv/macdrv_main.c
-@@ -380,6 +380,12 @@ static void setup_options(void)
-     {
-         const char *env = getenv("NEUTRON_RAW_MOUSE");
-         if (!env || strcmp(env, "0")) macdrv_start_raw_mouse();
-+    }
-+
-+    /* neutron: Home and Share buttons of pads to the game, see cocoa_gamepad.m */
-+    {
-+        const char *env = getenv("NEUTRON_PAD_SYSTEM_GESTURES");
-+        if (!env || strcmp(env, "1")) macdrv_start_gamepad_gestures();
-     }
- 
-     if (appkey) NtClose(appkey);
---- a/dlls/winemac.drv/Makefile.in
-+++ b/dlls/winemac.drv/Makefile.in
-@@ -23,6 +23,7 @@ SOURCES = \
- 	cocoa_cursorclipping.m \
- 	cocoa_display.m \
- 	cocoa_event.m \
-+	cocoa_gamepad.m \
- 	cocoa_main.m \
- 	cocoa_opengl.m \
- 	cocoa_rawmouse.m \
