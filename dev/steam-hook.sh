@@ -19,7 +19,7 @@ CONFIG_VDF="$HOME/Library/Application Support/Steam/config/config.vdf"
 say() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
 js()  { node "$DEV_DIR/steamjs.mjs" "$1"; }
 # Larger snippets live in files: macOS bash 3.2 garbles long JS inside "$(...)".
-js_file() { js "$(sed -e "s/__TOOL__/$TOOL/g" -e "s/__MAPPED__/${MAPPED:-}/g" "$DEV_DIR/$1")"; }
+js_file() { js "$(sed -e "s/__TOOL__/$TOOL/g" -e "s/__MAPPED__/${MAPPED:-}/g" -e "s/__NATIVE__/${NATIVE:-}/g" "$DEV_DIR/$1")"; }
 
 # App ids mapped to the tool (or its _remap name, see steam-sync.js) in config.vdf's
 # CompatToolMapping, comma separated.
@@ -42,6 +42,7 @@ say "Compat layer: $(js 'new Promise(r=>SteamClient.Settings.RegisterForSettings
 js 'new Promise(r=>{SteamClient.Console.ExecCommand("@sSteamCmdForcePlatformType macos"); setTimeout(()=>r(1),1000)})' >/dev/null
 say "Platform back to macos, tools: $(js 'SteamClient.Settings.GetGlobalCompatTools()')"
 MAPPED="$(mapped_apps)"
+NATIVE="$(node "$DEV_DIR/steam-native.mjs" 2>/dev/null || true)"
 say "Games: $(js_file steam-sync.js)"
 say "Settings tab: $(js "$(cat "$DEV_DIR/steam-panel.js")")"
 

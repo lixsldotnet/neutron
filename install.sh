@@ -167,7 +167,7 @@ fi
 say "Installing the helper scripts"
 mkdir -p "$BIN"
 rm -f "$BIN"/steam-*.js
-cp "$ROOT/dev/steam.sh" "$ROOT/dev/steam-hook.sh" "$ROOT/dev/steamjs.mjs" "$ROOT"/dev/steam-*.js "$BIN/"
+cp "$ROOT/dev/steam.sh" "$ROOT/dev/steam-hook.sh" "$ROOT/dev/steamjs.mjs" "$ROOT/dev/steam-native.mjs" "$ROOT"/dev/steam-*.js "$BIN/"
 chmod +x "$BIN/steam.sh" "$BIN/steam-hook.sh"
 
 quit_steam
