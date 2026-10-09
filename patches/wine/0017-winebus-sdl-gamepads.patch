@@ -1,0 +1,353 @@
+Game controllers: PlayStation and Nintendo pads through SDL as XInput pads (NEUTRON_PAD_HIDRAW=1
+keeps raw HID), IOHID pads kept when libSDL2 is missing, XInput rumble held until changed,
+XInput battery wired/full, Home/Share buttons of pads to the game instead of macOS gestures
+(NEUTRON_PAD_SYSTEM_GESTURES=1 keeps them), NEUTRON_PAD_VIRTUAL test pad in winebus.
+The winemac parts in macdrv_cocoa.h and macdrv_main.c are in 0010, Makefile.in in 0014.
+--- a/dlls/winebus.sys/main.c
++++ b/dlls/winebus.sys/main.c
+@@ -473,6 +473,19 @@
+     return default_value;
+ }
+ 
++/* neutron: Proton leaves PlayStation and Nintendo pads as raw HID devices and relies
++ * on Steam Input for XInput; the Mac Steam client has no Steam Input for Windows
++ * games. So they go through SDL as XInput gamepads like every other pad, unless
++ * NEUTRON_PAD_HIDRAW=1 (raw HID for games with their own PlayStation or Switch
++ * support: light bar, touchpad, gyro, adaptive triggers, button glyphs). services.exe
++ * gives winedevice a fresh Windows environment, so the SDL bus reads the variable
++ * from the Unix environment into options.pad_hidraw. */
++static BOOL is_console_pad(WORD vid, WORD pid)
++{
++    if (is_dualshock4_gamepad(vid, pid) || is_dualsense_gamepad(vid, pid)) return TRUE;
++    return vid == 0x057e && (pid == 0x2006 || pid == 0x2007 || pid == 0x2008 || pid == 0x2009 || pid == 0x057e);
++}
++
+ static BOOL is_hidraw_enabled(WORD vid, WORD pid, const USAGE_AND_PAGE *usages, UINT buttons)
+ {
+     char buffer[FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data[1024])];
+@@ -553,6 +566,9 @@
+         if (pid == 0x2009) prefer_hidraw = TRUE; /* Pro Controller */
+         break;
+     }
++
++    /* neutron: see is_console_pad */
++    if (is_console_pad(vid, pid) && !options.disable_sdl && !options.pad_hidraw) prefer_hidraw = FALSE;
+ 
+     RtlInitUnicodeString(&str, L"EnableHidraw");
+     if (!NtQueryValueKey(driver_key, &str, KeyValuePartialInformation, info,
+@@ -1208,7 +1224,7 @@
+ {
+     struct device_options *device, *next;
+ 
+-    if (!options.disable_sdl) sdl_bus_free_mappings(&options);
++    sdl_bus_free_mappings(&options); /* neutron: disable_sdl is also set when SDL failed to load */
+ 
+     LIST_FOR_EACH_ENTRY_SAFE(device, next, &options.devices, struct device_options, entry)
+     {
+@@ -1275,7 +1291,10 @@
+         keyboard_device_create();
+ 
+         if (!sdl_driver_init()) options.disable_input = TRUE;
+-        udev_driver_init();
++        /* neutron: without libSDL2 (or udev) nothing maps gamepads, so the raw IOHID
++         * devices must not be dropped in favour of SDL devices that never come */
++        else options.disable_sdl = TRUE;
++        if (udev_driver_init()) options.disable_input = TRUE;
+         iohid_driver_init();
+ 
+         irp->IoStatus.Status = STATUS_SUCCESS;
+--- a/dlls/winebus.sys/unixlib.h
++++ b/dlls/winebus.sys/unixlib.h
+@@ -64,6 +64,7 @@
+     BOOL disable_udevd;
+     BOOL split_controllers;
+     BOOL map_controllers;
++    BOOL pad_hidraw; /* neutron: NEUTRON_PAD_HIDRAW=1, set by the SDL bus, see main.c */
+     UINT mappings_count;
+     struct list devices;
+     char **mappings;
+--- a/dlls/winebus.sys/bus_sdl.c
++++ b/dlls/winebus.sys/bus_sdl.c
+@@ -122,6 +122,7 @@
+ static Uint16 (*pSDL_JoystickGetVendor)(SDL_Joystick * joystick);
+ static SDL_JoystickType (*pSDL_JoystickGetType)(SDL_Joystick * joystick);
+ static const char *(*pSDL_JoystickGetSerial)(SDL_Joystick * joystick);
++static SDL_bool (*pSDL_SetHint)(const char *name, const char *value);
+ 
+ /* internal bits for extended rumble support, SDL_Haptic types are 16-bits */
+ #define WINE_SDL_JOYSTICK_RUMBLE  0x40000000 /* using SDL_JoystickRumble API */
+@@ -475,6 +476,10 @@
+ 
+     if (impl->effect_support & WINE_SDL_JOYSTICK_RUMBLE)
+     {
++        /* neutron: XInput and Windows.Gaming.Input rumble lasts until the game changes it,
++         * but SDL stopped it after the 1 s default cutoff (XInput only sends changes).
++         * Duration 0 makes SDL keep it; shorter explicit cutoffs still apply. */
++        if (duration_ms >= 1000) duration_ms = 0;
+         pSDL_JoystickRumble(impl->sdl_joystick, rumble_intensity, buzz_intensity, duration_ms);
+         if (pSDL_JoystickRumbleTriggers)
+             pSDL_JoystickRumbleTriggers(impl->sdl_joystick, left_intensity, right_intensity, duration_ms);
+@@ -1069,17 +1074,141 @@
+     }
+ 
+     pthread_mutex_unlock(&sdl_cs);
++}
++
++/* neutron: NEUTRON_PAD_VIRTUAL=1 attaches an SDL virtual gamepad with Xbox 360 IDs
++ * (=<vid>:<pid> in hex for other IDs, e.g. 054c:0ce6 for the DualSense policy), so the
++ * whole path (SDL, winebus, XInput, DirectInput, raw HID, Windows.Gaming.Input,
++ * rumble, hotplug) can be tested without a real pad (tests/gamepad_list.c selftest).
++ * Every 400 ms it moves on: nothing, A, B + dpad up, left stick right/up + left
++ * trigger, nothing. Rumble comes back as input: right stick X = low frequency motor / 2,
++ * right trigger = high frequency motor / 2. Rumble 0xffff/0x0001 unplugs it for 1 s. */
++#if SDL_VERSION_ATLEAST(2, 24, 0)
++static int (*pSDL_JoystickAttachVirtualEx)(const SDL_VirtualJoystickDesc *desc);
++static int (*pSDL_JoystickDetachVirtual)(int device_index);
++static int (*pSDL_JoystickSetVirtualAxis)(SDL_Joystick *joystick, int axis, Sint16 value);
++static int (*pSDL_JoystickSetVirtualButton)(SDL_Joystick *joystick, int button, Uint8 value);
++static SDL_Joystick *(*pSDL_JoystickFromInstanceID)(SDL_JoystickID instance_id);
++static SDL_JoystickID (*pSDL_JoystickGetDeviceInstanceID)(int device_index);
++static int (*pSDL_NumJoysticks)(void);
++
++static BOOL virtual_pad;
++static unsigned int virtual_pad_vid = 0x045e, virtual_pad_pid = 0x028e;
++static SDL_JoystickID virtual_pad_id = -1;
++static Uint32 virtual_pad_start, virtual_pad_replug;
++static volatile Uint16 virtual_pad_low, virtual_pad_high;
++
++static void SDLCALL virtual_pad_update(void *userdata)
++{
++    SDL_Joystick *joystick = pSDL_JoystickFromInstanceID(virtual_pad_id);
++    unsigned int phase = (pSDL_GetTicks() - virtual_pad_start) / 400 % 5;
++
++    if (!joystick) return;
++    pSDL_JoystickSetVirtualButton(joystick, SDL_CONTROLLER_BUTTON_A, phase == 1);
++    pSDL_JoystickSetVirtualButton(joystick, SDL_CONTROLLER_BUTTON_B, phase == 2);
++    pSDL_JoystickSetVirtualButton(joystick, SDL_CONTROLLER_BUTTON_DPAD_UP, phase == 2);
++    pSDL_JoystickSetVirtualAxis(joystick, SDL_CONTROLLER_AXIS_LEFTX, phase == 3 ? 32767 : 0);
++    pSDL_JoystickSetVirtualAxis(joystick, SDL_CONTROLLER_AXIS_LEFTY, phase == 3 ? -32768 : 0);
++    pSDL_JoystickSetVirtualAxis(joystick, SDL_CONTROLLER_AXIS_TRIGGERLEFT, phase == 3 ? 32767 : -32768);
++    pSDL_JoystickSetVirtualAxis(joystick, SDL_CONTROLLER_AXIS_RIGHTX, virtual_pad_low / 2);
++    pSDL_JoystickSetVirtualAxis(joystick, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, (int)virtual_pad_high - 32768);
++}
++
++static int SDLCALL virtual_pad_rumble(void *userdata, Uint16 low, Uint16 high)
++{
++    TRACE("virtual pad rumble %#x %#x\n", low, high);
++    if (low == 0xffff && high == 0x0001) virtual_pad_replug = pSDL_GetTicks();
++    else virtual_pad_low = low, virtual_pad_high = high;
++    /* sdl2-compat 2.32.74 hands this SDL2 int (0 = success) to SDL3 as a bool, so
++     * success has to be non-zero there, or SDL3 never sends the stop */
++    return 1;
++}
++
++static void virtual_pad_attach(void)
++{
++    static SDL_VirtualJoystickDesc desc =
++    {
++        .version = SDL_VIRTUAL_JOYSTICK_DESC_VERSION,
++        .type = SDL_JOYSTICK_TYPE_GAMECONTROLLER,
++        .naxes = SDL_CONTROLLER_AXIS_MAX,
++        .nbuttons = SDL_CONTROLLER_BUTTON_DPAD_RIGHT + 1,
++        .button_mask = (1 << (SDL_CONTROLLER_BUTTON_DPAD_RIGHT + 1)) - 1,
++        .axis_mask = (1 << SDL_CONTROLLER_AXIS_MAX) - 1,
++        .name = "neutron virtual pad",
++        .Update = virtual_pad_update,
++        .Rumble = virtual_pad_rumble,
++    };
++    int index;
++
++    desc.vendor_id = virtual_pad_vid;
++    desc.product_id = virtual_pad_pid;
++    index = pSDL_JoystickAttachVirtualEx(&desc);
++
++    virtual_pad_low = virtual_pad_high = 0;
++    virtual_pad_start = pSDL_GetTicks();
++    virtual_pad_id = index < 0 ? -1 : pSDL_JoystickGetDeviceInstanceID(index);
++    if (index < 0) ERR("could not attach the virtual pad: %s\n", pSDL_GetError());
++    else TRACE("virtual pad attached, index %d id %d\n", index, virtual_pad_id);
+ }
+ 
++static void virtual_pad_init(void)
++{
++    const char *env = getenv("NEUTRON_PAD_VIRTUAL");
++
++    if (!env || (strcmp(env, "1") && sscanf(env, "%x:%x", &virtual_pad_vid, &virtual_pad_pid) != 2)) return;
++#define LOAD_FUNCPTR(f) if (!(p##f = dlsym(sdl_handle, #f))) { ERR("no %s for the virtual pad\n", #f); return; }
++    LOAD_FUNCPTR(SDL_JoystickAttachVirtualEx);
++    LOAD_FUNCPTR(SDL_JoystickDetachVirtual);
++    LOAD_FUNCPTR(SDL_JoystickSetVirtualAxis);
++    LOAD_FUNCPTR(SDL_JoystickSetVirtualButton);
++    LOAD_FUNCPTR(SDL_JoystickFromInstanceID);
++    LOAD_FUNCPTR(SDL_JoystickGetDeviceInstanceID);
++    LOAD_FUNCPTR(SDL_NumJoysticks);
++#undef LOAD_FUNCPTR
++    virtual_pad = TRUE;
++    virtual_pad_attach();
++}
++
++/* Runs in the bus thread: unplugs the pad when asked and plugs it in again after 1 s. */
++static void virtual_pad_poll(void)
++{
++    int i;
++
++    if (!virtual_pad || !virtual_pad_replug) return;
++    if (virtual_pad_id != -1)
++    {
++        for (i = 0; i < pSDL_NumJoysticks(); i++)
++            if (pSDL_JoystickGetDeviceInstanceID(i) == virtual_pad_id) pSDL_JoystickDetachVirtual(i);
++        TRACE("virtual pad detached\n");
++        virtual_pad_id = -1;
++    }
++    else if (pSDL_GetTicks() - virtual_pad_replug >= 1000)
++    {
++        virtual_pad_replug = 0;
++        virtual_pad_attach();
++    }
++}
++#else
++static void virtual_pad_init(void) {}
++static void virtual_pad_poll(void) {}
++#endif
++
+ NTSTATUS sdl_bus_init(void *args)
+ {
+-    const char *mapping;
++    const char *mapping, *env;
+     int i;
+ 
+     TRACE("args %p\n", args);
+ 
+     options = (struct bus_options *)args;
+ 
++    /* neutron: see is_console_pad in main.c */
++    if ((env = getenv("NEUTRON_PAD_HIDRAW")) && !strcmp(env, "1"))
++    {
++        ((struct bus_options *)args)->pad_hidraw = TRUE;
++        TRACE("PlayStation and Nintendo pads as raw HID devices\n");
++    }
++
+     if (!(sdl_handle = dlopen(SONAME_LIBSDL2, RTLD_NOW)))
+     {
+         WARN("could not load %s\n", SONAME_LIBSDL2);
+@@ -1146,7 +1275,12 @@
+     pSDL_JoystickGetVendor = dlsym(sdl_handle, "SDL_JoystickGetVendor");
+     pSDL_JoystickGetType = dlsym(sdl_handle, "SDL_JoystickGetType");
+     pSDL_JoystickGetSerial = dlsym(sdl_handle, "SDL_JoystickGetSerial");
++    pSDL_SetHint = dlsym(sdl_handle, "SDL_SetHint");
+ 
++    /* neutron: winedevice never has the focus, so SDL must not drop pad events for a
++     * background app (an environment variable of the same name still wins) */
++    if (pSDL_SetHint) pSDL_SetHint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
++
+     if (pSDL_Init(SDL_INIT_GAMECONTROLLER | SDL_INIT_HAPTIC) < 0)
+     {
+         ERR("could not init SDL: %s\n", pSDL_GetError());
+@@ -1179,6 +1313,7 @@
+         }
+     }
+ 
++    virtual_pad_init();
+     return STATUS_SUCCESS;
+ 
+ failed:
+@@ -1198,6 +1333,7 @@
+     do
+     {
+         if (bus_event_queue_pop(&event_queue, result)) return STATUS_PENDING;
++        virtual_pad_poll();
+         if (pSDL_WaitEventTimeout(&event, 10) != 0) process_device_event(&event);
+         else check_all_devices_effects_state();
+     } while (event.type != quit_event);
+--- a/dlls/xinput1_3/main.c
++++ b/dlls/xinput1_3/main.c
+@@ -1146,8 +1146,16 @@
+     if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
+ 
+     EnterCriticalSection(&xinput_cs);
+-    ret = controllers[index].device ? ERROR_NOT_SUPPORTED : ERROR_DEVICE_NOT_CONNECTED;
++    ret = controllers[index].device ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
+     LeaveCriticalSection(&xinput_cs);
++
++    /* neutron: the HID gamepads have no battery report; answer like Windows does for a
++     * wired pad instead of ERROR_NOT_SUPPORTED, which no Windows driver returns */
++    if (!ret && battery)
++    {
++        battery->BatteryType = type == BATTERY_DEVTYPE_GAMEPAD ? BATTERY_TYPE_WIRED : BATTERY_TYPE_DISCONNECTED;
++        battery->BatteryLevel = type == BATTERY_DEVTYPE_GAMEPAD ? BATTERY_LEVEL_FULL : BATTERY_LEVEL_EMPTY;
++    }
+ 
+     return ret;
+ }
+--- a/dlls/winemac.drv/cocoa_gamepad.m
++++ b/dlls/winemac.drv/cocoa_gamepad.m
+@@ -0,0 +1,69 @@
++/*
++ * MACDRV game controller system gestures
++ *
++ * neutron: games read pads in winedevice (winebus through SDL), a background
++ * process. macOS binds the Home/PS button (Launchpad, Game Overlay) and the
++ * Share/Create button (screenshot, recording) of a pad to system gestures and
++ * applies them for the frontmost app, which is the game's Wine process. So this
++ * process asks GameController to leave those buttons to the game, like a native
++ * game would. NEUTRON_PAD_SYSTEM_GESTURES=1 keeps the macOS gestures.
++ *
++ * Copyright 2026 the neutron contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#import "config.h"
++#import "macdrv.h"
++
++#import <GameController/GameController.h>
++
++WINE_DEFAULT_DEBUG_CHANNEL(gamepad);
++
++
++static void disable_system_gestures(GCController* controller)
++{
++    GCPhysicalInputProfile* profile = controller.physicalInputProfile;
++
++    for (NSString* name in profile.buttons)
++    {
++        GCControllerButtonInput* button = profile.buttons[name];
++
++        if (!button.boundToSystemGesture) continue;
++        button.preferredSystemGestureState = GCSystemGestureStateDisabled;
++        TRACE("%s: system gesture of %s off\n", [controller.vendorName UTF8String], [name UTF8String]);
++    }
++}
++
++/***********************************************************************
++ *              macdrv_start_gamepad_gestures
++ *
++ * Turn the system gestures off for every connected and future pad. The
++ * handlers run on the main queue.
++ */
++void macdrv_start_gamepad_gestures(void)
++{
++    dispatch_async(dispatch_get_main_queue(), ^{
++        [[NSNotificationCenter defaultCenter] addObserverForName:GCControllerDidConnectNotification
++                                                          object:nil
++                                                           queue:nil
++                                                      usingBlock:^(NSNotification* note){
++            disable_system_gestures(note.object);
++        }];
++
++        for (GCController* controller in [GCController controllers])
++            disable_system_gestures(controller);
++    });
++}

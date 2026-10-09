@@ -3,7 +3,7 @@ ntdll on arm64 macOS: TEB and PEB without x18 (TSD slot, page after KUSER), JIT 
 and the free area search that skips host mappings in one step (no 64K mach_vm_map probing
 under the virtual lock), and with NEUTRON_SANDBOX=1 a sandboxed client refuses a wineserver
 that runs outside the sandbox (it opens files and sockets for its clients). Also the
-ntdll parts of msync (0015) in these files.
+ntdll parts of msync (0015) and of the fast QPC (0016) in these files.
 --- a/include/winnt.h
 +++ b/include/winnt.h
 @@ -2575,6 +2575,10 @@
@@ -162,18 +162,21 @@ ntdll parts of msync (0015) in these files.
      DWORD        tid;               /* thread id */
      BOOL         allow_writes;      /* ThreadAllowWrites flags */
      BOOL         suspend;           /* suspend on startup */
-@@ -132,6 +137,10 @@
+@@ -132,6 +137,13 @@
  };
  
  extern pthread_key_t thread_data_key;
 +#ifdef WINE_TEB_IN_TSD
 +extern unsigned long long __wine_teb_tsd_offset;
 +extern void set_teb_tsd( TEB *teb );
++#ifdef __APPLE__
++extern void init_qpc_info(void);
++#endif
 +#endif
  
  static inline struct thread_data *get_thread_data(void)
  {
-@@ -420,6 +429,11 @@
+@@ -420,6 +432,11 @@
  extern void dbg_init(void);
  
  extern void close_inproc_sync( HANDLE handle );
@@ -226,10 +229,12 @@ ntdll parts of msync (0015) in these files.
          ptr = MAP_FAILED;
      }
  #else
-@@ -1536,6 +1550,42 @@
+@@ -1534,7 +1548,43 @@
+     *end_ptr = end;
+     return first;
  }
- 
- 
++
++
 +#ifdef __APPLE__
 +/* neutron: next candidate after a collision with a host mapping Wine does not track
 + * (Metal and GPU memory, system libraries, FEX's JIT). Stepping by the alignment
@@ -246,7 +251,7 @@ ntdll parts of msync (0015) in these files.
 +    mach_port_t object = MACH_PORT_NULL;
 +    size_t align = step > 0 ? step : -step;
 +    char *next = (char *)start + step;
-+
+ 
 +    if (mach_vm_region( mach_task_self(), &addr, &len, VM_REGION_BASIC_INFO_64,
 +                        (vm_region_info_t)&info, &count, &object ) != KERN_SUCCESS)
 +        return next;
@@ -265,10 +270,9 @@ ntdll parts of msync (0015) in these files.
 +    }
 +}
 +#endif
-+
+ 
  /***********************************************************************
   *           try_map_free_area
-  *
 @@ -1559,7 +1609,11 @@
              (step < 0 && (char *)start - (char *)base < -step) ||
              step == 0)
@@ -281,11 +285,10 @@ ntdll parts of msync (0015) in these files.
      }
  
      return NULL;
-@@ -1973,10 +2027,44 @@
-         if (!mprotect( base, size, unix_prot | PROT_EXEC )) return 0;
+@@ -1974,12 +2028,46 @@
          /* exec + write may legitimately fail, in that case fall back to write only */
          if (!(unix_prot & PROT_WRITE)) return -1;
-+    }
+     }
 +#if defined(__APPLE__) && defined(__aarch64__)
 +    /* neutron: Apple Silicon refuses write+exec without MAP_JIT, fall back to write only.
 +     * x86 code under FEX is translated, never executed natively, so games are not affected. */
@@ -293,15 +296,15 @@ ntdll parts of msync (0015) in these files.
 +    {
 +        if (!mprotect( base, size, unix_prot )) return 0;
 +        return mprotect( base, size, unix_prot & ~PROT_EXEC );
-     }
++    }
 +#endif
  
      return mprotect( base, size, unix_prot );
  }
-+
-+
+ 
+ 
 +#if defined(__APPLE__) && defined(__aarch64__)
-+/***********************************************************************
+ /***********************************************************************
 + *           remap_view_jit
 + *
 + * neutron: Apple Silicon only allows write+exec on MAP_JIT memory, and MAP_JIT
@@ -323,9 +326,12 @@ ntdll parts of msync (0015) in these files.
 +    return FALSE;
 +}
 +#endif
- 
- 
- /***********************************************************************
++
++
++/***********************************************************************
+  *           mprotect_range
+  *
+  * Call mprotect on a page range, applying the protections from the per-page byte.
 @@ -3682,6 +3770,10 @@
      pthread_mutexattr_t attr;
  
@@ -347,12 +353,10 @@ ntdll parts of msync (0015) in these files.
  #ifdef VALGRIND_STACK_REGISTER
      VALGRIND_STACK_REGISTER( (char *)data + signal_stack_mask + 1, (char *)data + kernel_stack_size );
  #endif
-@@ -4120,8 +4215,20 @@
-     if (status)
-     {
+@@ -4122,6 +4217,21 @@
          ERR( "wine: failed to map the shared user data: %08x\n", status );
-+        exit(1);
-+    }
+         exit(1);
+     }
 +
 +#ifdef WINE_TEB_IN_TSD
 +    /* page PE code reads the TEB TSD offset from (see NtCurrentTeb in winnt.h) */
@@ -361,14 +365,17 @@ ntdll parts of msync (0015) in these files.
 +    if (status)
 +    {
 +        ERR( "wine: failed to map the TEB offset page: %08x\n", status );
-         exit(1);
-     }
++        exit(1);
++    }
 +    *(volatile unsigned long long *)view->base = __wine_teb_tsd_offset;
++#ifdef __APPLE__
++    init_qpc_info();  /* neutron: QPC in PE code, info at +0x10 */
++#endif
 +#endif
  
      status = map_view( &view, NULL, signal_stack_mask + 1 + kernel_stack_size, MEM_TOP_DOWN,
                         VPROT_READ | VPROT_WRITE | VPROT_COMMITTED, 4 * limit_4g, 0, 0 );
-@@ -4172,6 +4279,11 @@
+@@ -4172,6 +4282,11 @@
  
      if (arm64ec_view) peb->EcCodeBitMap = arm64ec_view->base;
      init_teb( data, ptr );
@@ -380,7 +387,7 @@ ntdll parts of msync (0015) in these files.
      VIRTUAL_DEBUG_DUMP_VIEW( view );
  }
  
-@@ -5230,6 +5342,12 @@
+@@ -5230,6 +5345,12 @@
              if (status == STATUS_SUCCESS)
              {
                  base = view->base;

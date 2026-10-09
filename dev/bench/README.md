@@ -7,8 +7,10 @@ start from Steam.
 | File | What |
 |---|---|
 | `run.sh` | Runs the suite and prints one JSON result, appended to `.native-build/opt/bench-history.jsonl` |
-| `cpu.c` | CPU and Windows API micro benchmarks (x86 code in FEX, memory, atomics, wineserver round trips, clocks, virtual memory, heap, threads, calls into ARM64EC DLLs) |
+| `cpu.c` | CPU and Windows API micro benchmarks (x86 code in FEX, memory, atomics, wineserver round trips, clocks, virtual memory, heap, threads, calls into ARM64EC DLLs); `--nop` and `--user32` for start times |
+| `bigcode.py` | Generates an x86_64 program with many different functions, each run once: FEX JIT cost of a first pass against a second one (see "FEX JIT and its code cache" in docs/neutron.md) |
 | `d3d11.c` | D3D11 CPU overhead: many small draws per frame like an engine, no vsync |
+| `shader_stutter.c` | D3D11 hitches when shaders and pipelines are used for the first time: 400 generated VS/PS pairs come into use over 720 frames paced to 60 Hz, headless; worst frame, frames over budget, cold and warm cache (see "Shader and pipeline stutter" in docs/neutron.md) |
 | `bench.py` | Helper: wraps program output, follows game logs, summarizes, makes baselines, compares |
 | `hang-watch.sh` | Starts a game and dumps it (sample, vmmap, lldb backtraces) when its FPS log stalls |
 
@@ -35,7 +37,10 @@ spread in `spread_pct`.
 - `cpu.*`: ns per operation, FEX fast TSO. `cpu_strict.*`: the TSO-sensitive
   tests again with `NEUTRON_FEX_TSO=strict`.
 - `start.nop_exe_ms`: wall time to start a no-op exe through the tool, warm
-  wineserver.
+  wineserver. `start.nop_exe_cold_ms`: the same with a new wineserver (wineboot
+  `--init` runs first), like every start from Steam. `start.user32_load_ms` and
+  `start.user32_desktop_ms`: loading user32 and the first call that needs the desktop
+  (`explorer.exe /desktop`) in a cold start, from `cpu.exe --user32`.
 - `d3d11_5k.*`: 5000 draws per frame, draw loop time and process CPU time per
   frame. Its FPS sits at the display refresh and is left out.
 - `d3d11_20k.*`: 20000 draws per frame, CPU bound, so its FPS is a CPU number too.
@@ -86,3 +91,23 @@ it writes one dump to `.native-build/opt/hang/<time>-<label>` (`HANG_OUT`
 changes the folder, `HANG_DUMP=0` turns dumps off). It ends after the given
 time, a 30 s stall or 12 FPS lines and prints a `RESULT` line with the number of
 FPS lines, elapsed time and last gap.
+
+## shader_stutter.c
+
+```sh
+CC="$(ls -d .native-build/toolchains/llvm-mingw-*/bin/x86_64-w64-mingw32-clang | tail -1)"
+"$CC" -O2 -o .native-build/opt/shader_stutter.exe dev/bench/shader_stutter.c -ld3d11 -ld3dcompiler
+export SteamAppId=stutter STEAM_COMPAT_DATA_PATH="$PWD/.native-build/opt/stutterdata"
+rm -rf "$STEAM_COMPAT_DATA_PATH/dxmt-cache"          # cold: no DXMT or Metal cache
+tool/neutron runinprefix .native-build/opt/shader_stutter.exe load     # then again for warm
+tool/neutron runinprefix .native-build/opt/shader_stutter.exe stream
+```
+
+`load` creates all shaders before the first frame (level load), `stream` creates each
+pair in the frame that first draws it. Optional arguments: pairs (400), frames (720),
+pacing in FPS (60, 0 = none). One JSON line: `frame_ms_max` (worst frame, from frame
+start to GPU completion, so DXMT's encoder thread waiting for a pipeline counts),
+`over_budget` and `excess_ms` (frames over 16.7 ms and their time above it),
+`submit_ms_max` (app thread only), `hash_rgba8` and `hash_rgba16f` (images, compare
+builds with them). The HLSL is compiled to DXBC before the clock starts (about 3 s).
+`SHADER_STUTTER_CSV=<windows path>` writes the frame times.

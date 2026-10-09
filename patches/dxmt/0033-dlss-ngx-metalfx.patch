@@ -1,0 +1,739 @@
+DLSS on the MetalFX temporal scaler through DXMT's NGX core (nvngx.dll, loaded as _nvngx.dll with
+DXMT_ENABLE_NVEXT=1). Parameter Get() in the vtable order MSVC gives NVSDK_NGX_Parameter, render
+subrect 0 means the whole input, NGX signature override in the registry, and the D3D12 NGX entry
+points: the upscale is recorded into the command list (IMTLD3D12CommandListExt, new encoder type).
+
+diff --git a/src/d3d12/d3d12_command_allocator.cpp b/src/d3d12/d3d12_command_allocator.cpp
+index c218920..c325c0a 100644
+--- a/src/d3d12/d3d12_command_allocator.cpp
++++ b/src/d3d12/d3d12_command_allocator.cpp
+@@ -134,6 +134,11 @@ MTLD3D12CommandAllocatorImpl::Reset() {
+       case EncoderType::Resolve:
+         reinterpret_cast<ResolveEncoderData *>(next)->~ResolveEncoderData();
+         break;
++      case EncoderType::TemporalUpscale:
++        reinterpret_cast<TemporalUpscaleEncoderData *>(next)->~TemporalUpscaleEncoderData();
++        break;
++      default:
++        break;
+       }
+       next = next->next;
+     }
+diff --git a/src/d3d12/d3d12_command_encoder.hpp b/src/d3d12/d3d12_command_encoder.hpp
+index a0bd6e9..a6a77de 100644
+--- a/src/d3d12/d3d12_command_encoder.hpp
++++ b/src/d3d12/d3d12_command_encoder.hpp
+@@ -18,6 +18,7 @@
+ 
+ #pragma once
+ 
++#include "dxmt_scaler.hpp"
+ #include "dxmt_texture.hpp"
+ #include <cstdint>
+ 
+@@ -31,6 +32,7 @@ enum class EncoderType {
+   Compute,
+   Resolve,
+   SampleTimestamp, /* neutron: EndQuery(TIMESTAMP) */
++  TemporalUpscale, /* neutron: MetalFX temporal scaler (DLSS through DXMT's NGX core) */
+ };
+ 
+ struct EncoderData {
+@@ -132,4 +134,15 @@ struct ResolveEncoderData : EncoderData {
+   TextureViewRef dst;
+ };
+ 
++/* neutron: one MetalFX temporal scaler run */
++struct TemporalUpscaleEncoderData : EncoderData {
++  TextureViewRef color;
++  TextureViewRef output;
++  TextureViewRef depth;
++  TextureViewRef motion;
++  TextureViewRef exposure;
++  Rc<TemporalScaler> scaler;
++  WMTFXTemporalScalerProps props;
++};
++
+ }; // namespace dxmt
+diff --git a/src/d3d12/d3d12_command_list.cpp b/src/d3d12/d3d12_command_list.cpp
+index 05324b9..ef9f412 100644
+--- a/src/d3d12/d3d12_command_list.cpp
++++ b/src/d3d12/d3d12_command_list.cpp
+@@ -17,8 +17,10 @@
+  */
+ 
+ #include "d3d12_command_allocator.hpp"
++#include "d3d12_interfaces.hpp"
+ #include "com/com_pointer.hpp"
+ #include "dxmt_format.hpp"
++#include <mutex>
+ 
+ namespace dxmt {
+ 
+@@ -168,6 +170,59 @@ to_metal_primitive_type(D3D12_PRIMITIVE_TOPOLOGY topo, WMTPrimitiveType &primiti
+   return true;
+ }
+ 
++/* neutron: MetalFX temporal scalers for DLSS on D3D12 (DXMT's NGX core). Like the D3D11
++   context they are cached and never destroyed, a game creates only a few. */
++struct CachedTemporalScaler12 {
++  obj_handle_t device;
++  WMTFXTemporalScalerInfo info;
++  Rc<TemporalScaler> scaler;
++};
++
++static Rc<TemporalScaler>
++GetTemporalScaler12(WMT::Device device, const WMTFXTemporalScalerInfo &info) {
++  static std::mutex mutex;
++  static std::vector<CachedTemporalScaler12> cache;
++  std::lock_guard<std::mutex> lock(mutex);
++  for (auto &entry : cache) {
++    if (entry.device == device.handle && entry.info.color_format == info.color_format &&
++        entry.info.output_format == info.output_format && entry.info.depth_format == info.depth_format &&
++        entry.info.motion_format == info.motion_format && entry.info.input_width == info.input_width &&
++        entry.info.input_height == info.input_height && entry.info.output_width == info.output_width &&
++        entry.info.output_height == info.output_height && entry.info.auto_exposure == info.auto_exposure)
++      return entry.scaler;
++  }
++  Rc<TemporalScaler> scaler = new TemporalScaler(device, info);
++  if (!scaler->scaler())
++    return {};
++  cache.push_back({device.handle, info, scaler});
++  return scaler;
++}
++
++static WMTPixelFormat
++TemporalUpscaleMotionVectorFormat(WMTPixelFormat format) {
++  switch (format) {
++  case WMTPixelFormatRG16Uint:
++  case WMTPixelFormatRG16Float:
++  case WMTPixelFormatRG16Sint:
++  case WMTPixelFormatRG16Snorm:
++  case WMTPixelFormatRG16Unorm:
++    return WMTPixelFormatRG16Float;
++  case WMTPixelFormatRG32Uint:
++  case WMTPixelFormatRG32Float:
++  case WMTPixelFormatRG32Sint:
++    return WMTPixelFormatRG32Float;
++  case WMTPixelFormatRGBA16Sint:
++  case WMTPixelFormatRGBA16Snorm:
++  case WMTPixelFormatRGBA16Uint:
++  case WMTPixelFormatRGBA16Unorm:
++  case WMTPixelFormatRGBA16Float:
++    return WMTPixelFormatRGBA16Float;
++  default:
++    break;
++  }
++  return WMTPixelFormatInvalid;
++}
++
+ // `Graphics`CommandList is a really confusing name
+ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12GraphicsCommandList> {
+ 
+@@ -225,6 +280,110 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
+   bool occlusion_in_pass_ = false; /* visibility mode set in the current render pass */
+   bool occlusion_drawn_ = false;   /* the query got a render pass at all */
+ 
++  /* neutron: IMTLD3D12CommandListExt, MetalFX temporal upscaling for DXMT's NGX core */
++  class CommandListExt final : public IMTLD3D12CommandListExt {
++  public:
++    CommandListExt(MTLD3D12GraphicsCommandListImpl *list) : list_(list) {}
++
++    HRESULT STDMETHODCALLTYPE
++    QueryInterface(REFIID riid, void **ppvObject) final {
++      return list_->QueryInterface(riid, ppvObject);
++    }
++    ULONG STDMETHODCALLTYPE
++    AddRef() final {
++      return list_->AddRef();
++    }
++    ULONG STDMETHODCALLTYPE
++    Release() final {
++      return list_->Release();
++    }
++    HRESULT STDMETHODCALLTYPE
++    CheckTemporalUpscaleSupport(BOOL *pSupported) final {
++      if (!pSupported)
++        return E_INVALIDARG;
++      *pSupported = list_->device_->GetMTLDevice().supportsFXTemporalScaler();
++      return S_OK;
++    }
++    HRESULT STDMETHODCALLTYPE
++    TemporalUpscale(const MTL_TEMPORAL_UPSCALE_D3D12_DESC *pDesc) final {
++      return list_->RecordTemporalUpscale(pDesc);
++    }
++
++  private:
++    MTLD3D12GraphicsCommandListImpl *list_;
++  };
++  CommandListExt ext_{this};
++
++  HRESULT
++  RecordTemporalUpscale(const MTL_TEMPORAL_UPSCALE_D3D12_DESC *pDesc) {
++    if (!pDesc || GetType() == D3D12_COMMAND_LIST_TYPE_BUNDLE)
++      return E_INVALIDARG;
++    auto texture_of = [](ID3D12Resource *resource) -> Texture * {
++      auto r = static_cast<MTLD3D12Resource *>(resource);
++      return r ? r->texture.ptr() : nullptr;
++    };
++    Texture *color = texture_of(pDesc->Color), *output = texture_of(pDesc->Output);
++    Texture *depth = texture_of(pDesc->Depth), *motion = texture_of(pDesc->MotionVector);
++    Texture *exposure = texture_of(pDesc->ExposureTexture);
++    if (!color || !output || !depth || !motion || (pDesc->ExposureTexture && !exposure))
++      return E_INVALIDARG;
++    if (pDesc->MotionVectorInDisplayRes) {
++      ERR_ONCE("TemporalUpscale: D3D12 needs motion vectors at render resolution (DLSS flag MVLowRes)");
++      return E_NOTIMPL;
++    }
++    WMTPixelFormat motion_format = TemporalUpscaleMotionVectorFormat(motion->pixelFormat());
++    if (motion_format == WMTPixelFormatInvalid) {
++      ERR("TemporalUpscale: invalid motion vector format ", motion->pixelFormat());
++      return E_INVALIDARG;
++    }
++
++    WMTFXTemporalScalerInfo info = {};
++    info.color_format = color->pixelFormat();
++    info.output_format = output->pixelFormat();
++    info.depth_format = depth->pixelFormat();
++    info.motion_format = motion_format;
++    info.input_width = color->width();
++    info.input_height = color->height();
++    info.output_width = output->width();
++    info.output_height = output->height();
++    info.auto_exposure = pDesc->AutoExposure;
++    info.input_content_properties_enabled = true;
++    info.input_content_min_scale = 1.0f;
++    info.input_content_max_scale = 3.0f;
++    info.requires_synchronous_initialization = true;
++    auto scaler = GetTemporalScaler12(device_->GetMTLDevice(), info);
++    if (!scaler) {
++      ERR("TemporalUpscale: no MetalFX temporal scaler for ", info.input_width, "x", info.input_height, " -> ",
++          info.output_width, "x", info.output_height);
++      return E_FAIL;
++    }
++
++    allocator_->InvalidateCurrentPass();
++    auto pass = allocator_->AllocatePass<TemporalUpscaleEncoderData>();
++    pass->type = EncoderType::TemporalUpscale;
++    pass->color = color->view(color->fullView);
++    pass->output = output->view(output->fullView);
++    pass->depth = depth->view(depth->fullView);
++    pass->motion = motion->view(motion->createView(
++        {.format = motion_format,
++         .type = WMTTextureType2D,
++         .firstMiplevel = 0,
++         .miplevelCount = 1,
++         .firstArraySlice = 0,
++         .arraySize = 1}
++    ));
++    if (exposure)
++      pass->exposure = exposure->view(exposure->fullView);
++    pass->scaler = std::move(scaler);
++    pass->props = WMTFXTemporalScalerProps{
++        pDesc->InputContentWidth,  pDesc->InputContentHeight, (bool)pDesc->InReset,  (bool)pDesc->DepthReversed,
++        pDesc->MotionVectorScaleX, pDesc->MotionVectorScaleY, pDesc->JitterOffsetX, pDesc->JitterOffsetY,
++        pDesc->PreExposure,
++    };
++    allocator_->InvalidateCurrentPass();
++    return S_OK;
++  }
++
+ public:
+   MTLD3D12GraphicsCommandListImpl(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type) :
+       MTLD3D12DeviceChild<MTLD3D12GraphicsCommandList>(pDevice),
+@@ -327,6 +486,11 @@ public:
+       return S_OK;
+     }
+ 
++    if (riid == __uuidof(IMTLD3D12CommandListExt)) {
++      *ppvObject = ref(&ext_);
++      return S_OK;
++    }
++
+     if (logQueryInterfaceError(__uuidof(ID3D12GraphicsCommandList), riid)) {
+       WARN("D3D12GraphicsCommandList: Unknown interface query ", str::format(riid));
+     }
+diff --git a/src/d3d12/d3d12_command_queue.cpp b/src/d3d12/d3d12_command_queue.cpp
+index 9d1eb35..99f66e7 100644
+--- a/src/d3d12/d3d12_command_queue.cpp
++++ b/src/d3d12/d3d12_command_queue.cpp
+@@ -403,6 +403,15 @@ public:
+ 
+           break;
+         }
++        case EncoderType::TemporalUpscale: {
++          /* neutron: the scaler waits for and updates the queue fence like the other passes */
++          auto data = static_cast<TemporalUpscaleEncoderData *>(current);
++          cmdbuf.encodeTemporalScale(
++              data->scaler->scaler(), data->color.texture(), data->output.texture(), data->depth.texture(),
++              data->motion.texture(), data->exposure.texture(), fence_, data->props
++          );
++          break;
++        }
+         }
+         current = current->next;
+       }
+diff --git a/src/d3d12/d3d12_interfaces.hpp b/src/d3d12/d3d12_interfaces.hpp
+new file mode 100644
+index 0000000..b2155dc
+--- /dev/null
++++ b/src/d3d12/d3d12_interfaces.hpp
+@@ -0,0 +1,30 @@
++#pragma once
++#include "com/com_guid.hpp"
++#include "d3d12.h"
++
++/* neutron: MetalFX temporal upscaling recorded into a D3D12 command list, for DXMT's NGX
++   core (DLSS on D3D12). Same fields as MTL_TEMPORAL_UPSCALE_D3D11_DESC. */
++struct MTL_TEMPORAL_UPSCALE_D3D12_DESC {
++  UINT InputContentWidth;
++  UINT InputContentHeight;
++  BOOL AutoExposure;
++  BOOL InReset;
++  BOOL DepthReversed;
++  BOOL MotionVectorInDisplayRes;
++  ID3D12Resource *Color;
++  ID3D12Resource *Depth;
++  ID3D12Resource *MotionVector;
++  ID3D12Resource *Output;
++  FLOAT MotionVectorScaleX;
++  FLOAT MotionVectorScaleY;
++  FLOAT PreExposure;
++  ID3D12Resource *ExposureTexture;
++  FLOAT JitterOffsetX;
++  FLOAT JitterOffsetY;
++};
++
++DEFINE_COM_INTERFACE("5862f1cb-b42d-44f0-b3d0-eb8e78267757", IMTLD3D12CommandListExt) : public IUnknown {
++  /* S_OK when the device has the MetalFX temporal scaler */
++  virtual HRESULT STDMETHODCALLTYPE CheckTemporalUpscaleSupport(BOOL *pSupported) = 0;
++  virtual HRESULT STDMETHODCALLTYPE TemporalUpscale(const MTL_TEMPORAL_UPSCALE_D3D12_DESC *pDesc) = 0;
++};
+diff --git a/src/dxgi/dxgi.cpp b/src/dxgi/dxgi.cpp
+index d53e9ee..215f49f 100644
+--- a/src/dxgi/dxgi.cpp
++++ b/src/dxgi/dxgi.cpp
+@@ -17,9 +17,12 @@ static void InitializeVendorExtensionNV() {
+ #ifdef __i386__
+   return;
+ #endif
+-  HKEY key1 = nullptr, key2 = nullptr, key3 = nullptr;
++  HKEY key1 = nullptr, key2 = nullptr, key3 = nullptr, key4 = nullptr;
+   auto name1 = L"{41FCC608-8496-4DEF-B43E-7D9BD675A6FF}";
+   auto name2 = L"FullPath";
++  /* neutron: the NGX loader in games checks the NVIDIA signature of the NGX core
++     (_nvngx.dll) unless EnableSignatureOverride is set; DXMT's core is not signed */
++  auto name4 = L"EnableSignatureOverride";
+   WCHAR value3[] = L"C:\\Windows\\System32";
+   if (RegCreateKeyExW(HKEY_LOCAL_MACHINE,
+                       L"SOFTWARE\\NVIDIA Corporation\\Global", 0, nullptr, 0,
+@@ -29,18 +32,25 @@ static void InitializeVendorExtensionNV() {
+                       0, KEY_ALL_ACCESS, nullptr, &key2, nullptr) ||
+       RegCreateKeyExW(HKEY_LOCAL_MACHINE,
+                       L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore", 0,
+-                      nullptr, 0, KEY_ALL_ACCESS, nullptr, &key3, nullptr)) {
++                      nullptr, 0, KEY_ALL_ACCESS, nullptr, &key3, nullptr) ||
++      RegCreateKeyExW(HKEY_LOCAL_MACHINE,
++                      L"SYSTEM\\ControlSet001\\Services\\nvlddmkm\\NGXCore", 0,
++                      nullptr, 0, KEY_ALL_ACCESS, nullptr, &key4, nullptr)) {
+     goto cleanup;
+   }
+   if (env::getEnvVar("DXMT_ENABLE_NVEXT") != "1") {
+     RegDeleteValueW(key1, name1);
+     RegDeleteValueW(key2, name1);
+     RegDeleteValueW(key3, name2);
++    RegDeleteValueW(key3, name4);
++    RegDeleteValueW(key4, name4);
+   } else {
+     DWORD _1 = 1;
+     RegSetValueExW(key1, name1, 0, REG_DWORD, (const BYTE *)&_1, sizeof(_1));
+     RegSetValueExW(key2, name1, 0, REG_DWORD, (const BYTE *)&_1, sizeof(_1));
+     RegSetValueExW(key3, name2, 0, REG_SZ, (const BYTE *)value3, sizeof(value3));
++    RegSetValueExW(key3, name4, 0, REG_DWORD, (const BYTE *)&_1, sizeof(_1));
++    RegSetValueExW(key4, name4, 0, REG_DWORD, (const BYTE *)&_1, sizeof(_1));
+     Logger::info("Vendor extension enabled: NVEXT");
+     g_extension_enabled = VendorExtension::Nvidia;
+   }
+@@ -48,6 +58,7 @@ static void InitializeVendorExtensionNV() {
+   if (key1) RegCloseKey(key1);
+   if (key2) RegCloseKey(key2);
+   if (key3) RegCloseKey(key3);
++  if (key4) RegCloseKey(key4);
+ };
+ 
+ static void InitializeMetalCachePath() {
+diff --git a/src/nvngx/nvngx.cpp b/src/nvngx/nvngx.cpp
+index 1b353e8..0e08188 100644
+--- a/src/nvngx/nvngx.cpp
++++ b/src/nvngx/nvngx.cpp
+@@ -5,7 +5,10 @@
+ #include "nvngx_feature.hpp"
+ #include "nvngx_parameter.hpp"
+ #include "../d3d11/d3d11_interfaces.hpp"
++#include "../d3d12/d3d12_interfaces.hpp"
+ #include "../dxgi/dxgi_interfaces.h"
++#include "util_string.hpp"
++#include <algorithm>
+ #include <cmath>
+ 
+ namespace dxmt {
+@@ -41,6 +44,74 @@ NVSDK_NGX_D3D11_Init_with_ProjectID(
+   return NVNGX_RESULT_OK;
+ }
+ 
++/* neutron: DLSS create and evaluate parameters, shared by D3D11 and D3D12 */
++static NVNGX_RESULT
++CreateDLSSFeature(ParametersImpl *parameters, unsigned int **out_handle) {
++  auto dlss = std::make_unique<DLSSFeature>();
++  dlss->feature = NVNGX_FEATURE_SUPERSAMPLING;
++  if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Width, &dlss->width)))
++    return NVNGX_RESULT_INVALID_PARAMETER;
++  if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Height, &dlss->height)))
++    return NVNGX_RESULT_INVALID_PARAMETER;
++  if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_OutWidth, &dlss->target_width)))
++    return NVNGX_RESULT_INVALID_PARAMETER;
++  if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_OutHeight, &dlss->target_height)))
++    return NVNGX_RESULT_INVALID_PARAMETER;
++  if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_PerfQualityValue, &dlss->quality)))
++    dlss->quality = 0;
++  if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_DLSS_Feature_Create_Flags, &dlss->flag)))
++    dlss->flag = 0;
++  if (NVNGX_FAILED(parameters->Get("DLSS.Enable.Output.Subrects", &dlss->enable_output_subrects)))
++    dlss->enable_output_subrects = 0;
++
++  Logger::info(str::format(
++      "NGX: DLSS on MetalFX temporal, ", dlss->width, "x", dlss->height, " -> ", dlss->target_width, "x",
++      dlss->target_height, ", quality ", dlss->quality, ", flags ", dlss->flag
++  ));
++
++  *out_handle = &dlss.release()->handle;
++  return NVNGX_RESULT_OK;
++}
++
++/* Games that leave the render subrect out (older SDKs) or at 0 mean the whole color input;
++   MetalFX needs a size, at most 3x below the output (inputContentMaxScale). */
++template <typename Desc>
++static void
++FillDLSSEvaluation(
++    ParametersImpl *parameters, DLSSFeature *dlss, UINT color_width, UINT color_height, UINT output_width,
++    UINT output_height, Desc &desc
++) {
++  uint32_t width = 0, height = 0;
++  parameters->Get(NVNGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &width);
++  parameters->Get(NVNGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &height);
++  if (!width || !height) {
++    width = std::min(dlss->width, color_width);
++    height = std::min(dlss->height, color_height);
++  }
++  desc.InputContentWidth = std::clamp(width, (output_width + 2) / 3, color_width);
++  desc.InputContentHeight = std::clamp(height, (output_height + 2) / 3, color_height);
++
++  desc.DepthReversed = bool(dlss->flag & NVNGX_DLSS_FLAG_DEPTH_INVERTED);
++  desc.AutoExposure = bool(dlss->flag & NVNGX_DLSS_FLAG_AUTO_EXPOSURE);
++  desc.MotionVectorInDisplayRes = !bool(dlss->flag & NVNGX_DLSS_FLAG_MV_LOWRES);
++
++  if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Jitter_Offset_X, &desc.JitterOffsetX)))
++    desc.JitterOffsetX = 0;
++  if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Jitter_Offset_Y, &desc.JitterOffsetY)))
++    desc.JitterOffsetY = 0;
++
++  int reset = 0;
++  parameters->Get(NVNGX_Parameter_Reset, &reset);
++  desc.InReset = reset;
++
++  if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_MV_Scale_X, &desc.MotionVectorScaleX)))
++    desc.MotionVectorScaleX = 1.0;
++  if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_MV_Scale_Y, &desc.MotionVectorScaleY)))
++    desc.MotionVectorScaleY = 1.0;
++  if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_DLSS_Pre_Exposure, &desc.PreExposure)))
++    desc.PreExposure = 1.0;
++}
++
+ NVNGX_API NVNGX_RESULT
+ NVSDK_NGX_D3D11_CreateFeature(
+     ID3D11DeviceContext *context, unsigned int feature, NVNGXParameter *params, unsigned int **out_handle
+@@ -55,26 +126,7 @@ NVSDK_NGX_D3D11_CreateFeature(
+       return NVNGX_RESULT_FEATURE_NOT_SUPPORTED;
+     if (!feature_supported)
+       return NVNGX_RESULT_FEATURE_NOT_SUPPORTED;
+-
+-    auto dlss = std::make_unique<DLSSFeature>();
+-    dlss->feature = NVNGX_FEATURE_SUPERSAMPLING;
+-    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Width, &dlss->width)))
+-      return NVNGX_RESULT_INVALID_PARAMETER;
+-    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Height, &dlss->height)))
+-      return NVNGX_RESULT_INVALID_PARAMETER;
+-    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_OutWidth, &dlss->target_width)))
+-      return NVNGX_RESULT_INVALID_PARAMETER;
+-    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_OutHeight, &dlss->target_height)))
+-      return NVNGX_RESULT_INVALID_PARAMETER;
+-    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_PerfQualityValue, &dlss->quality)))
+-      dlss->quality = 0;
+-    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_DLSS_Feature_Create_Flags, &dlss->flag)))
+-      dlss->flag = 0;
+-    if (NVNGX_FAILED(parameters->Get("DLSS.Enable.Output.Subrects", &dlss->enable_output_subrects)))
+-      dlss->enable_output_subrects = 0;
+-
+-    *out_handle = &dlss.release()->handle;
+-    return NVNGX_RESULT_OK;
++    return CreateDLSSFeature(parameters, out_handle);
+   }
+ 
+   ERR("NVSDK_NGX_D3D11_CreateFeature: feature ", feature, " not handled");
+@@ -90,63 +142,36 @@ NVSDK_NGX_D3D11_EvaluateFeature(
+   case NVNGX_FEATURE_SUPERSAMPLING: {
+     auto dlss = static_cast<DLSSFeature *>((void *)handle);
+ 
+-    IMTLD3D11ContextExt *pCtxExt = nullptr;
++    Com<IMTLD3D11ContextExt> pCtxExt = nullptr;
+     if (FAILED(context->QueryInterface(IID_PPV_ARGS(&pCtxExt))))
+       return NVNGX_RESULT_INVALID_PARAMETER;
+ 
+     ID3D11Texture2D *input, *output, *depth, *mv, *exposure = nullptr;
+ 
+-    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Color, (ID3D11Resource **)&input)))
++    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Color, (ID3D11Resource **)&input)) || !input)
+       return NVNGX_RESULT_INVALID_PARAMETER;
+-    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Output, (ID3D11Resource **)&output)))
++    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Output, (ID3D11Resource **)&output)) || !output)
+       return NVNGX_RESULT_INVALID_PARAMETER;
+-    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Depth, (ID3D11Resource **)&depth)))
++    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Depth, (ID3D11Resource **)&depth)) || !depth)
+       return NVNGX_RESULT_INVALID_PARAMETER;
+-    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_MotionVectors, (ID3D11Resource **)&mv)))
++    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_MotionVectors, (ID3D11Resource **)&mv)) || !mv)
+       return NVNGX_RESULT_INVALID_PARAMETER;
+     parameters->Get(NVNGX_Parameter_ExposureTexture, (ID3D11Resource **)&exposure);
+ 
+-    uint32_t width = 0, height = 0;
+-    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &width)))
+-      return NVNGX_RESULT_INVALID_PARAMETER;
+-    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &height)))
+-      return NVNGX_RESULT_INVALID_PARAMETER;
++    D3D11_TEXTURE2D_DESC color_desc = {}, output_desc = {};
++    input->GetDesc(&color_desc);
++    output->GetDesc(&output_desc);
+ 
+     MTL_TEMPORAL_UPSCALE_D3D11_DESC desc = {};
+-    desc.InputContentWidth = width;
+-    desc.InputContentHeight = height;
+-
+     desc.Color = input;
+     desc.Output = output;
+     desc.Depth = depth;
+     desc.MotionVector = mv;
+     desc.ExposureTexture = exposure;
+-    desc.DepthReversed = bool(dlss->flag & NVNGX_DLSS_FLAG_DEPTH_INVERTED);
+-    desc.AutoExposure = bool(dlss->flag & NVNGX_DLSS_FLAG_AUTO_EXPOSURE);
+-    desc.MotionVectorInDisplayRes = !bool(dlss->flag & NVNGX_DLSS_FLAG_MV_LOWRES);
+-
+-    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Jitter_Offset_X, &desc.JitterOffsetX)))
+-      desc.JitterOffsetX = 0;
+-    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Jitter_Offset_Y, &desc.JitterOffsetY)))
+-      desc.JitterOffsetY = 0;
+-
+-    int reset = 0;
+-    parameters->Get(NVNGX_Parameter_Reset, &reset);
+-    desc.InReset = reset;
+-
+-    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_MV_Scale_X, &desc.MotionVectorScaleX)))
+-      desc.MotionVectorScaleX = 1.0;
+-    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_MV_Scale_Y, &desc.MotionVectorScaleY)))
+-      desc.MotionVectorScaleY = 1.0;
+-    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_DLSS_Pre_Exposure, &desc.PreExposure)))
+-      desc.PreExposure = 1.0;
++    FillDLSSEvaluation(parameters, dlss, color_desc.Width, color_desc.Height, output_desc.Width, output_desc.Height, desc);
+ 
+     pCtxExt->TemporalUpscale(&desc);
+-
+-    pCtxExt->Release();
+-
+     return NVNGX_RESULT_OK;
+-    break;
+   }
+   default:
+     break;
+@@ -326,6 +351,153 @@ NVSDK_NGX_D3D11_GetFeatureRequirements(
+   return NVNGX_RESULT_FAIL;
+ }
+ 
++/* neutron: the same for D3D12. The upscale is recorded into the game's command list
++   (IMTLD3D12CommandListExt of DXMT's d3d12.dll) and runs when the game executes it. */
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_Init_Ext(
++    unsigned long long id, const wchar_t *path, ID3D12Device *device, unsigned int sdk_version, const void *feature_info
++) {
++  return NVNGX_RESULT_OK;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_Init(
++    unsigned long long id, const wchar_t *path, ID3D12Device *device, const void *feature_info, unsigned int sdk_version
++) {
++  return NVNGX_RESULT_OK;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_Init_ProjectID(
++    const char *project, unsigned int engine_type, const char *engine_version, const wchar_t *path,
++    ID3D12Device *device, unsigned int sdk_version, const void *feature_info
++) {
++  return NVNGX_RESULT_OK;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_Init_with_ProjectID(
++    const char *project, unsigned int engine_type, const char *engine_version, const wchar_t *path,
++    ID3D12Device *device, const void *feature_info, unsigned int sdk_version
++) {
++  return NVNGX_RESULT_OK;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_Shutdown() {
++  return NVNGX_RESULT_OK;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_Shutdown1(ID3D12Device *device) {
++  return NVNGX_RESULT_OK;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_GetScratchBufferSize(unsigned int feature, const NVNGXParameter *params, size_t *out_size) {
++  return NVSDK_NGX_D3D11_GetScratchBufferSize(feature, params, out_size);
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_CreateFeature(
++    ID3D12GraphicsCommandList *command_list, unsigned int feature, NVNGXParameter *params, unsigned int **out_handle
++) {
++  auto parameters = static_cast<ParametersImpl *>(params);
++  Com<IMTLD3D12CommandListExt> pListExt = nullptr;
++  if (!command_list || FAILED(command_list->QueryInterface(IID_PPV_ARGS(&pListExt))))
++    return NVNGX_RESULT_INVALID_PARAMETER;
++  if (feature == NVNGX_FEATURE_SUPERSAMPLING) {
++    BOOL feature_supported = false;
++    if (FAILED(pListExt->CheckTemporalUpscaleSupport(&feature_supported)) || !feature_supported)
++      return NVNGX_RESULT_FEATURE_NOT_SUPPORTED;
++    return CreateDLSSFeature(parameters, out_handle);
++  }
++
++  ERR("NVSDK_NGX_D3D12_CreateFeature: feature ", feature, " not handled");
++  return NVNGX_RESULT_FAIL;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_EvaluateFeature(
++    ID3D12GraphicsCommandList *command_list, const unsigned int *handle, NVNGXParameter *params, void *callback
++) {
++  auto parameters = static_cast<ParametersImpl *>(params);
++  if (!handle || !command_list)
++    return NVNGX_RESULT_INVALID_PARAMETER;
++  switch (static_cast<CommonFeature *>((void *)handle)->feature) {
++  case NVNGX_FEATURE_SUPERSAMPLING: {
++    auto dlss = static_cast<DLSSFeature *>((void *)handle);
++
++    Com<IMTLD3D12CommandListExt> pListExt = nullptr;
++    if (FAILED(command_list->QueryInterface(IID_PPV_ARGS(&pListExt))))
++      return NVNGX_RESULT_INVALID_PARAMETER;
++
++    ID3D12Resource *input, *output, *depth, *mv, *exposure = nullptr;
++    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Color, &input)) || !input)
++      return NVNGX_RESULT_INVALID_PARAMETER;
++    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Output, &output)) || !output)
++      return NVNGX_RESULT_INVALID_PARAMETER;
++    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_Depth, &depth)) || !depth)
++      return NVNGX_RESULT_INVALID_PARAMETER;
++    if (NVNGX_FAILED(parameters->Get(NVNGX_Parameter_MotionVectors, &mv)) || !mv)
++      return NVNGX_RESULT_INVALID_PARAMETER;
++    parameters->Get(NVNGX_Parameter_ExposureTexture, &exposure);
++
++    auto color_desc = input->GetDesc();
++    auto output_desc = output->GetDesc();
++
++    MTL_TEMPORAL_UPSCALE_D3D12_DESC desc = {};
++    desc.Color = input;
++    desc.Output = output;
++    desc.Depth = depth;
++    desc.MotionVector = mv;
++    desc.ExposureTexture = exposure;
++    FillDLSSEvaluation(
++        parameters, dlss, (UINT)color_desc.Width, color_desc.Height, (UINT)output_desc.Width, output_desc.Height, desc
++    );
++
++    if (FAILED(pListExt->TemporalUpscale(&desc)))
++      return NVNGX_RESULT_FAIL;
++    return NVNGX_RESULT_OK;
++  }
++  default:
++    break;
++  }
++  return NVNGX_RESULT_FAIL;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_ReleaseFeature(unsigned int *handle) {
++  return NVSDK_NGX_D3D11_ReleaseFeature(handle);
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_AllocateParameters(NVNGXParameter **out_params) {
++  return NVSDK_NGX_D3D11_AllocateParameters(out_params);
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_DestroyParameters(NVNGXParameter *params) {
++  return NVSDK_NGX_D3D11_DestroyParameters(params);
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_GetCapabilityParameters(NVNGXParameter **out_params) {
++  return NVSDK_NGX_D3D11_GetCapabilityParameters(out_params);
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_GetParameters(NVNGXParameter **out_params) {
++  return NVSDK_NGX_D3D11_GetCapabilityParameters(out_params);
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_GetFeatureRequirements(
++    IDXGIAdapter *adapter, const NVNGX_FeatureDiscoveryInfo *discovery_info, NVNGX_FeatureRequirement *requirement
++) {
++  return NVSDK_NGX_D3D11_GetFeatureRequirements(adapter, discovery_info, requirement);
++}
++
+ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
+                                LPVOID reserved) {
+   if (reason != DLL_PROCESS_ATTACH)
+diff --git a/src/nvngx/nvngx.hpp b/src/nvngx/nvngx.hpp
+index 8e9ea81..78258af 100644
+--- a/src/nvngx/nvngx.hpp
++++ b/src/nvngx/nvngx.hpp
+@@ -34,7 +34,10 @@ enum NVNGX_PERFQUALITY: unsigned int {
+   NVNGX_PERFQUALITY_DLAA,
+ };
+ 
+-class NVNGXParameter { // vtable seems to be inconsistent?
++/* neutron: games call this through the vtable MSVC builds for NVSDK_NGX_Parameter: the
++   overloads of Set and of Get are grouped, each group in reverse declaration order. The
++   Get order was off (Get(ID3D11Resource **) landed on Get(double *) and the other way). */
++class NVNGXParameter {
+ public:
+   virtual void Set(const char *name, void *value) = 0;
+   virtual void Set(const char *name, ID3D12Resource *value) = 0;
+@@ -47,10 +50,10 @@ public:
+ 
+   virtual NVNGX_RESULT Get(const char *name, void **out) const = 0;
+   virtual NVNGX_RESULT Get(const char *name, ID3D12Resource **out) const = 0;
+-  virtual NVNGX_RESULT Get(const char *name, double *out) const = 0;
+-  virtual NVNGX_RESULT Get(const char *name, unsigned int *out) const = 0;
+-  virtual NVNGX_RESULT Get(const char *name, int *out) const = 0;
+   virtual NVNGX_RESULT Get(const char *name, ID3D11Resource **out) const = 0;
++  virtual NVNGX_RESULT Get(const char *name, int *out) const = 0;
++  virtual NVNGX_RESULT Get(const char *name, unsigned int *out) const = 0;
++  virtual NVNGX_RESULT Get(const char *name, double *out) const = 0;
+   virtual NVNGX_RESULT Get(const char *name, float *out) const = 0;
+   virtual NVNGX_RESULT Get(const char *name, unsigned long long *out) const = 0;
+ 

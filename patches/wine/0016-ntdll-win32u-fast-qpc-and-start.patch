@@ -1,0 +1,212 @@
+QueryPerformanceCounter without a syscall: RtlQueryPerformanceCounter reads the counter in PE
+code from the macOS commpage, like libsystem's mach_continuous_time (ntdll). Faster process
+starts: no OpenGL driver load for the GPU list without EGL (win32u opengl.c), font files from
+CTFontManagerCopyAvailableFontURLs instead of font descriptors (win32u freetype.c).
+The parts in ntdll's unix_private.h and virtual.c are in 0003, unix/sync.c in 0012.
+--- a/dlls/ntdll/unixlib.h
++++ b/dlls/ntdll/unixlib.h
+@@ -78,6 +78,46 @@
+     unix_system_time_precise,
+ };
+ 
++#ifdef WINE_TEB_IN_TSD
++/* neutron: QueryPerformanceCounter without a syscall on arm64 macOS. Wine's QPC is
++ * mach_continuous_time() in 100 ns units. libsystem computes that in user mode from
++ * the commpage: the counter register named by _COMM_PAGE_USER_TIMEBASE plus
++ * _COMM_PAGE_CONT_HW_TIMEBASE, both read on every call, so the kernel's update after
++ * sleep is seen right away. PE code reads the same fields; the unix side checks them
++ * against mach_continuous_time() at process start and only then sets enabled (page
++ * after KUSER_SHARED_DATA, see virtual_alloc_first_thread_data). NEUTRON_FAST_QPC=0
++ * keeps the syscall. */
++struct neutron_qpc_info
++{
++    unsigned int enabled;
++    unsigned int numer;   /* mach_timebase_info */
++    unsigned int denom;
++};
++#define NEUTRON_QPC_INFO ((volatile struct neutron_qpc_info *)(WINE_USER_SHARED_DATA_VA + 0x10010))
++
++#if defined(__aarch64__) || defined(__arm64ec__)
++#define DARWIN_COMM_PAGE 0xfffffc000ull  /* _COMM_PAGE64_BASE_ADDRESS on arm64 */
++
++/* mach_continuous_time() as libsystem computes it, FALSE if the commpage has no user-mode path */
++static inline BOOL darwin_continuous_time( unsigned long long *ret )
++{
++    const volatile unsigned char *page = (const volatile unsigned char *)DARWIN_COMM_PAGE;
++    unsigned long long ticks;
++
++    if (!page[0x91]) return FALSE;  /* _COMM_PAGE_CONT_HWCLOCK */
++    switch (page[0x90])             /* _COMM_PAGE_USER_TIMEBASE */
++    {
++    case 3: __asm__ __volatile__( "mrs %0, s3_4_c15_c10_6" : "=r" (ticks) ); break;  /* ACNTVCT_EL0 */
++    case 2: __asm__ __volatile__( "mrs %0, s3_3_c14_c0_6" : "=r" (ticks) ); break;   /* CNTVCTSS_EL0 */
++    case 1: __asm__ __volatile__( "isb\n\tmrs %0, cntvct_el0" : "=r" (ticks) ); break;
++    default: return FALSE;
++    }
++    *ret = ticks + *(const volatile unsigned long long *)(DARWIN_COMM_PAGE + 0xa8);  /* _COMM_PAGE_CONT_HW_TIMEBASE */
++    return TRUE;
++}
++#endif
++#endif
++
+ extern unixlib_handle_t __wine_unixlib_handle;
+ 
+ #endif /* __NTDLL_UNIXLIB_H */
+--- a/dlls/ntdll/time.c
++++ b/dlls/ntdll/time.c
+@@ -381,6 +381,21 @@
+  */
+ BOOL WINAPI DECLSPEC_HOTPATCH RtlQueryPerformanceCounter( LARGE_INTEGER *counter )
+ {
++#if defined(WINE_TEB_IN_TSD) && (defined(__aarch64__) || defined(__arm64ec__))
++    /* neutron: read the counter in user mode (see darwin_continuous_time), the same
++     * value NtQueryPerformanceCounter computes on the unix side, without the syscall */
++    const volatile struct neutron_qpc_info *info = NEUTRON_QPC_INFO;
++    unsigned long long ticks;
++
++    if (info->enabled && darwin_continuous_time( &ticks ))
++    {
++        if (info->numer == 125 && info->denom == 3)  /* 24 MHz, constant divisions */
++            counter->QuadPart = ticks * 125 / 3 / 100;
++        else
++            counter->QuadPart = ticks * info->numer / info->denom / 100;
++        return TRUE;
++    }
++#endif
+     NtQueryPerformanceCounter( counter, NULL );
+     return TRUE;
+ }
+--- a/dlls/win32u/opengl.c
++++ b/dlls/win32u/opengl.c
+@@ -3527,6 +3527,12 @@
+ {
+     struct egl_platform *egl;
+ 
++#ifndef SONAME_LIBEGL
++    /* neutron: only EGL devices are listed, and without EGL there are none. Loading the
++     * host OpenGL driver just to find that out took 0.5 s on macOS (explorer.exe at every
++     * desktop start, any process that rebuilds the display cache). */
++    return TRUE;
++#endif
+     if (!__wine_get_opengl_driver( WINE_OPENGL_DRIVER_VERSION )) return FALSE;
+ 
+     LIST_FOR_EACH_ENTRY( egl, &devices_egl, struct egl_platform, entry )
+--- a/dlls/win32u/freetype.c
++++ b/dlls/win32u/freetype.c
+@@ -1359,13 +1359,9 @@
+ 
+ static void load_mac_font_callback(const void *value, void *context)
+ {
+-    CFURLRef url = value;
+-    CFStringRef pathStr;
++    CFStringRef pathStr = value;
+     CFIndex len;
+     char* path;
+-
+-    pathStr = CFURLCopyFileSystemPath(url, kCFURLPOSIXPathStyle);
+-    if (!pathStr) return;
+ 
+     len = CFStringGetMaximumSizeOfFileSystemRepresentation(pathStr);
+     path = malloc( len );
+@@ -1375,78 +1371,57 @@
+         AddFontToList(NULL, path, NULL, 0, ADDFONT_EXTERNAL_FONT);
+     }
+     free( path );
+-    CFRelease(pathStr);
+ }
+ 
+ static void load_mac_fonts(void)
+ {
+-    CFStringRef removeDupesKey;
+-    CFBooleanRef removeDupesValue;
+-    CFDictionaryRef options;
+-    CTFontCollectionRef col;
+-    CFArrayRef descs;
+-    CFMutableSetRef urls;
++    CFArrayRef urls;
++    CFMutableSetRef paths;
+     CFIndex i;
+ 
+-    removeDupesKey = kCTFontCollectionRemoveDuplicatesOption;
+-    removeDupesValue = kCFBooleanTrue;
+-    options = CFDictionaryCreate(NULL, (const void**)&removeDupesKey, (const void**)&removeDupesValue, 1,
+-                                 &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+-    col = CTFontCollectionCreateFromAvailableFonts(options);
+-    if (options) CFRelease(options);
+-    if (!col)
++    /* neutron: CTFontManagerCopyAvailableFontURLs lists the same font files as the descriptors
++     * of CTFontCollectionCreateFromAvailableFonts (306 of 306 on macOS 27) in about 10 ms
++     * instead of 45 ms, and every process that loads user32 runs this. It returns some files
++     * more than once under different URLs, so the set holds paths. */
++    urls = CTFontManagerCopyAvailableFontURLs();
++    if (!urls)
+     {
+-        WARN("CTFontCollectionCreateFromAvailableFonts failed\n");
++        WARN("CTFontManagerCopyAvailableFontURLs failed\n");
+         return;
+     }
+ 
+-    descs = CTFontCollectionCreateMatchingFontDescriptors(col);
+-    CFRelease(col);
+-    if (!descs)
+-    {
+-        WARN("CTFontCollectionCreateMatchingFontDescriptors failed\n");
+-        return;
+-    }
+-
+-    urls = CFSetCreateMutable(NULL, 0, &kCFTypeSetCallBacks);
+-    if (!urls)
++    paths = CFSetCreateMutable(NULL, 0, &kCFTypeSetCallBacks);
++    if (!paths)
+     {
+         WARN("CFSetCreateMutable failed\n");
+-        CFRelease(descs);
++        CFRelease(urls);
+         return;
+     }
+ 
+-    for (i = 0; i < CFArrayGetCount(descs); i++)
++    for (i = 0; i < CFArrayGetCount(urls); i++)
+     {
+-        CTFontDescriptorRef desc;
+-        CFURLRef url;
+-        CFStringRef ext;
++        CFURLRef url = CFArrayGetValueAtIndex(urls, i);
++        CFStringRef ext, path;
+ 
+-        desc = CFArrayGetValueAtIndex(descs, i);
+-        url = CTFontDescriptorCopyAttribute(desc, kCTFontURLAttribute);
+-        if (!url) continue;
+-
+         ext = CFURLCopyPathExtension(url);
+         if (ext)
+         {
+             BOOL skip = (CFStringCompare(ext, CFSTR("pfa"), kCFCompareCaseInsensitive) == kCFCompareEqualTo ||
+                          CFStringCompare(ext, CFSTR("pfb"), kCFCompareCaseInsensitive) == kCFCompareEqualTo);
+             CFRelease(ext);
+-            if (skip)
+-            {
+-                CFRelease(url);
+-                continue;
+-            }
++            if (skip) continue;
+         }
+ 
+-        CFSetAddValue(urls, url);
+-        CFRelease(url);
++        path = CFURLCopyFileSystemPath(url, kCFURLPOSIXPathStyle);
++        if (!path) continue;
++        CFSetAddValue(paths, path);
++        CFRelease(path);
+     }
+ 
+-    CFRelease(descs);
+-
+-    CFSetApplyFunction(urls, load_mac_font_callback, NULL);
+     CFRelease(urls);
++
++    CFSetApplyFunction(paths, load_mac_font_callback, NULL);
++    CFRelease(paths);
+ }
+ 
+ #endif

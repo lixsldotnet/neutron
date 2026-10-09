@@ -1,0 +1,1081 @@
+D3D12 command list gaps. Queries: occlusion and binary occlusion through Metal visibility results in the
+heap, timestamps sampled by a blit pass into a counter sample buffer and resolved on the GPU (after their
+command buffer completed), statistics resolve to zeros. ExecuteBundle replays recorded bundle calls; buffer
+to buffer CopyTextureRegion, WriteBufferImmediate, whole-region ResolveSubresourceRegion; DiscardResource.
+
+diff --git a/src/d3d12/d3d12_command_encoder.hpp b/src/d3d12/d3d12_command_encoder.hpp
+index 1caf3bc..a0bd6e9 100644
+--- a/src/d3d12/d3d12_command_encoder.hpp
++++ b/src/d3d12/d3d12_command_encoder.hpp
+@@ -30,6 +30,7 @@ enum class EncoderType {
+   Blit,
+   Compute,
+   Resolve,
++  SampleTimestamp, /* neutron: EndQuery(TIMESTAMP) */
+ };
+ 
+ struct EncoderData {
+@@ -101,6 +102,10 @@ struct RenderEncoderData : EncoderData {
+   uint8_t dsv_readonly_flags;
+   uint8_t render_target_count;
+   bool use_visibility_result = 0;
++  obj_handle_t visibility_buffer = NULL_OBJECT_HANDLE; /* neutron: occlusion query heap of this pass */
++  /* neutron: attachment textures, for DiscardResource */
++  Texture *color_textures[8] = {};
++  Texture *depth_texture = nullptr;
+   bool use_tessellation = 0;
+   bool use_geometry = 0;
+ };
+@@ -108,12 +113,20 @@ struct RenderEncoderData : EncoderData {
+ struct BlitEncoderData : EncoderData {
+   wmtcmd_blit_nop cmd_head;
+   wmtcmd_base *cmd_tail;
++  bool resolves_timestamps = false; /* neutron: needs the timestamps sampled before it */
+ };
+ 
+ struct ComputeEncoderData : EncoderData {
+   wmtcmd_compute_nop cmd_head;
+   wmtcmd_base *cmd_tail;
+ };
++/* neutron: an (almost) empty blit pass that samples the GPU time at its start */
++struct SampleTimestampEncoderData : EncoderData {
++  obj_handle_t sample_buffer;
++  uint32_t index;
++  obj_handle_t dummy_buffer;
++};
++
+ struct ResolveEncoderData : EncoderData {
+   TextureViewRef src;
+   TextureViewRef dst;
+diff --git a/src/d3d12/d3d12_command_list.cpp b/src/d3d12/d3d12_command_list.cpp
+index 21ba13f..05324b9 100644
+--- a/src/d3d12/d3d12_command_list.cpp
++++ b/src/d3d12/d3d12_command_list.cpp
+@@ -216,8 +216,34 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
+   obj_handle_t bound_pso_ = NULL_OBJECT_HANDLE;
+   MTLD3D12GraphicsPipelineState::Kind bound_kind_ = MTLD3D12GraphicsPipelineState::Kind::Ordinary;
+ 
++  /* neutron: the occlusion query between BeginQuery and EndQuery. Its heap's result buffer is
++     the visibility result buffer of the render passes it draws in; a query that spans render
++     passes keeps only the count of the last one (Metal overwrites the slot per pass) */
++  MTLD3D12QueryHeap *occlusion_heap_ = nullptr;
++  UINT occlusion_index_ = 0;
++  bool occlusion_binary_ = false;
++  bool occlusion_in_pass_ = false; /* visibility mode set in the current render pass */
++  bool occlusion_drawn_ = false;   /* the query got a render pass at all */
++
+ public:
+-  MTLD3D12GraphicsCommandListImpl(MTLD3D12Device *pDevice) : MTLD3D12DeviceChild<MTLD3D12GraphicsCommandList>(pDevice) {}
++  MTLD3D12GraphicsCommandListImpl(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type) :
++      MTLD3D12DeviceChild<MTLD3D12GraphicsCommandList>(pDevice),
++      type_(Type) {}
++
++  /* neutron: bundles record their calls and ExecuteBundle replays them on the calling list
++     (bundles inherit the root signatures, root arguments and descriptor heaps, and what they
++     set stays set, as in D3D12) */
++  D3D12_COMMAND_LIST_TYPE type_;
++  Com<ID3D12PipelineState> bundle_initial_pso_;
++  std::vector<std::function<void(MTLD3D12GraphicsCommandListImpl *)>> bundle_calls_;
++
++  /* neutron: DiscardResource: textures whose next render pass loads them with DontCare,
++     valid only if that pass directly follows the discard */
++  struct PendingDiscard {
++    Texture *texture;
++    size_t pass_index;
++  };
++  std::vector<PendingDiscard> pending_discards_;
+ 
+   ~MTLD3D12GraphicsCommandListImpl() {}
+ 
+@@ -263,6 +289,9 @@ public:
+     index_type = {};
+     index_offset = 0;
+ 
++    occlusion_heap_ = nullptr;
++    occlusion_in_pass_ = false;
++
+     dirty_state_.clrAll();
+   }
+ 
+@@ -270,6 +299,10 @@ public:
+   Initialize(ID3D12CommandAllocator *pAllocator, ID3D12PipelineState *pInitialPipelineState) {
+     auto allocator = static_cast<MTLD3D12CommandAllocatorImpl *>(pAllocator);
+ 
++    bundle_calls_.clear();
++    bundle_initial_pso_ = pInitialPipelineState;
++    pending_discards_.clear();
++
+     if (allocator_ != allocator)
+       allocator_ = allocator;
+ 
+@@ -303,7 +336,7 @@ public:
+ 
+   D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE
+   GetType() {
+-    return D3D12_COMMAND_LIST_TYPE_DIRECT;
++    return type_; /* neutron: bundles, compute and copy lists report their type */
+   }
+ 
+   HRESULT STDMETHODCALLTYPE
+@@ -380,6 +413,26 @@ public:
+     EncodeSetBuffer(WMTRenderCommandSetFragmentBuffer, Offset, Index);
+   }
+ 
++  /* neutron: a pending discard of this texture applies to the pass being created now if no
++     other pass came in between */
++  bool
++  ConsumeDiscard(Texture *texture) {
++    bool hit = false;
++    for (auto it = pending_discards_.begin(); it != pending_discards_.end();) {
++      if (it->pass_index != allocator_->encoder_count_) {
++        it = pending_discards_.erase(it);
++        continue;
++      }
++      if (it->texture == texture) {
++        hit = true;
++        it = pending_discards_.erase(it);
++        continue;
++      }
++      ++it;
++    }
++    return hit;
++  }
++
+   DrawCallStatus
+   PreDraw(bool SkipResourceBinding = false, uint32_t IndexFormat = SM50_INDEX_BUFFER_FORMAT_NONE) {
+     using Kind = MTLD3D12GraphicsPipelineState::Kind;
+@@ -409,8 +462,9 @@ public:
+         auto &rt = render->colors[i];
+         rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
+         rt.depth_plane = AttachmentDesc.DepthPlane;
+-        rt.load_action = WMTLoadActionLoad;
++        rt.load_action = ConsumeDiscard(AttachmentDesc.Texture) ? WMTLoadActionDontCare : WMTLoadActionLoad;
+         rt.store_action = WMTStoreActionStore;
++        render->color_textures[i] = AttachmentDesc.Texture;
+         render_target_width = std::min(render_target_width, AttachmentDesc.Width);
+         render_target_height = std::min(render_target_height, AttachmentDesc.Height);
+         render_target_array_length = std::max(render_target_array_length, AttachmentDesc.RenderTargetArrayLength);
+@@ -422,18 +476,20 @@ public:
+         if (!AttachmentDesc.Texture)
+           continue;
+         auto dsv_planar_flags = DepthStencilPlanarFlags(AttachmentDesc.Texture->pixelFormat(AttachmentDesc.View));
++        auto dsv_load = ConsumeDiscard(AttachmentDesc.Texture) ? WMTLoadActionDontCare : WMTLoadActionLoad;
++        render->depth_texture = AttachmentDesc.Texture;
+         if (dsv_planar_flags & 1) {
+           auto &rt = render->depth;
+           rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
+           rt.depth_plane = 0; // DSV cannot be 3D
+-          rt.load_action = WMTLoadActionLoad;
++          rt.load_action = dsv_load;
+           rt.store_action = WMTStoreActionStore;
+         }
+         if (dsv_planar_flags & 2) {
+           auto &rt = render->stencil;
+           rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
+           rt.depth_plane = 0; // DSV cannot be 3D
+-          rt.load_action = WMTLoadActionLoad;
++          rt.load_action = dsv_load;
+           rt.store_action = WMTStoreActionStore;
+         }
+         render->dsv_planar_flags = dsv_planar_flags;
+@@ -455,8 +511,12 @@ public:
+       dirty_state_.set(DirtyState::GraphicsPipelineState);
+       bound_pso_ = NULL_OBJECT_HANDLE;
+       bound_kind_ = Kind::Ordinary;
++      occlusion_in_pass_ = false;
+     }
+ 
++    if (occlusion_heap_ && !occlusion_in_pass_)
++      EnableOcclusionQuery();
++
+     if (!pso_graphics_)
+       return DrawCallStatus::Invalid;
+ 
+@@ -670,6 +730,12 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   DrawInstanced(UINT VertexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation, UINT StartInstanceLocation) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->DrawInstanced(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
++      });
++      return;
++    }
+     WMTPrimitiveType primitive_type;
+     uint32_t cp_count;
+     if (!to_metal_primitive_type(topology_, primitive_type, cp_count))
+@@ -698,6 +764,14 @@ public:
+       UINT IndexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation, INT BaseVertexLocation,
+       UINT StartInstanceLocation
+   ) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->DrawIndexedInstanced(
++            IndexCountPerInstance, InstanceCount, StartVertexLocation, BaseVertexLocation, StartInstanceLocation
++        );
++      });
++      return;
++    }
+     WMTPrimitiveType primitive_type;
+     uint32_t cp_count;
+     if (!to_metal_primitive_type(topology_, primitive_type, cp_count))
+@@ -798,6 +872,12 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   Dispatch(UINT X, UINT Y, UINT Z) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->Dispatch(X, Y, Z);
++      });
++      return;
++    }
+     if (!PreDispatch())
+       return;
+ 
+@@ -1032,8 +1112,34 @@ public:
+                              ? (src_planar ? WMTBlitOptionStencilFromDepthStencil : WMTBlitOptionDepthFromDepthStencil)
+                              : WMTBlitOptionNone;
+       } else {
+-        // so it is buffer to buffer copy?
+-        IMPLEMENT_ME
++        /* neutron: footprint to footprint (buffer to buffer), row by row */
++        auto &src = static_cast<MTLD3D12Resource *>(pSrc->pResource)->buffer;
++        if (!src)
++          return;
++        auto block = dst_format.Flag & MTL_DXGI_FORMAT_BC ? 4u : 1u;
++        auto &sf = pSrc->PlacedFootprint.Footprint;
++        auto &df = pDst->PlacedFootprint.Footprint;
++        uint64_t row_bytes = uint64_t((src_box.right - src_box.left + block - 1) / block) * dst_format.BytesPerTexel;
++        uint32_t rows = (src_box.bottom - src_box.top + block - 1) / block;
++        uint64_t src_slice = uint64_t(sf.RowPitch) * ((sf.Height + block - 1) / block);
++        uint64_t dst_slice = uint64_t(df.RowPitch) * ((df.Height + block - 1) / block);
++        for (uint32_t z = 0; z < src_box.back - src_box.front; z++) {
++          uint64_t src_off = pSrc->PlacedFootprint.Offset + (src_box.front + z) * src_slice +
++                             (src_box.top / block) * uint64_t(sf.RowPitch) +
++                             (src_box.left / block) * dst_format.BytesPerTexel;
++          uint64_t dst_off = pDst->PlacedFootprint.Offset + (DstZ + z) * dst_slice +
++                             (DstY / block) * uint64_t(df.RowPitch) + (DstX / block) * dst_format.BytesPerTexel;
++          bool contiguous = sf.RowPitch == df.RowPitch && row_bytes == sf.RowPitch;
++          for (uint32_t y = 0; y < (contiguous ? 1u : rows); y++) {
++            auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
++            cmd_cp.type = WMTBlitCommandCopyFromBufferToBuffer;
++            cmd_cp.src = src->current()->buffer();
++            cmd_cp.src_offset = src_off + y * uint64_t(sf.RowPitch);
++            cmd_cp.dst = dst->current()->buffer();
++            cmd_cp.dst_offset = dst_off + y * uint64_t(df.RowPitch);
++            cmd_cp.copy_length = contiguous ? row_bytes * rows : row_bytes;
++          }
++        }
+       }
+     }
+   };
+@@ -1138,6 +1244,12 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY Topology) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->IASetPrimitiveTopology(Topology);
++      });
++      return;
++    }
+     topology_ = Topology;
+   };
+ 
+@@ -1165,6 +1277,15 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   OMSetBlendFactor(const FLOAT BlendFactors[4]) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      std::array<FLOAT, 4> f = {1, 1, 1, 1};
++      if (BlendFactors)
++        memcpy(f.data(), BlendFactors, sizeof(f));
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->OMSetBlendFactor(f.data());
++      });
++      return;
++    }
+     if (BlendFactors) {
+       memcpy(blend_factor_, BlendFactors, std::size(blend_factor_) * sizeof(blend_factor_[0]));
+     } else {
+@@ -1178,6 +1299,12 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   OMSetStencilRef(UINT StencilRef) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->OMSetStencilRef(StencilRef);
++      });
++      return;
++    }
+     if (stencil_ref_ == (UINT8)StencilRef)
+       return;
+     stencil_ref_ = (UINT8)StencilRef;
+@@ -1186,6 +1313,12 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   SetPipelineState(ID3D12PipelineState *pPSO) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->SetPipelineState(pPSO);
++      });
++      return;
++    }
+     if (!pPSO) {
+       pso_graphics_ = nullptr;
+       pso_compute_ = nullptr;
+@@ -1217,9 +1350,26 @@ public:
+     // optimization hints later)
+   };
+ 
+-  void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList *CommandList) { IMPLEMENT_ME };
++  void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList *CommandList) {
++    /* neutron: replay the bundle's calls; its initial pipeline state comes first */
++    auto bundle =
++        static_cast<MTLD3D12GraphicsCommandListImpl *>(static_cast<MTLD3D12GraphicsCommandList *>(CommandList));
++    if (!bundle || bundle->type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE || bundle == this)
++      return;
++    if (bundle->bundle_initial_pso_)
++      SetPipelineState(bundle->bundle_initial_pso_.ptr());
++    for (auto &call : bundle->bundle_calls_)
++      call(this);
++  };
+ 
+   void STDMETHODCALLTYPE SetDescriptorHeaps(UINT HeapCount, ID3D12DescriptorHeap *const *Heaps) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      std::vector<ID3D12DescriptorHeap *> heaps(Heaps, Heaps + HeapCount);
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->SetDescriptorHeaps(heaps.size(), heaps.data());
++      });
++      return;
++    }
+     // descriptor tables carry the full descriptor address in the root arguments;
+     // neutron: shaders that index the heaps directly (SM 6.6) get the heap addresses
+     for (UINT i = 0; i < HeapCount; i++) {
+@@ -1253,6 +1403,12 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   SetComputeRootSignature(ID3D12RootSignature *pRootSignature) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->SetComputeRootSignature(pRootSignature);
++      });
++      return;
++    }
+     if (rootsig_compute_.ptr() == pRootSignature)
+       return;
+     if (pRootSignature) {
+@@ -1267,6 +1423,12 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   SetGraphicsRootSignature(ID3D12RootSignature *pRootSignature) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->SetGraphicsRootSignature(pRootSignature);
++      });
++      return;
++    }
+     if (rootsig_graphics_.ptr() == pRootSignature)
+       return;
+     if (pRootSignature) {
+@@ -1280,6 +1442,12 @@ public:
+   };
+ 
+   void STDMETHODCALLTYPE SetComputeRootDescriptorTable(UINT Index, D3D12_GPU_DESCRIPTOR_HANDLE BaseDescriptor) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->SetComputeRootDescriptorTable(Index, BaseDescriptor);
++      });
++      return;
++    }
+     if (!rootsig_compute_)
+       return;
+     if (Index > rootsig_compute_->ParameterSlots)
+@@ -1290,6 +1458,12 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   SetGraphicsRootDescriptorTable(UINT Index, D3D12_GPU_DESCRIPTOR_HANDLE BaseDescriptor) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->SetGraphicsRootDescriptorTable(Index, BaseDescriptor);
++      });
++      return;
++    }
+     if (!rootsig_graphics_)
+       return;
+     if (Index > rootsig_graphics_->ParameterSlots)
+@@ -1299,6 +1473,12 @@ public:
+   };
+ 
+   void STDMETHODCALLTYPE SetComputeRoot32BitConstant(UINT Index, UINT Data, UINT DstOffset) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->SetComputeRoot32BitConstant(Index, Data, DstOffset);
++      });
++      return;
++    }
+     if (!rootsig_compute_)
+       return;
+     if (Index > rootsig_compute_->ParameterSlots)
+@@ -1310,6 +1490,12 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   SetGraphicsRoot32BitConstant(UINT Index, UINT Data, UINT DstOffset) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->SetGraphicsRoot32BitConstant(Index, Data, DstOffset);
++      });
++      return;
++    }
+     if (!rootsig_graphics_)
+       return;
+     if (Index > rootsig_graphics_->ParameterSlots)
+@@ -1321,6 +1507,13 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   SetComputeRoot32BitConstants(UINT Index, UINT ConstantCount, const void *pData, UINT DstOffset) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      std::vector<uint32_t> data((const uint32_t *)pData, (const uint32_t *)pData + ConstantCount);
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->SetComputeRoot32BitConstants(Index, ConstantCount, data.data(), DstOffset);
++      });
++      return;
++    }
+     if (!rootsig_compute_)
+       return;
+     if (Index > rootsig_compute_->ParameterSlots)
+@@ -1335,6 +1528,13 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   SetGraphicsRoot32BitConstants(UINT Index, UINT ConstantCount, const void *pData, UINT DstOffset) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      std::vector<uint32_t> data((const uint32_t *)pData, (const uint32_t *)pData + ConstantCount);
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->SetGraphicsRoot32BitConstants(Index, ConstantCount, data.data(), DstOffset);
++      });
++      return;
++    }
+     if (!rootsig_graphics_)
+       return;
+     if (Index > rootsig_graphics_->ParameterSlots)
+@@ -1348,6 +1548,12 @@ public:
+   };
+ 
+   void STDMETHODCALLTYPE SetComputeRootConstantBufferView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->SetComputeRootConstantBufferView(Index, VA);
++      });
++      return;
++    }
+     if (!rootsig_compute_)
+       return;
+     if (Index > rootsig_compute_->ParameterSlots)
+@@ -1358,6 +1564,12 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   SetGraphicsRootConstantBufferView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->SetGraphicsRootConstantBufferView(Index, VA);
++      });
++      return;
++    }
+     if (!rootsig_graphics_)
+       return;
+     if (Index > rootsig_graphics_->ParameterSlots)
+@@ -1367,6 +1579,12 @@ public:
+   };
+ 
+   void STDMETHODCALLTYPE SetComputeRootShaderResourceView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->SetComputeRootShaderResourceView(Index, VA);
++      });
++      return;
++    }
+     if (!rootsig_compute_)
+       return;
+     if (Index > rootsig_compute_->ParameterSlots)
+@@ -1377,6 +1595,12 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   SetGraphicsRootShaderResourceView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->SetGraphicsRootShaderResourceView(Index, VA);
++      });
++      return;
++    }
+     if (!rootsig_graphics_)
+       return;
+     if (Index > rootsig_graphics_->ParameterSlots)
+@@ -1386,6 +1610,12 @@ public:
+   };
+ 
+   void STDMETHODCALLTYPE SetComputeRootUnorderedAccessView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->SetComputeRootUnorderedAccessView(Index, VA);
++      });
++      return;
++    }
+     if (!rootsig_compute_)
+       return;
+     if (Index > rootsig_compute_->ParameterSlots)
+@@ -1396,6 +1626,12 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   SetGraphicsRootUnorderedAccessView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->SetGraphicsRootUnorderedAccessView(Index, VA);
++      });
++      return;
++    }
+     if (!rootsig_graphics_)
+       return;
+     if (Index > rootsig_graphics_->ParameterSlots)
+@@ -1406,6 +1642,14 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW *pView) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      bool has_view = pView != nullptr;
++      D3D12_INDEX_BUFFER_VIEW view = has_view ? *pView : D3D12_INDEX_BUFFER_VIEW{};
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->IASetIndexBuffer(has_view ? &view : nullptr);
++      });
++      return;
++    }
+     auto index_buffer_allocation = pView ? device_->LookupBufferByVA(pView->BufferLocation, &index_offset) : nullptr;
+     if (index_buffer_allocation) {
+       index_buffer_address = pView->BufferLocation;
+@@ -1421,6 +1665,15 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   IASetVertexBuffers(UINT StartSlot, UINT Count, const D3D12_VERTEX_BUFFER_VIEW *Views) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      if (!Views)
++        return;
++      std::vector<D3D12_VERTEX_BUFFER_VIEW> views(Views, Views + Count);
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->IASetVertexBuffers(StartSlot, views.size(), views.data());
++      });
++      return;
++    }
+     if (!Views)
+       return;
+     
+@@ -1641,17 +1894,132 @@ public:
+   };
+ 
+   void STDMETHODCALLTYPE DiscardResource(ID3D12Resource *pResource, const D3D12_DISCARD_REGION *pRegion) {
+-    // do nothing for now
++    /* neutron: like DXMT's D3D11 DiscardView (0016): the render pass that just wrote the
++       texture stores it with DontCare and the next one, if it follows directly, loads it with
++       DontCare. Rectangles and buffers stay a no-op. */
++    auto resource = static_cast<MTLD3D12Resource *>(pResource);
++    if (!resource || !resource->texture || (pRegion && pRegion->NumRects))
++      return;
++    Texture *texture = resource->texture.ptr();
++    if (InRenderPass()) {
++      auto render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
++      bool found = false;
++      for (unsigned i = 0; i < render->colors.size(); i++) {
++        if (render->color_textures[i] == texture && render->colors[i].attachment) {
++          render->colors[i].store_action = WMTStoreActionDontCare;
++          found = true;
++        }
++      }
++      if (render->depth_texture == texture) {
++        if (render->depth.attachment)
++          render->depth.store_action = WMTStoreActionDontCare;
++        if (render->stencil.attachment)
++          render->stencil.store_action = WMTStoreActionDontCare;
++        found = true;
++      }
++      if (found)
++        allocator_->InvalidateCurrentPass();
++    }
++    pending_discards_.push_back({texture, allocator_->encoder_count_ + (allocator_->encoder_current ? 1 : 0)});
+   };
+ 
++  /* neutron: queries. Occlusion: Metal visibility results in the heap's buffer (counting, or
++     boolean for BINARY_OCCLUSION). Timestamps: a blit pass that samples the GPU clock into the
++     heap's counter sample buffer, resolved on the GPU. Pipeline and stream output statistics
++     are not available on Metal and resolve to zeros. */
++  void
++  EnableOcclusionQuery() {
++    auto render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
++    auto buffer = occlusion_heap_->results.handle;
++    if (render->visibility_buffer && render->visibility_buffer != buffer) {
++      WARN("BeginQuery: occlusion queries of two heaps in one render pass, the second one is not counted");
++      occlusion_in_pass_ = true;
++      return;
++    }
++    render->visibility_buffer = buffer;
++    auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setvisibilitymode>();
++    cmd.type = WMTRenderCommandSetVisibilityMode;
++    cmd.mode = occlusion_binary_ ? WMTVisibilityResultModeBoolean : WMTVisibilityResultModeCounting;
++    cmd.offset = uint64_t(occlusion_index_ + 1) * sizeof(uint64_t);
++    occlusion_in_pass_ = true;
++    occlusion_drawn_ = true;
++  }
++
++  void
++  DisableOcclusionQuery() {
++    auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setvisibilitymode>();
++    cmd.type = WMTRenderCommandSetVisibilityMode;
++    cmd.mode = WMTVisibilityResultModeDisabled;
++    cmd.offset = 0;
++  }
++
++  bool
++  InRenderPass() {
++    return allocator_->encoder_current && allocator_->encoder_current->type == EncoderType::Render;
++  }
++
++  void
++  FillBuffer(WMT::Buffer buffer, uint64_t offset, uint64_t length, uint8_t value) {
++    PreBlit();
++    auto &cmd = allocator_->EncodeBlitCommand<wmtcmd_blit_fillbuffer>();
++    cmd.type = WMTBlitCommandFillBuffer;
++    cmd.buffer = buffer;
++    cmd.offset = offset;
++    cmd.length = length;
++    cmd.value = value;
++  }
++
+   void STDMETHODCALLTYPE
+   BeginQuery(ID3D12QueryHeap *pHeap, D3D12_QUERY_TYPE Type, UINT Index) {
+-    DEBUG("BeginQuery");
++    auto heap = static_cast<MTLD3D12QueryHeap *>(pHeap);
++    if (!heap || Index >= heap->count)
++      return;
++    if (Type != D3D12_QUERY_TYPE_OCCLUSION && Type != D3D12_QUERY_TYPE_BINARY_OCCLUSION)
++      return; /* statistics: nothing to count */
++    if (occlusion_heap_ && occlusion_in_pass_ && InRenderPass())
++      DisableOcclusionQuery();
++    occlusion_heap_ = heap;
++    occlusion_index_ = Index;
++    occlusion_binary_ = Type == D3D12_QUERY_TYPE_BINARY_OCCLUSION;
++    occlusion_in_pass_ = false;
++    occlusion_drawn_ = false;
++    if (InRenderPass())
++      EnableOcclusionQuery();
+   };
+ 
+   void STDMETHODCALLTYPE
+   EndQuery(ID3D12QueryHeap *pHeap, D3D12_QUERY_TYPE Type, UINT Index) {
+-    DEBUG("EndQuery");
++    auto heap = static_cast<MTLD3D12QueryHeap *>(pHeap);
++    if (!heap || Index >= heap->count)
++      return;
++    switch (Type) {
++    case D3D12_QUERY_TYPE_OCCLUSION:
++    case D3D12_QUERY_TYPE_BINARY_OCCLUSION: {
++      if (occlusion_heap_ != heap || occlusion_index_ != Index)
++        return;
++      if (occlusion_in_pass_ && InRenderPass())
++        DisableOcclusionQuery();
++      if (!occlusion_drawn_) /* no render pass saw it: nothing passed */
++        FillBuffer(heap->results, uint64_t(Index + 1) * sizeof(uint64_t), sizeof(uint64_t), 0);
++      occlusion_heap_ = nullptr;
++      occlusion_in_pass_ = false;
++      return;
++    }
++    case D3D12_QUERY_TYPE_TIMESTAMP: {
++      if (!heap->timestamps)
++        return;
++      allocator_->InvalidateCurrentPass();
++      auto sample = allocator_->AllocatePass<SampleTimestampEncoderData>();
++      sample->type = EncoderType::SampleTimestamp;
++      sample->sample_buffer = heap->timestamps.handle;
++      sample->index = Index;
++      sample->dummy_buffer = heap->results.handle;
++      allocator_->InvalidateCurrentPass();
++      return;
++    }
++    default:
++      return;
++    }
+   };
+ 
+   void STDMETHODCALLTYPE
+@@ -1659,7 +2027,55 @@ public:
+       ID3D12QueryHeap *pHeap, D3D12_QUERY_TYPE Type, UINT StartIndex, UINT QueryCount, ID3D12Resource *pDstBuffer,
+       UINT64 AlignedDstBufferOffset
+   ) {
+-    DEBUG("ResolveQueryData");
++    auto heap = static_cast<MTLD3D12QueryHeap *>(pHeap);
++    auto dst = static_cast<MTLD3D12Resource *>(pDstBuffer);
++    if (!heap || !dst || !dst->buffer || !QueryCount || StartIndex + QueryCount > heap->count)
++      return;
++    auto dst_buffer = dst->buffer->current()->buffer();
++    switch (Type) {
++    case D3D12_QUERY_TYPE_OCCLUSION:
++    case D3D12_QUERY_TYPE_BINARY_OCCLUSION: {
++      PreBlit();
++      auto &cmd = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
++      cmd.type = WMTBlitCommandCopyFromBufferToBuffer;
++      cmd.src = heap->results;
++      cmd.src_offset = uint64_t(StartIndex + 1) * sizeof(uint64_t);
++      cmd.dst = dst_buffer;
++      cmd.dst_offset = AlignedDstBufferOffset;
++      cmd.copy_length = uint64_t(QueryCount) * sizeof(uint64_t);
++      return;
++    }
++    case D3D12_QUERY_TYPE_TIMESTAMP: {
++      if (!heap->timestamps) {
++        FillBuffer(dst_buffer, AlignedDstBufferOffset, uint64_t(QueryCount) * sizeof(uint64_t), 0);
++        return;
++      }
++      PreBlit();
++      static_cast<BlitEncoderData *>(allocator_->encoder_current)->resolves_timestamps = true;
++      auto &cmd = allocator_->EncodeBlitCommand<wmtcmd_blit_resolvecounters>();
++      cmd.type = WMTBlitCommandResolveCounters;
++      cmd.sample_buffer = heap->timestamps;
++      cmd.start = StartIndex;
++      cmd.len = QueryCount;
++      cmd.dst_buffer = dst_buffer;
++      cmd.dst_offset = AlignedDstBufferOffset;
++      return;
++    }
++    case D3D12_QUERY_TYPE_PIPELINE_STATISTICS:
++      FillBuffer(
++          dst_buffer, AlignedDstBufferOffset, uint64_t(QueryCount) * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS), 0
++      );
++      return;
++    case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0:
++    case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1:
++    case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM2:
++    case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3:
++      FillBuffer(dst_buffer, AlignedDstBufferOffset, uint64_t(QueryCount) * sizeof(D3D12_QUERY_DATA_SO_STATISTICS), 0);
++      return;
++    default:
++      WARN("ResolveQueryData: query type ", Type, " not supported");
++      return;
++    }
+   };
+ 
+   /* neutron: predication is a hint to skip work; without it everything is drawn,
+@@ -1680,6 +2096,14 @@ public:
+       ID3D12CommandSignature *pCommandSignature, UINT MaxCommandCount, ID3D12Resource *pArgBuffer,
+       UINT64 ArgBufferOffset, ID3D12Resource *pCountBuffer, UINT64 CountBufferOffset
+   ) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      bundle_calls_.emplace_back([=](MTLD3D12GraphicsCommandListImpl *l) {
++        l->ExecuteIndirect(
++            pCommandSignature, MaxCommandCount, pArgBuffer, ArgBufferOffset, pCountBuffer, CountBufferOffset
++        );
++      });
++      return;
++    }
+     auto sig = static_cast<MTLD3D12CommandSignature *>(pCommandSignature);
+     auto arg_buffer = static_cast<MTLD3D12Resource *>(pArgBuffer);
+     if (!arg_buffer || !arg_buffer->buffer)
+@@ -1776,7 +2200,26 @@ public:
+       ID3D12Resource *pDstResource, UINT DstSubresource, UINT DstX, UINT DstY, ID3D12Resource *pSrcResource,
+       UINT SrcSubresource, D3D12_RECT *pSrcRect, DXGI_FORMAT Format, D3D12_RESOLVE_MODE ResolveMode
+   ) {
+-    IMPLEMENT_ME
++    /* neutron: Metal resolves whole attachments; a region that covers the source at (0, 0)
++       is a ResolveSubresource, others are skipped. Nothing is compressed in place on Metal. */
++    auto *pSrc = static_cast<MTLD3D12Resource *>(pSrcResource);
++    if (ResolveMode == D3D12_RESOLVE_MODE_DECOMPRESS || !pSrc || !pSrc->texture)
++      return;
++    if (ResolveMode != D3D12_RESOLVE_MODE_AVERAGE && ResolveMode != D3D12_RESOLVE_MODE_MIN &&
++        ResolveMode != D3D12_RESOLVE_MODE_MAX) {
++      WARN("ResolveSubresourceRegion: resolve mode ", ResolveMode, " not supported");
++      return;
++    }
++    auto desc = pSrc->GetDesc();
++    bool full = !pSrcRect || (pSrcRect->left <= 0 && pSrcRect->top <= 0 && pSrcRect->right >= (LONG)desc.Width &&
++                              pSrcRect->bottom >= (LONG)desc.Height);
++    if (!full || DstX || DstY) {
++      WARN("ResolveSubresourceRegion: partial regions are not supported, skipped");
++      return;
++    }
++    if (ResolveMode != D3D12_RESOLVE_MODE_AVERAGE)
++      WARN("ResolveSubresourceRegion: min/max resolve done as average");
++    ResolveSubresource(pDstResource, DstSubresource, pSrcResource, SrcSubresource, Format);
+   }
+ 
+   void STDMETHODCALLTYPE
+@@ -1788,7 +2231,28 @@ public:
+   WriteBufferImmediate(
+       UINT Count, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER *pParams, const D3D12_WRITEBUFFERIMMEDIATE_MODE *pModes
+   ) {
+-    IMPLEMENT_ME
++    /* neutron: each value goes through the allocator's upload heap and a 4-byte blit copy, in
++       command order (the marker modes only matter for crash dumps) */
++    if (!pParams)
++      return;
++    for (UINT i = 0; i < Count; i++) {
++      uint64_t offset;
++      auto allocation = device_->LookupBufferByVA(pParams[i].Dest, &offset);
++      if (!allocation) {
++        WARN("WriteBufferImmediate: no buffer at ", pParams[i].Dest);
++        continue;
++      }
++      auto [ptr, src_offset] = allocator_->AllocateGPUHeap(sizeof(UINT), 4);
++      *reinterpret_cast<UINT *>(ptr) = pParams[i].Value;
++      PreBlit();
++      auto &cmd = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
++      cmd.type = WMTBlitCommandCopyFromBufferToBuffer;
++      cmd.src = allocator_->gpu_heap_buffer_;
++      cmd.src_offset = src_offset;
++      cmd.dst = allocation->buffer();
++      cmd.dst_offset = offset;
++      cmd.copy_length = sizeof(UINT);
++    }
+   }
+ };
+ 
+@@ -1800,7 +2264,7 @@ MTLD3D12CommandAllocatorImpl::CreateCommandList(
+   if (Type != type_)
+     return E_INVALIDARG;
+ 
+-  auto cmd_list = Com(new MTLD3D12GraphicsCommandListImpl(device_));
++  auto cmd_list = Com(new MTLD3D12GraphicsCommandListImpl(device_, Type));
+   HRESULT hr = cmd_list->Initialize(this, pInitialPipelineState);
+   if (FAILED(hr))
+     return hr;
+diff --git a/src/d3d12/d3d12_command_queue.cpp b/src/d3d12/d3d12_command_queue.cpp
+index 7c3bf45..9d1eb35 100644
+--- a/src/d3d12/d3d12_command_queue.cpp
++++ b/src/d3d12/d3d12_command_queue.cpp
+@@ -41,6 +41,11 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
+ 
+   WMT::Reference<WMT::CommandQueue> queue_;
+   WMT::Reference<WMT::Fence> fence_;
++  /* neutron: timestamp samples reach the counter sample buffer only once their command buffer
++     has completed, so a resolve waits on this event, which the waiting thread signals after
++     the completion of each command buffer that sampled */
++  WMT::Reference<WMT::SharedEvent> timestamp_event_;
++  uint64_t timestamp_event_value_ = 0;
+ 
+   std::atomic_uint64_t inflight_cmdbuf_seq_ = 1;
+   std::atomic_uint64_t inflight_cmdbuf_count_ = 0;
+@@ -49,6 +54,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
+   struct InflightCommandBuffer {
+     WMT::Reference<WMT::CommandBuffer> cmdbuf{};
+     HANDLE semaphore{};
++    uint64_t timestamp_value{}; /* neutron: signal timestamp_event_ with it after completion */
+   };
+ 
+   std::array<InflightCommandBuffer, kCommandQueueSize> inflight_cmdbuf_pool_;
+@@ -75,6 +81,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
+ 
+       if (inflight.semaphore)
+         ReleaseSemaphore(inflight.semaphore, 1, nullptr);
++      if (inflight.timestamp_value)
++        timestamp_event_.signalValue(inflight.timestamp_value);
+ 
+       inflight = {};
+ 
+@@ -89,24 +97,40 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
+     MTLD3D12CommandQueueImpl *queue;
+     std::lock_guard<dxmt::mutex> lock;
+     uint64_t seq;
+-    InflightCommandBuffer &inflight;
++    InflightCommandBuffer *inflight;
+     WMT::Reference<WMT::Object> pool;
+ 
+     CommittingScope(MTLD3D12CommandQueueImpl *queue) :
+         queue(queue),
+         lock(queue->mutex_commit_),
+         seq(queue->inflight_cmdbuf_seq_.load(std::memory_order_relaxed)),
+-        inflight(queue->inflight_cmdbuf_pool_[seq % kCommandQueueSize]),
++        inflight(&queue->inflight_cmdbuf_pool_[seq % kCommandQueueSize]),
+         pool(WMT::MakeAutoreleasePool()) {
+-      inflight.cmdbuf = queue->queue_.commandBuffer();
++      inflight->cmdbuf = queue->queue_.commandBuffer();
+     };
+ 
+-    ~CommittingScope() {
+-      inflight.cmdbuf.commit();
++    void
++    commit() {
++      inflight->cmdbuf.commit();
+       queue->inflight_cmdbuf_seq_.fetch_add(1, std::memory_order_release);
+       queue->inflight_cmdbuf_seq_.notify_one();
+       queue->inflight_cmdbuf_count_.fetch_add(1, std::memory_order_relaxed);
+     }
++
++    /* neutron: commit what is encoded so far and continue in a new command buffer (counter
++       samples only become visible to a resolve in a later command buffer) */
++    void
++    split() {
++      commit();
++      queue->inflight_cmdbuf_count_.wait(kCommandQueueSize, std::memory_order_acquire);
++      seq = queue->inflight_cmdbuf_seq_.load(std::memory_order_relaxed);
++      inflight = &queue->inflight_cmdbuf_pool_[seq % kCommandQueueSize];
++      inflight->cmdbuf = queue->queue_.commandBuffer();
++    }
++
++    ~CommittingScope() {
++      commit();
++    }
+   };
+ 
+   CommittingScope
+@@ -140,6 +164,7 @@ public:
+     queue_.addResidencySet(device_->GetGlobalResidencySet());
+ 
+     fence_ = metal_device.newFence();
++    timestamp_event_ = metal_device.newSharedEvent();
+ 
+     return S_OK;
+   }
+@@ -200,7 +225,8 @@ public:
+   void STDMETHODCALLTYPE
+   ExecuteCommandLists(UINT Count, ID3D12CommandList *const *ppCommandLists) {
+     auto scope = StartCommitting();
+-    auto &cmdbuf = scope.inflight.cmdbuf;
++    WMT::CommandBuffer cmdbuf = scope.inflight->cmdbuf;
++    bool sampled_timestamps = false; /* neutron: see CommittingScope::split */
+     for (unsigned i = 0; i < Count; i++) {
+       auto pCommandList = static_cast<MTLD3D12GraphicsCommandList *>(ppCommandLists[i]);
+       EncoderData *current = pCommandList->entry;
+@@ -291,6 +317,7 @@ public:
+               stencil_info.clear_stencil = stencil_data.clear_stencil;
+             }
+             render_pass_info.default_raster_sample_count = data->default_raster_sample_count;
++            render_pass_info.visibility_buffer = data->visibility_buffer; /* neutron: occlusion queries */
+             render_pass_info.render_target_array_length = data->render_target_array_length;
+             render_pass_info.render_target_width = data->render_target_width;
+             render_pass_info.render_target_height = data->render_target_height;
+@@ -307,6 +334,17 @@ public:
+         }
+         case EncoderType::Blit: {
+           auto data = static_cast<BlitEncoderData *>(current);
++          if (data->resolves_timestamps) {
++            /* neutron: wait for the samples of earlier command buffers; samples of this one
++               need a new command buffer first */
++            if (sampled_timestamps) {
++              scope.split();
++              cmdbuf = scope.inflight->cmdbuf;
++              sampled_timestamps = false;
++            }
++            if (timestamp_event_value_)
++              cmdbuf.encodeWaitForEvent(timestamp_event_, timestamp_event_value_);
++          }
+           auto encoder = cmdbuf.blitCommandEncoder();
+           encoder.waitForFence(fence_);
+           encoder.encodeCommands(&data->cmd_head);
+@@ -323,6 +361,30 @@ public:
+           encoder.endEncoding();
+           break;
+         }
++        case EncoderType::SampleTimestamp: {
++          /* neutron: the sample attachment only fires for a non-empty blit pass */
++          auto data = static_cast<SampleTimestampEncoderData *>(current);
++          WMTSampleBufferAttachmentInfo sample_info{};
++          sample_info.sample_buffer = data->sample_buffer;
++          sample_info.start_of_encoder_sample_index = data->index;
++          sample_info.end_of_encoder_sample_index = ~0ull; /* MTLCounterDontSample */
++          auto encoder = cmdbuf.blitCommandEncoderWithSampleBuffers(&sample_info, 1);
++          encoder.waitForFence(fence_);
++          struct wmtcmd_blit_fillbuffer fill;
++          fill.next.set(nullptr);
++          fill.type = WMTBlitCommandFillBuffer;
++          fill.buffer = data->dummy_buffer;
++          fill.offset = 0;
++          fill.length = 4;
++          fill.value = 0;
++          MTLBlitCommandEncoder_encodeCommands(encoder, (const struct wmtcmd_base *)&fill);
++          encoder.updateFence(fence_);
++          encoder.endEncoding();
++          if (!sampled_timestamps)
++            scope.inflight->timestamp_value = ++timestamp_event_value_;
++          sampled_timestamps = true;
++          break;
++        }
+         case EncoderType::Resolve: {
+           auto data = static_cast<ResolveEncoderData *>(current);
+ 
+@@ -356,7 +418,7 @@ public:
+   HRESULT STDMETHODCALLTYPE
+   Signal(ID3D12Fence *pFence, UINT64 Value) {
+     auto scope = StartCommitting();
+-    auto &cmdbuf = scope.inflight.cmdbuf;
++    auto &cmdbuf = scope.inflight->cmdbuf;
+     static_cast<MTLD3D12Fence *>(pFence)->fence->signal(cmdbuf, Value);
+     return S_OK;
+   };
+@@ -364,7 +426,7 @@ public:
+   HRESULT STDMETHODCALLTYPE
+   Wait(ID3D12Fence *pFence, UINT64 Value) {
+     auto scope = StartCommitting();
+-    auto &cmdbuf = scope.inflight.cmdbuf;
++    auto &cmdbuf = scope.inflight->cmdbuf;
+     static_cast<MTLD3D12Fence *>(pFence)->fence->wait(cmdbuf, Value);
+     return S_OK;
+   };
+@@ -413,7 +475,7 @@ public:
+       WMT::FXSpatialScaler scaler, WMT::Texture upscaled
+   ) {
+     auto scope = StartCommitting();
+-    auto &cmdbuf = scope.inflight.cmdbuf;
++    auto &cmdbuf = scope.inflight->cmdbuf;
+ 
+     auto g = reinterpret_cast<MTLD3D12Resource *>(backbuffer);
+     auto &view = g->texture->view(g->texture->fullView);
+@@ -436,7 +498,7 @@ public:
+       cmdbuf.presentDrawableAfterMinimumDuration(drawable, after);
+     else
+       cmdbuf.presentDrawable(drawable);
+-    scope.inflight.semaphore = hLantecyWaitable;
++    scope.inflight->semaphore = hLantecyWaitable;
+ 
+     return S_OK;
+   }
+diff --git a/src/d3d12/d3d12_device.hpp b/src/d3d12/d3d12_device.hpp
+index 0eac8be..316f222 100644
+--- a/src/d3d12/d3d12_device.hpp
++++ b/src/d3d12/d3d12_device.hpp
+@@ -139,6 +139,12 @@ public:
+ 
+ class MTLD3D12QueryHeap : public ID3D12QueryHeap {
+ public:
++  /* neutron: occlusion results (uint64 per query from slot 1 on, the visibility result buffer of
++     the render passes), timestamps in a counter sample buffer (GPU nanoseconds) */
++  D3D12_QUERY_HEAP_TYPE type;
++  UINT count;
++  WMT::Reference<WMT::Buffer> results;
++  WMT::Reference<WMT::CounterSampleBuffer> timestamps;
+ };
+ 
+ class MTLD3D12PipelineState : public ID3D12PipelineState {
+diff --git a/src/d3d12/d3d12_query_heap.cpp b/src/d3d12/d3d12_query_heap.cpp
+index 904c58f..f06321c 100644
+--- a/src/d3d12/d3d12_query_heap.cpp
++++ b/src/d3d12/d3d12_query_heap.cpp
+@@ -27,6 +27,25 @@ public:
+ 
+   HRESULT
+   Initialize(const D3D12_QUERY_HEAP_DESC *pDesc) {
++    /* neutron: real storage for BeginQuery/EndQuery/ResolveQueryData */
++    if (!pDesc || !pDesc->Count)
++      return E_INVALIDARG;
++    type = pDesc->Type;
++    count = pDesc->Count;
++    WMTBufferInfo info;
++    /* slot 0 is scratch: each render pass with a visibility buffer also writes offset 0 (the
++       disabled mode's offset), so query i lives in slot i + 1 */
++    info.length = (uint64_t(count) + 1) * sizeof(uint64_t);
++    info.options = WMTResourceHazardTrackingModeUntracked;
++    info.memory.set(nullptr);
++    results = device_->GetMTLDevice().newBuffer(info);
++    if (!results)
++      return E_OUTOFMEMORY;
++    if (type == D3D12_QUERY_HEAP_TYPE_TIMESTAMP || type == D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP) {
++      timestamps = device_->GetMTLDevice().newCounterSampleBuffer(count, false);
++      if (!timestamps)
++        WARN("CreateQueryHeap: no counter sample buffer for ", count, " timestamps, they read as 0");
++    }
+     return S_OK;
+   }
+ 

@@ -1,0 +1,70 @@
+Code cache (FEX_ENABLECODECACHINGWIP=1, FEXOfflineCompiler64.exe) on Apple Silicon: the offline
+compiler loads its config before logging (it crashed on a null config layer) and gets the MAP_JIT
+write switch; relocating cached code and copying it into the ARM64EC code buffer run in a
+JITWriteScope. Loading a cache still crashes at the first cached block, see docs/neutron.md.
+
+diff --git a/FEXCore/Source/Interface/Core/CodeCache.cpp b/FEXCore/Source/Interface/Core/CodeCache.cpp
+index 87a110c..cd68ef1 100644
+--- a/FEXCore/Source/Interface/Core/CodeCache.cpp
++++ b/FEXCore/Source/Interface/Core/CodeCache.cpp
+@@ -29,6 +29,7 @@
+ #include <xxhash.h>
+ 
+ #include <FEXCore/Utils/AllocatorHooks.h>
++#include <FEXCore/Utils/JITWriteScope.h>
+ 
+ #include <fstream>
+ 
+@@ -617,6 +618,8 @@ bool CodeCache::ApplyPackedCodeRelocations(uint64_t GuestEntry, std::span<std::b
+ 
+ bool CodeCache::ApplyCodeRelocations(uint64_t GuestEntry, std::span<std::byte> Code,
+                                      std::span<const FEXCore::CPU::Relocation> EntryRelocations, bool ForStorage) {
++  // neutron: Code may be MAP_JIT memory (the live code buffer when saving, the loaded cache buffer on ARM64EC)
++  FEXCore::Utils::JITWriteScope WriteScope;
+   CPU::Arm64Emitter Emitter(&CTX, Code.data(), Code.size_bytes());
+   for (size_t j = 0; j < EntryRelocations.size(); ++j) {
+     const FEXCore::CPU::Relocation& Reloc = EntryRelocations[j];
+@@ -988,6 +991,8 @@ void CodeCache::FinalizeCodePages(MappedCodeCacheFile& Code, std::span<std::byte
+   Allocator::VirtualDontNeed(Code.CodeBufferInFile.data() + StartOffset, Size);
+ #else
+   // TODO: Implement lazy mapping on Windows
++  // neutron: the ARM64EC code buffer is MAP_JIT memory on Apple Silicon
++  FEXCore::Utils::JITWriteScope WriteScope;
+ #ifdef _M_ARM64EC
+   memcpy(Code.CodeBuffer.data() + StartOffset, Code.CodeBufferInFile.data() + StartOffset, Size);
+ #endif
+diff --git a/Source/Tools/FEXOfflineCompiler/Main.cpp b/Source/Tools/FEXOfflineCompiler/Main.cpp
+index 484aeb8..f0ad8ba 100644
+--- a/Source/Tools/FEXOfflineCompiler/Main.cpp
++++ b/Source/Tools/FEXOfflineCompiler/Main.cpp
+@@ -43,6 +43,8 @@
+ #include <Common/InvalidationTracker.h>
+ #include <Common/JITGuardPage.h>
+ #include <Common/Logging.h>
++#include <Common/FEXUnixLib.h>
++#include <FEXCore/Utils/JITWriteScope.h>
+ #include <Common/Module.h>
+ #include <Common/OvercommitTracker.h>
+ #include <Common/PortabilityInfo.h>
+@@ -844,7 +846,21 @@ int main(int argc, char** argv) {
+   LogMan::Throw::InstallHandler(AssertHandler);
+   LogMan::Msg::InstallHandler(MsgHandler);
+ #else
++  // neutron: Logging::Init reads SILENTLOG, which needs a loaded config (null layer otherwise)
++  {
++    char* envp[] = {nullptr};
++    FEX::Config::LoadConfig("", envp, FEX::ReadPortabilityInformation());
++  }
+   FEX::Windows::Logging::Init();
++  // neutron: code buffers are MAP_JIT memory on Apple Silicon, emitting code needs the
++  // per-thread write switch from the unix library (as in ARM64EC/Module.cpp)
++  FEX::Windows::UnixLib::Init(GetModuleHandleW(L"ntdll.dll"));
++  if (FEX::Windows::UnixLib::JITWriteProtect(true)) {
++    FEX::Windows::UnixLib::JITWriteProtect(false);
++    FEXCore::Utils::JITWriteToggle = [](bool Write) {
++      FEX::Windows::UnixLib::JITWriteProtect(Write);
++    };
++  }
+ #endif
+ 
+   std::vector<const char*> Args {argv + 1, argv + argc};

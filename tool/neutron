@@ -19,13 +19,24 @@
 #   NEUTRON_RENDER_SCALE=<0.5..1>  Windows sees a display this much smaller and
 #                               MetalFX scales the output back (default 0.85, 1 = off)
 #   NEUTRON_METALFX=<factor>    MetalFX upscale factor, default 1 / NEUTRON_RENDER_SCALE
+#   NEUTRON_DLSS=1              games see an NVIDIA GPU with DLSS; DLSS runs on the MetalFX
+#                               temporal scaler (DXMT's nvapi64.dll and NGX core, D3D11
+#                               and D3D12). Turns NEUTRON_RENDER_SCALE off (DLSS renders
+#                               at a lower resolution itself). Opt-in: games take other
+#                               code paths on an NVIDIA GPU
 #   NEUTRON_FEX_TSO=fast|strict FEX memory ordering; strict is the full x86 order,
 #                               much slower (default fast, per game APP_TSO_<appid>)
 #   NEUTRON_NATIVE_FULLSCREEN=0 no macOS native fullscreen and Game Mode for
 #                               borderless fullscreen windows (default 1)
 #   NEUTRON_RAW_MOUSE=0         raw input (mouse look) from the accelerated macOS
 #                               cursor deltas instead of the GCMouse device deltas
+#   NEUTRON_PAD_HIDRAW=1        PlayStation and Switch pads as raw HID devices for games
+#                               with own support for them, not as XInput pads (winebus)
+#   NEUTRON_PAD_SYSTEM_GESTURES=1  Home/PS and Share buttons of pads do the macOS gestures
+#                               (Launchpad, Game Overlay, screenshot) instead of going to the game
 #   NEUTRON_PRECISE_TIMERS=0    Sleep() through select() again instead of a kqueue timer
+#   NEUTRON_FAST_QPC=0          QueryPerformanceCounter through the NT syscall again instead
+#                               of reading the counter in the game process
 #   NEUTRON_DXMT_WRITE_COMBINED=1  dynamic D3D11 buffers write-combined again (DXMT
 #                               patch 0019 turned it off, it stalled the game thread)
 #   NEUTRON_D3D12_SM6=1         D3D12 with shader model 6.6 / feature level 12_0 (DXIL shaders,
@@ -61,6 +72,8 @@
 #                               in screen pixels
 #   NEUTRON_BENCH_NOVSYNC=1     benchmarks only: DXMT draws the present pass offscreen
 #                               and never presents (dev/bench/run.sh)
+#   NEUTRON_PAD_VIRTUAL=1|<vid>:<pid>  tests only: winebus attaches a scripted SDL virtual
+#                               pad (tests/gamepad_list.c selftest)
 #
 # Set here for Wine and DXMT, not settings: NEUTRON_HUD_INFO, NEUTRON_APP_BUNDLE,
 # NEUTRON_NTDLL.
@@ -129,6 +142,16 @@ export NEUTRON_NATIVE_FULLSCREEN="${NEUTRON_NATIVE_FULLSCREEN:-1}"
 export NEUTRON_MSYNC="${NEUTRON_MSYNC:-0}"
 # Wine dlopens FreeType and GnuTLS by soname: bundled copies first, then Homebrew.
 export DYLD_FALLBACK_LIBRARY_PATH="$FILES/lib:/opt/homebrew/lib:/usr/local/lib:/usr/lib"
+# DLSS on the MetalFX temporal scaler: DXMT reports an NVIDIA GPU (vendor 0x10DE) and its
+# dxgi.dll writes the NGX registry keys (NGXCore FullPath = system32); setup_dlss puts
+# DXMT's nvapi64.dll and NGX core there. DLSS renders at a lower resolution and scales
+# up itself, so the render scale (spatial MetalFX on the whole display) is off.
+if [ "${NEUTRON_DLSS:-0}" = 1 ]; then
+  export DXMT_ENABLE_NVEXT=1
+  NEUTRON_RENDER_SCALE=1
+else
+  unset DXMT_ENABLE_NVEXT
+fi
 # Light upscaling: Wine reports the display at this scale, MetalFX brings it back.
 NEUTRON_RENDER_SCALE="${NEUTRON_RENDER_SCALE:-0.85}"
 if awk -v s="$NEUTRON_RENDER_SCALE" 'BEGIN { exit !(s >= 0.5 && s < 1) }'; then
@@ -180,6 +203,7 @@ NEUTRON_HUD_INFO="$NEUTRON_HUD_INFO;FEX TSO $NEUTRON_FEX_TSO"
   NEUTRON_HUD_INFO="$NEUTRON_HUD_INFO;Render scale $(awk -v s="$NEUTRON_RENDER_SCALE" 'BEGIN { printf "%d%%", s * 100 + 0.5 }')"
 [ -n "${NEUTRON_METALFX:-}" ] &&
   NEUTRON_HUD_INFO="$NEUTRON_HUD_INFO;MetalFX $(awk -v f="$NEUTRON_METALFX" 'BEGIN { printf "%.2fx", f }')"
+[ "${NEUTRON_DLSS:-0}" = 1 ] && NEUTRON_HUD_INFO="$NEUTRON_HUD_INFO;DLSS MetalFX temporal"
 # NEUTRON_HUD_NOTE adds one free line (dev/direct-test.sh names its variants with it).
 [ -n "${NEUTRON_HUD_NOTE:-}" ] && NEUTRON_HUD_INFO="$NEUTRON_HUD_INFO;$NEUTRON_HUD_NOTE"
 export NEUTRON_HUD_INFO
@@ -283,11 +307,18 @@ run_wine() {
 #  prefix
 #-------------------------------------------------------------------------------
 
-# Copies src to dst only when the content differs (keeps mtimes stable).
+# Copies src to dst only when the content differs. A synced copy has the size and mtime
+# of its source, so the byte compare (45 ms for the 58 MB lsteamclient.dll, every start)
+# only runs after a runtime update.
 sync_file() {
   local src="$1" dst="$2"
+  [ "$(stat -f '%z %m' "$src" 2>/dev/null)" = "$(stat -f '%z %m' "$dst" 2>/dev/null)" ] && return 0
   mkdir -p "$(dirname "$dst")"
-  cmp -s "$src" "$dst" 2>/dev/null || cp "$src" "$dst"
+  if cmp -s "$src" "$dst" 2>/dev/null; then
+    touch -r "$src" "$dst"
+  else
+    cp -p "$src" "$dst"
+  fi
 }
 
 setup_prefix() {
@@ -317,7 +348,31 @@ setup_prefix() {
 
   setup_steam_registry
   setup_emulator_registry
+  setup_dlss
   sandbox_user_dirs
+}
+
+# NEUTRON_DLSS=1: DXMT's nvapi64.dll and its NGX core into system32. The NGX loader in
+# the game looks for _nvngx.dll in the NGXCore FullPath folder (system32, written by
+# DXMT's dxgi.dll); the core implements DLSS on MetalFX itself, no nvngx_dlss.dll
+# is used. Without the setting the files go away again, so games see no NVIDIA parts.
+setup_dlss() {
+  local src="$FILES/lib/neutron/dlss" sys32="$WINEPREFIX/drive_c/windows/system32"
+  local marker="$WINEPREFIX/neutron-dlss-files" f
+  if [ "${NEUTRON_DLSS:-0}" = 1 ]; then
+    if [ ! -f "$src/nvngx.dll" ] || [ ! -f "$src/nvapi64.dll" ]; then
+      log "NEUTRON_DLSS=1 but no DLSS files in $src"
+      return 0
+    fi
+    sync_file "$src/nvapi64.dll" "$sys32/nvapi64.dll"
+    sync_file "$src/nvngx.dll" "$sys32/_nvngx.dll"
+    sync_file "$src/nvngx.dll" "$sys32/nvngx.dll"
+    touch "$marker"
+  elif [ -f "$marker" ]; then
+    for f in nvapi64.dll _nvngx.dll nvngx.dll; do rm -f "$sys32/$f"; done
+    rm -f "$marker"
+    log "DLSS off: removed nvapi64.dll and the NGX core from system32"
+  fi
 }
 
 # Wine links the prefix's Documents, Desktop, Downloads, Music, Pictures and Videos

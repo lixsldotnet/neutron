@@ -2,7 +2,7 @@
 #
 # Shows which swapchains macOS presents "Direct" (no compositor pass). Runs
 # tests/d3d11_present.c fullscreen with the Metal HUD, one variant after the other,
-# 8 seconds each; the variant name is the last line of the HUD's neutron block.
+# 10 seconds each; the variant name is the last line of the HUD's neutron block.
 # Read "Direct" or "Composited" in the HUD's top right for each and note them.
 # Do not take screenshots meanwhile (that switches to Composited).
 #
@@ -38,10 +38,16 @@ fi
 
 run() {  # run <name> <format> <scale%> [VAR=value...]
   local name="$1" format="$2" scale="$3"; shift 3
-  printf '%-14s %s\n' "$name" "(8 s)"
+  printf '%-14s %s\n' "$name" "(10 s)"
   env SteamAppId=present STEAM_COMPAT_DATA_PATH="$NB/opt/presentdata" \
-    NEUTRON_FILES="$FILES" NEUTRON_HUD=1 NEUTRON_HUD_NOTE="Test $name" "$@" \
-    "$REPO/tool/neutron" runinprefix "$EXE" "$format" 8 "$scale" > /dev/null 2>&1 || echo "  failed"
+    NEUTRON_FILES="$FILES" WINEDEBUG="${WINEDEBUG:-err+all,warn+macdrv}" NEUTRON_HUD=1 NEUTRON_HUD_NOTE="Test $name" "$@" \
+    "$REPO/tool/neutron" waitforexitandrun "$EXE" "$format" 10 "$scale" > /dev/null 2>&1 &
+  # Started from a terminal, macOS does not let the test app take the focus, and an
+  # inactive window gets no native fullscreen (so never Direct). Activate its app
+  # bundle (built by the tool like for a game) the way a click would.
+  sleep 2
+  open -a "$NB/opt/presentdata/Neutron.app" 2>/dev/null || true
+  wait $! || echo "  failed"
 }
 
 variants=("$@")

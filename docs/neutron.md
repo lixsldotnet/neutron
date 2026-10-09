@@ -303,6 +303,9 @@ log, `NEUTRON_HUD=2` shows the Metal HUD with DXMT's per-frame statistics.
   bits are already clear, and every IR block with vector register operands
   ensures NEP/AH at its start (mrs, tbnz, rarely orr+msr). Native calls from
   integer code cost about 5 ns, the d3d11 draw loop gained 19% FPS (fex 0003).
+  Blocks without float math, with compares or with a few add/sub/mul/div before a
+  native call skip the FPCR write too: about 5 ns after float code (fex 0004, see
+  D3D11 CPU cost).
   `FEX_HOSTFEATURES=disableafp` is no alternative, it slows scalar float code.
 - **x64 syscall stubs.** The ARM64EC x64 syscall stubs (`__ASM_SYSCALL_FUNC`)
   tested `0x7ffe0308`, which faults since KUSER lives above 4 GB, on every
@@ -356,13 +359,44 @@ supported on your system".
 - 0015: `d3d12.shaderModel = 66` (DXMT config, `NEUTRON_D3D12_SM6=1` in the tool)
   reports FL 12_0, SM 6.6, binding tier 3, wave ops, Int64 and Atomic64. Default
   stays SM 5.1.
+- 0029: geometry, hull and domain shaders, emulated like DXMT's D3D11 does: a Metal
+  mesh pipeline with the VS (or VS+HS) as object function and the GS (or DS) as mesh
+  function. The object function depends on the draw (index format, strip topology), so
+  a PSO builds these variants on first use (the non-indexed list one at creation, so a
+  shader the emulation cannot handle fails `CreateGraphicsPipelineState`). A GS that
+  only passes through the render target array or viewport index is folded into the VS.
+  Root parameters with GEOMETRY, HULL or DOMAIN visibility go to the object and mesh
+  stages.
+- 0030: the same for DXIL: GS emit, cut, `SV_GSInstanceID` and `SV_PrimitiveID`; HS with
+  the control point function on the threads of a patch and the patch constant function
+  on its first thread after a barrier; DS domain location and patch constants.
+- 0028: hull shaders from vkd3d-shader (Wine's `D3DCompile`, which games that compile
+  HLSL at run time get) index control points with `vOutputControlPointID` itself; the
+  converter crashed on them, D3D11 included.
+- 0031: queries, bundles and the command list methods that aborted. Occlusion and
+  binary occlusion count into the query heap's buffer, used as visibility result buffer
+  of the render pass (slot 0 stays unused: every such pass also writes offset 0).
+  Timestamps: a blit pass samples the GPU clock (nanoseconds, matches
+  `GetTimestampFrequency`) into a counter sample buffer; Metal fills the samples only
+  once their command buffer has completed, so a timestamp `ResolveQueryData` waits on
+  an event the queue signals after that completion (a GPU bubble when it is in the same
+  frame). Pipeline and stream output statistics resolve to zeros. `ExecuteBundle`
+  replays the bundle's calls on the calling list. Buffer to buffer `CopyTextureRegion`,
+  `WriteBufferImmediate`, `ResolveSubresourceRegion` for whole regions, and
+  `DiscardResource` (DontCare store of the pass that just wrote the texture and load in
+  the pass right after, like D3D11's 0016).
 - Tests (headless): `tests/d3d12_caps.c` reproduces Unreal 5's adapter checks,
   `tests/d3d12_dxil_*.c` cover compute, draw, MRT, ops, descriptor heap indexing,
-  64-bit atomics and PSO creation. 204 of 243 vkd3d-proton SM6 test shaders convert.
-- Missing: geometry, hull and domain shaders in DXMT's D3D12 (DXBC too), 16-bit
-  shader types, doubles, other 64-bit atomics, SM 6.7+, mesh shaders, ray tracing;
-  `ResolveQueryData` is a no-op; no D3D12 shader cache (DXIL is converted for every
-  PSO). Not yet run with a real Unreal 5 game.
+  64-bit atomics, PSO creation, geometry and tessellation shaders; `tests/d3d12_gs.c`,
+  `tests/d3d12_tess.c` (DXBC), `tests/d3d12_queries.c` and `tests/d3d12_cmdlist.c`.
+  204 of 243 vkd3d-proton SM6 test shaders convert.
+- Missing: stream output, a GS after tessellation (unless pass-through), tessellator
+  point and line output, isolines, `ExecuteIndirect` with GS or tessellation pipelines
+  (skipped with a warning), 16-bit shader types, doubles, other 64-bit atomics, SM 6.7+,
+  mesh shaders, ray tracing; no D3D12 shader cache (DXIL is converted for every PSO).
+  An occlusion query that spans render passes keeps only the count of the last one,
+  and queries of two heaps in one render pass count only the first heap. Partial
+  `ResolveSubresourceRegion` is skipped. Not yet run with a real Unreal 5 game.
 
 ## msync
 
@@ -422,20 +456,31 @@ app-thread time per frame 45 to 80% lower, FPS 2 to 6 times, images identical.
 - 0024: command data comes from a 64 KB span per chunk.
 - 0025, 0026: unchanged input layout, depth-stencil state and blend factor emit no
   command; state setters use `static_cast` instead of a QueryInterface.
-- Left: FEX's FPCR toggling on every x64 to ARM64EC call after float code (26.7 ns
-  against 4.7 ns from integer code, 14-20% of the app thread); DXMT's encoder
-  thread at about 120 ns per draw, half of it in the AGX driver.
-- FPCR, measured on M5 Max: reading costs 0.3 ns, writing the same value 2.7 ns,
-  writing a changed bit about 9 ns (any bit) and the write serializes. Under FEX
-  patch 0003 a call into ARM64EC code costs 4.3 ns after integer code and 25-27 ns
-  after any block that touched an xmm register. A prototype (not in the series,
-  needs game tests and a re-audit on every FEX update: it classifies FEX's IR ops)
-  sets the x86 float mode only for blocks that need it and checks small float
-  blocks for NaN instead: 25 ns to 5 ns per call, x86 NaN/denormal/DAZ/FTZ results
-  exact. It does not speed up `d3d11_headless` yet, because clang divides junk
-  vector lanes (0/0), so the NaN path runs every draw; fixing NaN lanes in software
-  instead of switching FPCR is the next step. `FEX_HOSTFEATURES=disableafp` makes
-  every call cheap but scalar float chains 85% slower and x86 NaN results wrong.
+- fex 0004: FPCR, measured on M5 Max: reading costs 0.3 ns, writing the same value
+  2.7 ns, writing a changed bit about 9 ns (any bit) and the write serializes. Under
+  0003 a call into ARM64EC code cost 4.5 ns after integer code and 26 ns after any
+  block that touched an xmm register (14-20% of the app thread). 0004 sets NEP/AH only
+  in blocks that need them: data moves and int to float never, compares and float to
+  int only under FTZ, and up to 8 add/sub/mul/div in a block that ends in a call that
+  may reach ARM64EC code run without AH. Only NaN lanes can differ there, so each
+  result is checked for NaN and a NaN lane is rebuilt with the x86 rules (first source
+  if NaN, else second, else the negative default NaN) by a few vector ops and FMINNM,
+  without an FPCR write (with DAZ set FMINNM would flush denormals, then AH is set and
+  the op redone). The prototype set AH on a NaN instead, which clang's `fill_cb` in
+  `d3d11_headless` hits every draw (it divides junk vector lanes, 0/0).
+  `tests/fex_float.c bench`: call after scalar, vector, double float code, compares,
+  moves and 0/0 lanes 26.5 to 4.6-5.2 ns, after sqrtss (still AFP) unchanged, pure
+  float code (`cpu.exe float_sse_16k`) unchanged. `d3d11_headless` submit_ms (median
+  of 7 interleaved runs): base 0.55 to 0.37, state 0.89 to 0.71, indexed, update,
+  inst and deferred 17-31% lower, same images. `bind` does not gain and its FPS drops
+  about 10% in most runs: the app thread then waits in its `GetData` poll and app and
+  encoder thread most likely slow each other down (bistable, some runs are 5% faster;
+  with a busy loop of a few ns per draw `bind` is 5% faster in every run). All 748 checks of
+  `tests/fex_float.c` pass. Needs a re-audit on every FEX update: it classifies FEX's
+  IR ops by name, and a new float op that is not listed runs without AH.
+  `FEX_HOSTFEATURES=disableafp` makes every call cheap but scalar float chains 85%
+  slower and x86 NaN results wrong.
+- Left: DXMT's encoder thread at about 120 ns per draw, half of it in the AGX driver.
 - Measured and not worth changing: Wine's `arm64x_check_call` costs about 0.67 ns
   per indirect call in ARM64EC code (1.33 ns against 0.66 ns for plain ARM64),
   which is the call and return the compiler emits around the check, not the TEB
@@ -443,8 +488,127 @@ app-thread time per frame 45 to 80% lower, FPS 2 to 6 times, images identical.
   Unix calls (`__wine_unix_call_arm64ec`) save only q8-q15. NT syscalls read FPSR
   in `__wine_syscall_dispatcher` (5 ns after an FP op): storing 0 instead makes
   `QueryPerformanceCounter` 20.6 to 16.4 ns but no D3D11 benchmark moved, so it
-  stays (contexts keep the real flags). Next step there: QPC without a syscall
-  (CNTVCT plus the continuous-time offset in PE code).
+  stays (contexts keep the real flags). QPC no longer makes the syscall, see
+  QueryPerformanceCounter below.
+
+## QueryPerformanceCounter
+
+Wine's QPC is `mach_continuous_time()` in 100 ns units (10 MHz), and
+`NtQueryPerformanceCounter` was a full NT syscall into the unix side. On macOS
+`mach_continuous_time` itself needs no kernel call: libsystem reads the commpage
+(`0xfffffc000`). `_COMM_PAGE_CONT_HWCLOCK` (`+0x91`) says the user-mode path exists,
+`_COMM_PAGE_USER_TIMEBASE` (`+0x90`) names the counter register (3: Apple's
+`ACNTVCT_EL0` = `S3_4_C15_C10_6`, 2: `CNTVCTSS_EL0`, 1: `isb` + `CNTVCT_EL0`), and
+`_COMM_PAGE_CONT_HW_TIMEBASE` (`+0xa8`) is added. On the M5 Max (macOS 27) the type is
+3, the timebase 125/3 (24 MHz) and the offset 0, also after the Mac had slept (6.8 h of
+sleep since boot): `ACNTVCT` keeps counting while the Mac sleeps, `mach_absolute_time`
+subtracts the sleep through `_COMM_PAGE_TIMEBASE_OFFSET` instead. `CNTVCT_EL0` is not the mach timebase there (`CNTFRQ_EL0` reads 1 GHz).
+
+The pending Wine diff (`patches/wine/pending-qpc.diff`) does the same in PE code:
+`RtlQueryPerformanceCounter` (which `QueryPerformanceCounter` and `timeGetTime` call)
+reads the three commpage fields on every call and computes
+`ticks * numer / denom / 100` exactly like the unix side. The unix side enables it per
+process (page after `KUSER_SHARED_DATA`, `+0x10`) after 100 reads between two
+`mach_continuous_time()` calls agreed, so an unknown commpage layout or type falls back to
+the syscall; `NEUTRON_FAST_QPC=0` turns it off. Sleep and wake need no bias update: the
+same fields libsystem uses are read on every call, so the values are identical to
+`NtQueryPerformanceCounter`, wineserver timers and `KUSER_SHARED_DATA` at any time. A
+real sleep was not tested (no way headless).
+
+`tests/qpc.c` (x64 and ARM64EC builds): frequency, monotonic in one thread (10M reads)
+and across 8 threads mixed with the syscall, QPC between two `NtQueryPerformanceCounter`
+calls and the other way round (1M each), rates against `GetTickCount64` (within 17 ms,
+the 16 ms KUSER update), `timeGetTime` and the system time. Cost per call (M5 Max,
+best of 3):
+
+| | before | after |
+|---|---|---|
+| `QueryPerformanceCounter` from x64 (FEX) | 19.2 ns | 12.8 ns |
+| `QueryPerformanceCounter` from ARM64EC | 17.2 ns | 10.7 ns |
+| `RtlQueryPerformanceCounter` from ARM64EC | 16.0 ns | 8.6 ns |
+| `timeGetTime` from x64 | 21.2 ns | 14.3 ns |
+
+The rest is the x64 to ARM64EC transition (about 5 ns) and `mrs ACNTVCT` (3.8 ns
+natively, `mach_continuous_time` 5.3 ns). `NtQueryPerformanceCounter` called directly is
+unchanged (15.5 ns from ARM64EC, 164 ns through the x64 syscall stub).
+
+## Start time
+
+What a game start costs besides the game. `waitforexitandrun` waits for the prefix's
+wineserver to exit, so every start from Steam is a cold start: a new wineserver, then the
+first process runs `wineboot --init` and waits for it. Measured with
+`dev/bench/cpu.c` (`--nop`, `--user32`) through `tool/neutron runinprefix` (M5 Max,
+median of 5, interleaved with the old runtime; `start.*` in `dev/bench/run.sh`):
+
+| | before | after |
+|---|---|---|
+| no-op exe, cold wineserver | 573 ms | 376 ms |
+| no-op exe, warm wineserver | 131 ms | 71 ms |
+| cold start of a process that loads user32 and needs the desktop | 1443 ms | 632 ms |
+| loading user32.dll in a process | 68 ms | 29 ms |
+
+- **Desktop.** The first window (or `GetSystemMetrics`) starts `explorer.exe /desktop`,
+  which rebuilds the display cache. win32u asked for OpenGL GPUs there, which loaded the
+  macOS OpenGL driver (about 0.5 s) only to list EGL devices, and without EGL there are
+  none. Skipped when Wine is built without EGL (`SONAME_LIBEGL`, never on macOS).
+- **Fonts.** Every process that loads user32 enumerated the system fonts with
+  `CTFontCollectionCreateMatchingFontDescriptors` (45 ms for 640 descriptors).
+  `CTFontManagerCopyAvailableFontURLs` gives the same 306 files in about 10 ms; the font
+  list is identical (`WINEDEBUG=+font` dump). wineboot's chain alone loads user32 in
+  plugplay, winedevice (winebus) and wineboot, one after the other.
+- **Tool.** `sync_file` compared the 58 MB `lsteamclient.dll` with the prefix copy byte by
+  byte (45 ms) on every call; it now compares size and mtime first.
+- Left in a cold start (376 ms): about 250 ms waiting for `wineboot --init` (services.exe
+  starts winedevice/mountmgr, plugplay, svchost/eventlog and winedevice/winebus one after
+  the other, then wineboot loads shell32, ole32 and wininet). user32 still costs 29 ms
+  per process (Cocoa and raw mouse setup in winemac). Native x86 DLLs (FileAlignment
+  0x200) cannot be mmapped with 16K pages and are read with `pread`; Wine's builtin DLLs
+  are 64K aligned and mapped.
+
+### FEX JIT and its code cache
+
+`dev/bench/bigcode.py` generates an x86_64 program with 20000 different functions
+(28000 FEX blocks, 6.6 MB exe) and calls each once: the first pass takes 250 to 290 ms,
+the second pass 8 to 9 ms, so FEX translates about 10 us per block. A second start of the
+process costs the same again: FEX keeps nothing between runs.
+
+FEX-2610 has a work-in-progress offline code cache that also covers ARM64EC:
+
+- `FEX_ENABLECODECACHINGWIP=1` writes a code map of the executed blocks per main
+  executable to `%LOCALAPPDATA%\fex-emu\codemap\new\` and loads caches from
+  `%LOCALAPPDATA%\fex-emu\cache\<name>-<fileid>-<config id>` when an image is mapped
+  (`Windows/Common/ImageTracker.cpp`). The config id is a TODO (always 0), so a cache
+  does not know the TSO or other code-generating settings it was built with.
+- `FEXOfflineCompiler64.exe process-all` (built in `fex-arm64ec/Bin`, an ARM64EC exe
+  that runs in the prefix) merges the code maps and compiles each image in a child
+  process: it maps the image, compiles the listed blocks and writes code, block list and
+  relocations (bigcode: 1.15 s, 25 MB).
+- On ARM64EC loading is eager: the whole code is copied into an EC code buffer and
+  relocated at image load (no lazy per-page mapping on Windows).
+
+On macOS fex patch 0005 was needed to get that far: the compiler crashed on a null config
+layer (it called `Logging::Init` before loading the config), it had no `MAP_JIT` write
+switch (endless write fault when emitting code), and relocating or copying cached code
+wrote to `MAP_JIT` memory outside a `JITWriteScope`. With it, code maps, cache generation
+and cache loading work, but running the cached code does not:
+
+- An image the compiler maps at another address than the game (every exe with the
+  default base 0x140000000, where `FEXOfflineCompiler64.exe` itself sits) keeps
+  RIP-relative data addresses of the compiler's mapping: the first cached block read
+  `generator base + 0x4d4020`.
+- With a different image base (`-Wl,--image-base=0x150000000`) the first cached block
+  jumps outside every code buffer (illegal instruction at a non-JIT address).
+- The ARM64EC exception handler only treats faults in `CTX` code buffers as JIT faults
+  (`IsAddressInCodeBuffer`), not in loaded cache buffers, so self-modifying-code and
+  unaligned-atomic handling would not work in cached code.
+- `FEX_ENABLECODECACHEVALIDATION=1` crashes in the IR emitter (validation thread).
+
+So the cache is not usable yet; what it would save is the JIT time of the blocks a
+game runs at every start (about 10 us each). Needed: relocations that work when the
+compiler maps the image elsewhere, the jump target bug above, the cache buffers in the
+exception handler, a config id from the code-generating settings (TSO mode, AFP), and a
+place in the tool to run the compiler (after a game exits) and keep the cache in
+`compatdata/<appid>`.
 
 ## GPU passes
 
@@ -480,6 +644,260 @@ command buffer; the waste came from frames cut into several command buffers.
   Metal program reproduces it without DXMT. Compare images on an otherwise idle
   GPU.
 
+## Game controllers
+
+Games read pads through XInput (most), DirectInput, raw HID (SDL's and Unity's HID
+drivers, games with own PlayStation support) or Windows.Gaming.Input. In Wine all
+four sit on winebus.sys, which runs in `winedevice.exe` and has three backends:
+SDL, udev (Linux only) and IOHID (macOS). SDL maps every pad it knows to a HID
+gamepad with the XInput layout (winexinput.sys then makes the XInput device, VID/PID
+of the pad, name "Controller (XBOX 360 For Windows)" like on Windows); IOHID passes
+the raw HID device through. winebus keeps only one of the two per pad
+(`is_hidraw_enabled`): raw for DualShock 4, DualSense, Switch Pro and Joy-Cons and
+a list of flight sticks and wheels, SDL for the rest.
+
+Before: Wine was configured against whatever SDL2 headers Homebrew had (sdl2 is not
+in the build's package list) and dlopens `libSDL2-2.0.0.dylib`. On a Mac without
+Homebrew SDL `sdl_bus_init` logs "could not load libSDL2-2.0.0.dylib"; winebus still
+expects SDL to take Xbox and generic pads and dropped their IOHID devices ("ignoring
+hidraw device"), so they did not reach the game at all. PlayStation and Switch pads
+came through as raw HID only, which XInput-only games do not see (Proton relies on
+Steam Input for them, which the Mac client does not have for Windows games). With
+Homebrew's sdl2-compat it worked by chance, with bottles built for the newest macOS
+only.
+
+Now (`wine/pending-gamepad.diff`, `build.sh`):
+
+- SDL3 and sdl2-compat are built from pinned releases for the deployment target and
+  bundled (`files/lib`: `libSDL2-2.0.0.dylib`, `libSDL3.0.dylib`, `libSDL3.dylib`
+  link; sdl2-compat loads SDL3 from its own folder). configure gets their headers,
+  build.sh stops when Wine was configured without SDL. SDL drives Xbox (Bluetooth
+  and USB), DualShock 4, DualSense, Switch Pro and Joy-Con pairs through its HIDAPI
+  drivers (IOKit), MFi and other GameController pads through GameController, and
+  generic HID pads through IOKit with its controller database (unknown pads become
+  DirectInput joysticks). Rumble, trigger rumble (WGI impulse triggers) and the
+  macOS controller remapping (GameController pads) come with it. SDL environment
+  variables (`SDL_GAMECONTROLLERCONFIG` and the `SDL_JOYSTICK_*` hints) work from
+  `neutron.env`. SDL init costs about 40 ms in winedevice at prefix start.
+- PlayStation and Nintendo pads go through SDL as XInput pads too.
+  `NEUTRON_PAD_HIDRAW=1` gives the raw HID devices instead (Wine's default), for games
+  with own support (light bar, touchpad, gyro, adaptive triggers, glyphs).
+  services.exe starts winedevice with a fresh Windows environment, so the SDL bus
+  reads the variable from the Unix environment (`bus_options.pad_hidraw`).
+- Without libSDL2 winebus now takes the IOHID devices of all pads (SDL counts as
+  disabled when it fails to load), Xbox pads get XInput from their raw HID reports.
+- XInput rumble lasted 1 s: Wine's HID haptics have a 1000 ms cutoff and XInput only
+  sends changes, SDL stopped the motors when the duration ran out. On Windows it
+  lasts until the game changes it. The SDL backend passes duration 0 (until changed)
+  for cutoffs of 1 s or more.
+- `XInputGetBatteryInformation` returned `ERROR_NOT_SUPPORTED`; now wired/full for the
+  gamepad (no battery report through HID), disconnected for the headset.
+- `SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1`: winedevice never has the focus. SDL itself
+  sets `GCController.shouldMonitorBackgroundEvents` for its GameController pads.
+- Home/PS and Share buttons: macOS binds them to system gestures (Launchpad, Game
+  Overlay, screenshots) and applies them for the frontmost app, which is the game,
+  not winedevice. winemac.drv (`cocoa_gamepad.m`) sets
+  `preferredSystemGestureState = Disabled` on every button `isBoundToSystemGesture`
+  of every connected pad, so the game gets the guide button (`XInputGetStateEx`,
+  WGI) and macOS does not take the game out of fullscreen.
+  `NEUTRON_PAD_SYSTEM_GESTURES=1` keeps the macOS gestures.
+- Button layout: sdl2-compat keeps SDL2's default `SDL_GAMECONTROLLER_USE_BUTTON_LABELS=1`,
+  so on Nintendo pads the button labeled A is XInput A (by label, not by position).
+  `SDL_GAMECONTROLLER_USE_BUTTON_LABELS=0` in `neutron.env` maps by position.
+
+Testing without a pad: a virtual IOHID device (`IOHIDUserDeviceCreateWithProperties`)
+needs the restricted `com.apple.developer.hid.virtual.device` entitlement: unsigned it
+returns NULL, ad-hoc signed with the entitlement AMFI kills the process. So winebus
+has a test hook instead: `NEUTRON_PAD_VIRTUAL=1` (or `=<vid>:<pid>`) attaches an SDL
+virtual gamepad that runs a fixed button and axis sequence, echoes rumble as stick
+and trigger input and unplugs itself for a second on a magic rumble value.
+`tests/gamepad_list.c selftest` checks it in XInput, DirectInput, raw input and WGI,
+including hotplug and rumble held over 1 s (fails without the rumble fix);
+`selftest absent` with `054c:0ce6` and `NEUTRON_PAD_HIDRAW=1` checks the PlayStation
+policy. Real pads: `gamepad_list.exe`, `watch` and `rumble`. (sdl2-compat 2.32.74
+passes the SDL2 return value of a virtual pad's rumble callback to SDL3 as a bool, so
+the hook returns 1 for success.)
+
+## DLSS
+
+`NEUTRON_DLSS=1` lets games turn on DLSS (super resolution), which then runs on the
+MetalFX temporal scaler. The game gives DLSS its color, depth, motion vectors, jitter
+and exposure every frame, which is what the temporal scaler needs, so the result is
+much better than the spatial upscaling of the render scale. Opt-in per game: the game
+sees an NVIDIA GPU.
+
+What DXMT already has (built with `-Denable_nvapi=true -Denable_nvngx=true`):
+
+- `dxgi.dll` with `DXMT_ENABLE_NVEXT=1` reports vendor 0x10DE and writes
+  `HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore` `FullPath` = `C:\Windows\System32`
+  (plus two keys games look at for an NVIDIA driver). Without the variable it deletes
+  the values again.
+- `nvapi64.dll`: the NvAPI calls games make for GPU detection (an "NVIDIA GeForce RTX
+  4090", Ada AD102, driver 999.99, display and HDR queries, Reflex calls as no-ops,
+  all shader extension op codes unsupported). `NvAPI_Initialize` fails without NVEXT.
+  No D3D12 NvAPI calls.
+- `nvngx.dll`: an NGX core. The NGX loader linked into the game loads `_nvngx.dll`
+  from the `FullPath` folder and calls its D3D11 entry points; DLSS create and
+  evaluate become a MetalFX temporal scaler run (`IMTLD3D11ContextExt::TemporalUpscale`,
+  motion vectors at display resolution are scaled down first). The quality modes have
+  fixed ratios (ultra performance 1/3, performance 1/2, balanced 0.58, quality 1/1.5,
+  ultra quality 1/1.3, DLAA 1). The game's `nvngx_dlss.dll` is never loaded. No frame
+  generation and no ray reconstruction.
+
+neutron:
+
+- `build.sh` builds both DLLs and puts them into `files/lib/neutron/dlss`, outside
+  Wine's DLL folders.
+- `tool/neutron` with `NEUTRON_DLSS=1` exports `DXMT_ENABLE_NVEXT=1`, copies
+  `nvapi64.dll` and `nvngx.dll` (as `_nvngx.dll` and `nvngx.dll`) into the prefix's
+  `system32` and sets the render scale to 1: Windows sees the native display size and
+  DLSS renders at the lower resolution itself (with the render scale on, DLSS output
+  would be scaled a second time). Without the setting the files are removed again
+  (marker `neutron-dlss-files` in the prefix) and dxgi deletes the registry values, so
+  the game sees the Apple GPU as before. The HUD shows "DLSS MetalFX temporal".
+- dxmt 0033:
+  - Games call the NGX parameter object through the vtable MSVC builds for
+    `NVSDK_NGX_Parameter`: overloads grouped, each group in reverse declaration order
+    (checked with `clang -target x86_64-pc-windows-msvc`). DXMT had the `Get` group
+    partly in another order, `Get(ID3D11Resource **)` and `Get(double *)` hit each
+    other's slots.
+  - A render subrect of 0 (older SDKs, or games that leave it out) means the whole
+    color input instead of a 0x0 MetalFX input; the size is clamped to the scaler's
+    range (at most 3x below the output).
+  - `EnableSignatureOverride` = 1 in both NGXCore keys: the NGX loader checks the
+    NVIDIA signature of the core unless this is set, DXMT's core is not signed.
+  - D3D12: the `NVSDK_NGX_D3D12_*` entry points. Evaluate records the upscale into the
+    game's command list (`IMTLD3D12CommandListExt`, a new `TemporalUpscale` encoder
+    type that waits for and updates the queue fence like the other passes). Motion
+    vectors must be at render resolution (the `MVLowRes` flag, what Unreal and most
+    engines use); display resolution ones are refused on D3D12.
+  - A log line `NGX: DLSS on MetalFX temporal, <in> -> <out>, quality, flags` per
+    created feature.
+
+Findings:
+
+- On macOS 26 and later the MetalFX temporal scaler runs a network on the Neural
+  Engine (MPSGraph `ANERegion` in the backtrace). More than about 20 scaler encodes in
+  one Metal command buffer end in a GPU timeout, also in a native Metal program. Games
+  run DLSS once per frame and DXMT commits per Present, so only tests without Present
+  hit it (`tests/dlss_ngx.c` flushes after every frame).
+- Conventions, checked with the test: jitter as the offset applied to the projection
+  (the sample sits at pixel center minus jitter, in render pixels) and motion vectors
+  from the current to the previous position in render pixels go to MetalFX unchanged.
+  Negating the jitter or the motion vectors makes the output worse than bilinear.
+- `tests/dlss_ngx.c`, performance mode, 256x256 to 512x512, analytic scene (zone
+  plate, checkerboard, thin lines), mean error against the exact picture (0..255):
+  bilinear 37.6, DLSS after 32 still frames 18.7, after 32 scrolling frames 30.4;
+  D3D11 and D3D12 the same. Render subrect 0 and no auto exposure work too.
+
+Not tested with a game yet. Risks of the NVIDIA identity: games pick other presets
+and code paths on an "RTX 4090" (ray tracing options, NVIDIA-only effects, vendor
+specific workarounds), and an NVIDIA path that needs a real NVIDIA driver or NvAPI
+call that is not implemented can fail. Depth as D24S8 (Depth32Float_Stencil8 in
+Metal) and R11G11B10 color or output have not been tried with the scaler.
+
+## Shader and pipeline stutter
+
+D3D11 games hitch when they draw with a shader or render state for the first time
+(new area, new effect): DXMT converts the DXBC with airconv and creates the Metal
+pipeline when the first draw needs it, and its encoder thread waits for it.
+Benchmark: `dev/bench/shader_stutter.c`, headless, 400 generated material-like VS/PS
+pairs (skinning, normal maps, 1 to 6 textures, 1 to 8 lights, parallax loops), 720
+frames paced to 60 Hz, a burst of 24 new pairs every 60 frames and one every 4
+frames, every 8th pair also with 3 other blend states and in an RGBA16F pass without
+depth. Frame time runs from frame start to GPU completion.
+
+Where the time went (M5 Max, cold cache, 840 shader variants, 600 pipelines):
+
+- `newRenderPipelineState`: 23 ms median, 15.4 s in total. airconv: 1.6 ms median,
+  1.6 s in total. `newLibraryWithData` and `newFunctionWithName` 0.06 ms: Metal
+  compiles AIR to GPU code only for a pipeline.
+- DXMT compiled pipelines on a task pool, but added a thread only when all workers
+  were running at the moment of a submit. A draw loop submits a burst before the
+  workers wake up, so 24 new pairs compiled on about 4 threads: 200 ms frames.
+  Metal scales to about 16 pipelines in parallel (native test with DXMT's
+  metallibs: 120 pipelines in 2.3 s on 1 thread, 0.25 s on 16, the same with the
+  async API); `newRenderPipelineState` is not behind a lock for ordinary pipelines
+  (upstream keeps one for D3D11 tessellation and D3D12 mesh pipelines).
+- Metal caches parts of a pipeline (native tests, 19 pipelines each): a new pair
+  20.6 ms; with its VS compiled before in a pipeline with another PS 15.0 ms; with
+  its PS compiled before with another VS 7.1 ms; both 2.9 ms. The PS part depends
+  on color formats and blend state (another blend state: 18.7 ms), not on the
+  depth format (0 ms). A pipeline with the VS alone does not help.
+- Warm cache: airconv is skipped (DXMT's `shaders_320.db`) and Metal's cache in
+  compatdata answers `newRenderPipelineState` in 0.3 ms median, so warm runs had no
+  frame over budget already. A binary archive for warm starts would gain nothing
+  measurable.
+- Wine on macOS turns a `THREAD_PRIORITY_TIME_CRITICAL` thread into a fixed
+  priority Mach thread of the highest importance. DXMT's workers use it; many busy
+  workers made the game thread twice as slow in frames that created shaders.
+- Creating a thread takes 1 to 2 ms in Wine; growing the pool on the game thread
+  cost up to 25 ms in one call.
+
+DXMT patch 0032:
+
+- The pool adds a worker while queued tasks outnumber idle workers, up to the
+  number of cores. Workers create the threads, the game thread at most one per
+  submit. A background queue for speculative work runs on at most half the
+  workers at `BELOW_NORMAL` (QoS utility); work a draw waits for keeps
+  `TIME_CRITICAL`. A draw that needs a background task moves it to the front, or
+  raises its worker when it already runs.
+- Pipeline priming: 50 ms after a VS or PS is created and not drawn, it is compiled
+  in the background in a pipeline with a partner whose signature links with it
+  (the VS created next to the PS, or a shader a draw used) and the render state
+  most pipelines used for as many render targets. The VS variant is exact from
+  `CreateInputLayout`. When the guess is the real pipeline, the draw finds it
+  compiled; otherwise only the link and the guessed-wrong part remain. Within
+  50 ms a shader is compiled for its draw with foreground priority (a background
+  compile started at utility QoS stays slow in MTLCompilerService). Compute
+  pipelines are compiled at `CreateComputeShader`. `DXMT_CONFIG="d3d11.primePipelines
+  = False"` turns priming off.
+- Pixel shader variant keys drop bits that do not change the code (depth target
+  bound for a PS without `SV_Depth`, unorm fix for targets the PS does not write as
+  float), so such draws do not convert and compile the same function again.
+
+Results (M5 Max, macOS 27, medians of 3 cold and 6 warm runs, alternating with the
+build before; frame time in ms, "over" = frames over 16.7 ms of 720, "excess" = their
+time above it, "app" = worst app thread time of a frame):
+
+| Case | Worst frame | p99 | Over | Excess | App |
+|---|---|---|---|---|---|
+| load, cold, before | 214 | 113 | 149 | 2787 | 2.3 |
+| load, cold, 0032 | 59 | 49 | 28 | 718 | 7.5 |
+| load, warm, before | 7.7 | 4.1 | 0 | 0 | 4.2 |
+| load, warm, 0032 | 8.2 | 3.0 | 0 | 0 | 3.0 |
+| stream, cold, before | 213 | 113 | 149 | 2802 | 4.7 |
+| stream, cold, 0032 | 89 | 78 | 149 | 2168 | 5.3 |
+| stream, warm, before | 12.6 | 8.5 | 0 | 0 | 8.7 |
+| stream, warm, 0032 | 13.8 | 9.7 | 0 | 0 | 9.4 |
+
+`load` creates all shaders before the first frame, `stream` each pair in the frame
+that draws it. Images are identical (`hash_rgba8`, `hash_rgba16f`), and so are the
+`gpu_headless` hashes (default, `msaa`, `bgra discard`), the `d3d11_headless` numbers
+(`base`, `state`, `deferred` within 2%) and the D3D11 and D3D12 tests. Of 384 primed
+pipelines in a cold `load` run, 358 were the ones the draws asked for, all compiled
+before the draw. Cache size after a cold run: Metal 12.8 MB (12.7 before), DXMT
+6.3 MB (7.2 before).
+
+What is left:
+
+- A new pair costs about 20 ms of Metal compile, more than a 60 Hz frame. Shaders
+  created in the frame that draws them (`stream`) still miss that frame; only the
+  larger pool helps there.
+- Other blend states and render target formats for a shader cannot be guessed from
+  the shader; the heavy pairs' variants are most of the remaining 40 to 60 ms frames
+  in `load`.
+- In `stream` warm the frames take about 1 ms more CPU (p99 8.5 to 9.7 ms, still
+  none over budget): conversion of each new VS at `CreateInputLayout` and the
+  priming runs.
+- In `load` cold the worst app thread time rises from 2.3 to 7.5 ms while the
+  background compiles run (lookups of primed pipelines, CPU shared with
+  MTLCompilerService).
+- Priming compiles shaders a game creates but never draws (CPU in
+  MTLCompilerService, at utility QoS, capped at 8192 pipelines and half the cores).
+- D3D12 creates its pipelines in `CreateGraphicsPipelineState`, as the API wants,
+  and still has no DXMT cache for DXIL.
+
 ## Patches
 
 All third-party code is fetched at build time at a pinned version and patched
@@ -495,6 +913,7 @@ DXMT patches with `git apply`, all in file name order.
 | LLVM (for DXMT airconv) | 15.0.7 |
 | llvm-mingw | 20260908, CRT startup objects rebuilt from mingw-w64 9f55f4a |
 | Wine Mono | 11.3.0 |
+| SDL3, sdl2-compat | 3.4.18, 2.32.74 |
 
 | Patch | What |
 |---|---|
@@ -512,12 +931,16 @@ DXMT patches with `git apply`, all in file name order.
 | `wine/0012-server-qos-precise-timers` | Wineserver QoS, latency tier, kqueue sleep timers |
 | `wine/0013-win32u-recursive-display-lock` | Display lock recursive for its owner |
 | `wine/0014-winemac-raw-mouse` | Raw mouse input from GameController `GCMouse` |
+| `wine/pending-gamepad.diff` | Game controllers: PlayStation/Nintendo pads as XInput through SDL (`NEUTRON_PAD_HIDRAW`), IOHID pads without SDL, XInput rumble held, battery, Home/Share gestures off (`NEUTRON_PAD_SYSTEM_GESTURES`), `NEUTRON_PAD_VIRTUAL` (to be split into the series) |
+| `wine/pending-qpc.diff` | QPC in PE code from the commpage, no OpenGL load for the GPU list, faster font enumeration (to be split into the series) |
 | `proton/0001-lsteamclient-macos` | lsteamclient on macOS: optional exports, libc++, key map, `NEUTRON_STEAMCLIENT_DYLIB` |
 | `proton/0002-lsteamclient-link-libcxx` | Links lsteamclient.so against libc++ |
 | `proton/0003-steam-helper-macos` | steam.exe opens `steam://` URLs with `open` |
 | `fex/0001-macos-teb-tsd-and-map-jit` | TEB via TSD, `MAP_JIT` write scopes, macOS UnixLib |
 | `fex/0002-host-page-guards` | Guard pages cover a whole host page |
 | `fex/0003-afp-lazy-native-transition` | Fewer FPCR writes on x64 to ARM64EC calls |
+| `fex/0004-afp-only-for-float-blocks` | x86 float mode (FPCR.NEP/AH) only in blocks that need it, NaN lanes before a native call fixed in software |
+| `fex/0005-code-cache-map-jit` | FEX code cache tools on Apple Silicon (offline compiler config and `MAP_JIT`), not usable yet |
 | `llvm-mingw/0001-ntcurrentteb-tsd` | `NtCurrentTeb()` via TSD in `winnt.h` |
 | `dxmt/0001-d3d12-clock-calibration` | D3D12 timestamp frequency and clock calibration |
 | `dxmt/0002-no-thread-local` | No `thread_local` in the occlusion query code |
@@ -530,6 +953,7 @@ DXMT patches with `git apply`, all in file name order.
 | `dxmt/0009-no-display-mode-switch` | No real display mode switches |
 | `dxmt/0010-display-layer-format` | BGR10A2 layer for 10-bit backbuffers, `NEUTRON_LAYER_FORMAT` |
 | `dxmt/0011-native-drawable-size` | Drawable in screen pixels, `NEUTRON_NATIVE_DRAWABLE` |
+| `dxmt/0033-dlss-ngx-metalfx` | DLSS on MetalFX temporal: NGX parameter vtable, render subrect 0, signature override, D3D12 NGX |
 
 ## Open points
 
@@ -544,3 +968,10 @@ DXMT patches with `git apply`, all in file name order.
 - Direct presentation: the changes in dxmt 0010 and 0011 still need to be
   verified on screen with `dev/direct-test.sh`.
 - D3D12 support is being worked on; a section on it will follow.
+- Game controllers are only tested with SDL's virtual pad so far. Open with real
+  pads: Xbox over USB and other pads SDL reads through GameController (winedevice is
+  a background process, SDL sets `shouldMonitorBackgroundEvents`), whether the
+  disabled Home button gesture holds in native fullscreen, DualSense and Switch Pro
+  rumble through SDL's HIDAPI drivers, `NEUTRON_PAD_HIDRAW=1` with a game that has own
+  PlayStation support.
+- DLSS (`NEUTRON_DLSS=1`) still needs a test with a real game; see DLSS.

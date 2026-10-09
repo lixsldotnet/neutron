@@ -408,6 +408,23 @@ int main(int argc, char **argv)
 {
     QueryPerformanceFrequency(&qpf);
     if (argc > 1 && strcmp(argv[1], "--nop") == 0) { printf("{\"bench\":\"nop\"}\n"); return 0; }
+    if (argc > 1 && strcmp(argv[1], "--user32") == 0)
+    {
+        /* start costs of a GUI process: loading user32 (fonts, winemac) and the first call
+         * that needs the desktop (explorer.exe /desktop on a cold wineserver), no window */
+        LARGE_INTEGER t0, t1, t2;
+        HMODULE user32;
+        int (WINAPI *metrics)(int);
+        QueryPerformanceCounter(&t0);
+        user32 = LoadLibraryA("user32.dll");
+        QueryPerformanceCounter(&t1);
+        metrics = (void *)GetProcAddress(user32, "GetSystemMetrics");
+        metrics(SM_CXSCREEN);
+        QueryPerformanceCounter(&t2);
+        printf("{\"bench\":\"user32\",\"user32_load_ms\":%.1f,\"user32_desktop_ms\":%.1f}\n",
+               (t1.QuadPart - t0.QuadPart) * 1e3 / qpf.QuadPart, (t2.QuadPart - t1.QuadPart) * 1e3 / qpf.QuadPart);
+        return 0;
+    }
     filter = argc > 1 ? argv[1] : NULL;
 
     for (int i = 0; i < 4096; i++) { vbuf_a[i] = (float)(i % 97) - 48.f; vbuf_b[i] = (float)(i % 13); }

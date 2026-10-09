@@ -1,5 +1,6 @@
 Raw input (mouse look) from GameController GCMouse: unaccelerated device deltas, sent
 only as WM_INPUT; the cursor follows the macOS cursor. NEUTRON_RAW_MOUSE=0 disables.
+Makefile.in also lists cocoa_gamepad.m from 0017.
 --- a/dlls/winemac.drv/cocoa_rawmouse.m
 +++ b/dlls/winemac.drv/cocoa_rawmouse.m
 @@ -0,0 +1,136 @@
@@ -221,8 +222,11 @@ only as WM_INPUT; the cursor follows the macOS cursor. NEUTRON_RAW_MOUSE=0 disab
  	-framework IOKit \
  	-framework Metal \
  	-framework OpenGL \
-@@ -24,6 +25,7 @@
+@@ -22,8 +23,10 @@
+ 	cocoa_cursorclipping.m \
+ 	cocoa_display.m \
  	cocoa_event.m \
++	cocoa_gamepad.m \
  	cocoa_main.m \
  	cocoa_opengl.m \
 +	cocoa_rawmouse.m \

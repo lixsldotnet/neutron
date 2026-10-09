@@ -1,0 +1,397 @@
+Fewer FPCR writes around x64 to ARM64EC calls (on top of 0003): only blocks with float math set FPCR.NEP/AH,
+compares and float to int conversions only while FPCR.FZ is set, and up to 8 add/sub/mul/div before a call into
+ARM64EC code run without AH; NaN lanes of their results are rebuilt with the x86 NaN rules in software.
+
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -884,20 +884,196 @@ CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(s
+   return AllocatedInfo;
+ }
+ 
+-bool Arm64JITCore::BlockUsesFPR(IR::Ref BlockNode) const {
+-  const auto IsFPRClass = [](IR::RegClass C) { return C == IR::RegClass::FPR || C == IR::RegClass::FPRFixed; };
++/* neutron: does an IR block need FPCR.NEP/AH? FPCR only affects floating point instructions, and codegen of all
++   other ops works with and without AFP (it has to run on non-AFP hosts too). So blocks that only move data through
++   vector registers (struct copies, zeroing, memcpy, integer SIMD) or convert int to float (no NaN, no denormal; the
++   scalar insert form is emitted without NEP in such blocks) skip the FPCR write after a native call. Compares and
++   rounding to integer only differ through input flushing (with AH=0, FPCR.FZ also flushes denormal inputs; FIZ is
++   not touched by the native transition), so they need AFP only while FZ (x86 MXCSR.FTZ) is set. Everything else
++   that does floating point math needs it (NaN sign and selection, x86 min/max, flushing, AFP scalar inserts), and
++   so does SetRoundingMode, which can set FZ in the middle of a block. Exception (Light): with FZ clear, add, sub,
++   mul and div only differ from their AH=1 result in NaN lanes; a small block that ends with a call computes them
++   into a temporary without AFP and rebuilds NaN lanes with the x86 rules (LightNaNFixup), no FPCR write. */
++Arm64JITCore::AFPNeed Arm64JITCore::BlockNeedsAFP(IR::Ref BlockNode) const {
++  AFPNeed Need = AFPNeed::None;
++  uint32_t LightOps = 0;
++  bool EndsWithCall = false;
+   for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+-    if (IR::GetHasDest(IROp->Op) && IsFPRClass(IR::PhysicalRegister(CodeNode).AsRegClass())) {
+-      return true;
++    switch (IROp->Op) {
++    case IR::OP_EXITFUNCTION: {
++      // A call that may go to ARM64EC code: indirect (imports, vtables) or to a known EC address
++      const auto Op = IROp->C<IR::IROp_ExitFunction>();
++      uint64_t Target;
++      if (Op->Hint == IR::BranchHint::Call) {
++        EndsWithCall = !(IsInlineConstant(Op->NewRIP, &Target) || IsInlineEntrypointOffset(Op->NewRIP, &Target));
++#ifdef ARCHITECTURE_arm64ec
++        EndsWithCall |= !EndsWithCall && Target < EC_CODE_BITMAP_MAX_ADDRESS && RtlIsEcCode(Target);
++#endif
++      }
++      break;
+     }
+-    const int NumRAArgs = IR::GetRAArgs(IROp->Op);
+-    for (int i = 0; i < NumRAArgs; ++i) {
+-      if (IROp->Args[i].IsImmediate() && IsFPRClass(IR::PhysicalRegister(IROp->Args[i]).AsRegClass())) {
+-        return true;
++    case IR::OP_VFADD:
++    case IR::OP_VFSUB:
++    case IR::OP_VFMUL:
++    case IR::OP_VFDIV:
++    case IR::OP_VFADDSCALARINSERT:
++    case IR::OP_VFSUBSCALARINSERT:
++    case IR::OP_VFMULSCALARINSERT:
++    case IR::OP_VFDIVSCALARINSERT:
++      // Add/sub/mul/div of float/double, scalar or 128-bit: can run without AH (see LightNaNFixup)
++      if (IROp->Size == IR::OpSize::i256Bit || (IROp->ElementSize != IR::OpSize::i32Bit && IROp->ElementSize != IR::OpSize::i64Bit)) {
++        return AFPNeed::Always;
++      }
++      ++LightOps;
++      break;
++    case IR::OP_FCMP:
++    case IR::OP_FLOAT_TOGPR_S:
++    case IR::OP_FLOAT_TOGPR_ZS:
++    case IR::OP_VECTOR_FTOS:
++    case IR::OP_VECTOR_FTOZS:
++    case IR::OP_VFCMPEQ:
++    case IR::OP_VFCMPNEQ:
++    case IR::OP_VFCMPLT:
++    case IR::OP_VFCMPGT:
++    case IR::OP_VFCMPLE:
++    case IR::OP_VFCMPORD:
++    case IR::OP_VFCMPUNO:
++    case IR::OP_VECTOR_FTOI:
++    case IR::OP_VECTOR_FTOISIZED:
++      Need = AFPNeed::IfFZ;
++      break;
++    case IR::OP_SELECT:
++      // An FPR compare emits fcmp
++      if (IsFPR(IROp->C<IR::IROp_Select>()->Cmp1)) {
++        Need = AFPNeed::IfFZ;
+       }
++      break;
++    case IR::OP_SETROUNDINGMODE: // may set FZ in the middle of an IfFZ block (x86 ldmxcsr)
++    case IR::OP_VFMINSCALARINSERT:
++    case IR::OP_VFMAXSCALARINSERT:
++    case IR::OP_VFSQRTSCALARINSERT:
++    case IR::OP_VFRSQRTSCALARINSERT:
++    case IR::OP_VFRECPSCALARINSERT:
++    case IR::OP_VFTOFSCALARINSERT:
++    case IR::OP_VFTOISCALARINSERT:
++    case IR::OP_VFCMPSCALARINSERT:
++    case IR::OP_VFMLASCALARINSERT:
++    case IR::OP_VFMLSSCALARINSERT:
++    case IR::OP_VFNMLASCALARINSERT:
++    case IR::OP_VFNMLSSCALARINSERT:
++    case IR::OP_VFCOPYSIGN:
++    case IR::OP_VFABS:
++    case IR::OP_VFNEG:
++    case IR::OP_VFRECP:
++    case IR::OP_VFRECPPRECISION:
++    case IR::OP_VFSQRT:
++    case IR::OP_VFRSQRT:
++    case IR::OP_VFRSQRTPRECISION:
++    case IR::OP_VFADDP:
++    case IR::OP_VFADDV:
++    case IR::OP_VFMIN:
++    case IR::OP_VFMAX:
++    case IR::OP_VFCADD:
++    case IR::OP_VFMLA:
++    case IR::OP_VFMLS:
++    case IR::OP_VFNMLA:
++    case IR::OP_VFNMLS:
++    case IR::OP_FLOAT_FTOF:
++    case IR::OP_VECTOR_FTOF:
++    case IR::OP_VFCVTL2:
++    case IR::OP_VFCVTN2:
++    case IR::OP_VECTOR_F64TOI32:
++    case IR::OP_F64ATAN:
++    case IR::OP_F64FPREM:
++    case IR::OP_F64FPREM1:
++    case IR::OP_F64SCALE:
++    case IR::OP_F64F2XM1:
++    case IR::OP_F64FYL2X:
++    case IR::OP_F64FYL2XP1:
++    case IR::OP_F64TAN:
++    case IR::OP_F64SIN:
++    case IR::OP_F64COS:
++    case IR::OP_F64SINCOS:
++    case IR::OP_SYNCSTACKTOSLOW:
++    case IR::OP_STACKFORCESLOW:
++    case IR::OP_INITSTACK:
++    case IR::OP_INCSTACKTOP:
++    case IR::OP_DECSTACKTOP:
++    case IR::OP_INVALIDATESTACK:
++    case IR::OP_PUSHSTACK:
++    case IR::OP_COPYPUSHSTACK:
++    case IR::OP_STORESTACKMEM:
++    case IR::OP_STORESTACKTOSTACK:
++    case IR::OP_POPSTACKDESTROY:
++    case IR::OP_READSTACKVALUE:
++    case IR::OP_STACKVALIDTAG:
++    case IR::OP_F80ADDSTACK:
++    case IR::OP_F80ADDVALUE:
++    case IR::OP_F80ADD:
++    case IR::OP_F80SUBSTACK:
++    case IR::OP_F80SUBVALUE:
++    case IR::OP_F80SUBRVALUE:
++    case IR::OP_F80SUB:
++    case IR::OP_F80MULSTACK:
++    case IR::OP_F80MULVALUE:
++    case IR::OP_F80MUL:
++    case IR::OP_F80DIVSTACK:
++    case IR::OP_F80DIVVALUE:
++    case IR::OP_F80DIVRVALUE:
++    case IR::OP_F80DIV:
++    case IR::OP_F80STACKXCHANGE:
++    case IR::OP_F80STACKCHANGESIGN:
++    case IR::OP_F80STACKABS:
++    case IR::OP_F80PTANSTACK:
++    case IR::OP_F80ATANSTACK:
++    case IR::OP_F80ATAN:
++    case IR::OP_F80FPREMSTACK:
++    case IR::OP_F80FPREM:
++    case IR::OP_F80FPREM1STACK:
++    case IR::OP_F80FPREM1:
++    case IR::OP_F80SCALESTACK:
++    case IR::OP_F80SCALE:
++    case IR::OP_F80CVT:
++    case IR::OP_F80CVTINT:
++    case IR::OP_F80CVTTO:
++    case IR::OP_F80CVTTOINT:
++    case IR::OP_F80ROUNDSTACK:
++    case IR::OP_F80ROUND:
++    case IR::OP_F80F2XM1STACK:
++    case IR::OP_F80F2XM1:
++    case IR::OP_F80TAN:
++    case IR::OP_F80SINSTACK:
++    case IR::OP_F80SIN:
++    case IR::OP_F80COSSTACK:
++    case IR::OP_F80COS:
++    case IR::OP_F80SINCOS:
++    case IR::OP_F80SINCOSSTACK:
++    case IR::OP_F80SQRTSTACK:
++    case IR::OP_F80SQRT:
++    case IR::OP_F80XTRACT_EXP:
++    case IR::OP_F80XTRACT_SIG:
++    case IR::OP_F80STACKTEST:
++    case IR::OP_F80CMPSTACK:
++    case IR::OP_F80CMPVALUE:
++    case IR::OP_F80CMP:
++    case IR::OP_F80BCDLOAD:
++    case IR::OP_F80BCDSTORE:
++    case IR::OP_F80FYL2XSTACK:
++    case IR::OP_F80FYL2X:
++    case IR::OP_F80FYL2XP1STACK:
++    case IR::OP_F80FYL2XP1:
++    case IR::OP_F80VBSLSTACK:
++      return AFPNeed::Always;
++    default: break;
+     }
+   }
+-  return false;
++  if (LightOps) {
++    // A few float ops right before a call that may go into ARM64EC code (e.g. a D3D call after filling a constant
++    // buffer): NaN checks are cheaper than setting AH here and clearing it again in ExitFunctionEC (two FPCR writes,
++    // about 20 ns). Larger blocks, loops and direct calls to x86 code keep the faster AFP code.
++    return EndsWithCall && LightOps <= 8 ? AFPNeed::Light : AFPNeed::Always;
++  }
++  return Need;
+ }
+ 
+ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size, bool SingleInst, const FEXCore::IR::IRListView* IR,
+@@ -1041,11 +1217,17 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
+ 
+ #ifdef ARCHITECTURE_arm64ec
+     /* neutron: FPCR.NEP/AH are not set when entering JIT code from native code (saves two FPCR writes per native
+-       call). A block that uses vector registers ensures them at its start, a mid-block spill/fill restores them. */
+-    if (HostSupportsAFP && BlockUsesFPR(BlockNode)) {
++       call). A block with floating point ops ensures them at its start, a mid-block spill/fill restores them. */
++    const auto Need = HostSupportsAFP ? BlockNeedsAFP(BlockNode) : AFPNeed::None;
++    CurrentBlockAFP = Need == AFPNeed::Always;
++    CurrentBlockLight = Need == AFPNeed::Light;
++    if (Need != AFPNeed::None) {
+       ARMEmitter::ForwardLabel AFPOn;
+       mrs(TMP1, ARMEmitter::SystemRegister::FPCR);
+       (void)tbnz(TMP1, 2, &AFPOn);
++      if (Need != AFPNeed::Always) {
++        (void)tbz(TMP1, 24, &AFPOn); // FZ clear: these ops give the same results without AH (Light: unless NaN)
++      }
+       orr(ARMEmitter::Size::i64Bit, TMP1, TMP1, (1U << 2) | (1U << 1));
+       msr(ARMEmitter::SystemRegister::FPCR, TMP1);
+       (void)Bind(&AFPOn);
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -69,8 +69,64 @@ private:
+   const bool HostSupportsAVX256 {};
+   const bool HostSupportsRPRES {};
+   const bool HostSupportsAFP {};
+-  /* neutron: true if an IR block has vector register operands (needs FPCR.NEP/AH) */
+-  bool BlockUsesFPR(IR::Ref BlockNode) const;
++  /* neutron: whether an IR block needs FPCR.NEP/AH: never, only while FPCR.FZ is set, or always */
++  enum class AFPNeed { None, IfFZ, Light, Always };
++  AFPNeed BlockNeedsAFP(IR::Ref BlockNode) const;
++  /* neutron: false while emitting a block that may run without FPCR.NEP (scalar inserts then use a temporary) */
++  bool CurrentBlockAFP {true};
++  /* neutron: emitting an AFPNeed::Light block: float ops check their result for NaN */
++  bool CurrentBlockLight {false};
++  /* neutron: Result (VTMP1) holds Src1 op Src2 (add/sub/mul/div), computed without FPCR.AH. Only NaN lanes can
++     differ from x86 then: x86 returns Src1 if it is a NaN, else Src2 if it is a NaN, else the default NaN with the
++     sign bit set, all quieted; AH=0 prefers a signaling NaN and returns a positive default NaN. If a lane is NaN,
++     build the x86 NaN for every lane and keep it where the result is NaN (FMINNM returns the number when one operand
++     is a quiet NaN), without an FPCR write. Emit(Dst) computes the operation again into Dst, Src1 and Src2 must be
++     unchanged. With FPCR.FIZ set (x86 DAZ) FMINNM would flush a denormal result, then AH is set and the operation
++     redone instead. Uses TMP1 and VTMP2, keeps NZCV. */
++  template<typename F>
++  void LightNaNFixup(IR::OpSize ElementSize, bool IsScalar, ARMEmitter::VRegister Src1, ARMEmitter::VRegister Src2, F&& Emit) {
++    ARMEmitter::ForwardLabel Done, SetAFP;
++    const bool Is64 = ElementSize == IR::OpSize::i64Bit;
++    const auto Size = Is64 ? ARMEmitter::SubRegSize::i64Bit : ARMEmitter::SubRegSize::i32Bit;
++    if (IsScalar) {
++      fcmeq(Is64 ? ARMEmitter::ScalarRegSize::i64Bit : ARMEmitter::ScalarRegSize::i32Bit, VTMP2, VTMP1, VTMP1);
++    } else {
++      fcmeq(Size, VTMP2.Q(), VTMP1.Q(), VTMP1.Q());
++      uminv(ARMEmitter::SubRegSize::i32Bit, VTMP2.Q(), VTMP2.Q());
++    }
++    fmov(ARMEmitter::Size::i32Bit, TMP1.W(), VTMP2.S());
++    (void)cbnz(ARMEmitter::Size::i32Bit, TMP1, &Done); // no NaN lane
++    mrs(TMP1, ARMEmitter::SystemRegister::FPCR);
++    (void)tbnz(TMP1, 1, &Done);   // AH already set (AFP block before, mid-block fill): the result is exact
++    (void)tbnz(TMP1, 0, &SetAFP); // FIZ
++    // x86 NaN per lane: Src1 ordered ? (Src2 ordered ? default NaN : Src2) : Src1, then quieted
++    fcmeq(Size, VTMP2.Q(), Src2.Q(), Src2.Q());
++    if (Is64) {
++      movz(TMP1, 0xFFF8, 48);
++    } else {
++      movz(TMP1.W(), 0xFFC0, 16);
++    }
++    dup(Size, VTMP1.Q(), TMP1);
++    bsl(VTMP2.Q(), VTMP1.Q(), Src2.Q());
++    fcmeq(Size, VTMP1.Q(), Src1.Q(), Src1.Q());
++    bsl(VTMP1.Q(), VTMP2.Q(), Src1.Q());
++    if (Is64) {
++      movz(TMP1, 0x0008, 48);
++    } else {
++      movz(TMP1.W(), 0x0040, 16);
++    }
++    dup(Size, VTMP2.Q(), TMP1);
++    orr(VTMP1.Q(), VTMP1.Q(), VTMP2.Q());
++    // Every lane of VTMP1 is a quiet NaN now: take the result where it is a number
++    Emit(VTMP2);
++    fminnm(Size, VTMP1.Q(), VTMP1.Q(), VTMP2.Q());
++    (void)b(&Done);
++    (void)Bind(&SetAFP);
++    orr(ARMEmitter::Size::i64Bit, TMP1, TMP1, (1U << 2) | (1U << 1));
++    msr(ARMEmitter::SystemRegister::FPCR, TMP1);
++    Emit(VTMP1);
++    (void)Bind(&Done);
++  }
+ 
+   struct RestartOptions {
+     enum class Control : uint64_t {
+diff --git a/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp b/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
+--- a/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
+@@ -156,6 +156,19 @@ namespace FEXCore::CPU {
+                                                                                                                                     \
+     if (HostSupportsSVE256 && Is256Bit) {                                                                                           \
+       ARMOp(SubRegSize, Dst.Z(), Vector1.Z(), Vector2.Z());                                                                         \
++    } else if (CurrentBlockLight) { /* neutron: into a temporary, NaN check, see LightNaNFixup */                                   \
++      auto Emit = [&](ARMEmitter::VRegister T) {                                                                                    \
++        if (!IsScalar) {                                                                                                            \
++          ARMOp(SubRegSize, T.Q(), Vector1.Q(), Vector2.Q());                                                                       \
++        } else if (ElementSize == IR::OpSize::i64Bit) {                                                                             \
++          ARMOp(T.D(), Vector1.D(), Vector2.D());                                                                                   \
++        } else {                                                                                                                    \
++          ARMOp(T.S(), Vector1.S(), Vector2.S());                                                                                   \
++        }                                                                                                                           \
++      };                                                                                                                            \
++      Emit(VTMP1);                                                                                                                  \
++      LightNaNFixup(ElementSize, IsScalar, Vector1, Vector2, Emit);                                                                 \
++      mov(Dst.Q(), VTMP1.Q());                                                                                                      \
+     } else {                                                                                                                        \
+       if (IsScalar) {                                                                                                               \
+         switch (ElementSize) {                                                                                                      \
+@@ -185,8 +198,13 @@ namespace FEXCore::CPU {
+     const auto ElementSize = Op->Header.ElementSize;                                                                          \
+     const auto SubRegSize = ConvertSubRegSizePair248(IROp);                                                                   \
+                                                                                                                               \
+-    auto ScalarEmit = [this, SubRegSize](ARMEmitter::VRegister Dst, ARMEmitter::VRegister Src1, ARMEmitter::VRegister Src2) { \
++    auto ScalarEmit = [this, SubRegSize, ElementSize](ARMEmitter::VRegister Dst, ARMEmitter::VRegister Src1,                  \
++                                                      ARMEmitter::VRegister Src2) {                                           \
+       ARMOp(SubRegSize.Scalar, Dst, Src1, Src2);                                                                              \
++      if (CurrentBlockLight) { /* neutron: Dst is VTMP1 here (no AFP insert in Light blocks), see LightNaNFixup */            \
++        LightNaNFixup(ElementSize, true, Src1, Src2,                                                                          \
++                      [&](ARMEmitter::VRegister T) { ARMOp(SubRegSize.Scalar, T, Src1, Src2); });                             \
++      }                                                                                                                       \
+     };                                                                                                                        \
+                                                                                                                               \
+     const auto Dst = GetVReg(Node);                                                                                           \
+@@ -315,7 +333,7 @@ void Arm64JITCore::VFScalarOperation(IR::OpSize OpSize, IR::OpSize ElementSize,
+       mov(Dst.Q(), Vector1.Q());
+     }
+ 
+-    if (HostSupportsAFP) {
++    if (HostSupportsAFP && CurrentBlockAFP) { // neutron: see BlockNeedsAFP
+       // If the host CPU supports AFP then scalar does an insert without modifying upper bits.
+       ScalarEmit(Dst, Vector1, Vector2);
+     } else {
+@@ -336,7 +354,7 @@ void Arm64JITCore::VFScalarOperation(IR::OpSize OpSize, IR::OpSize ElementSize,
+       mov(Dst.Q(), Vector1.Q());
+     }
+ 
+-    if (HostSupportsAFP) {
++    if (HostSupportsAFP && CurrentBlockAFP) { // neutron: see BlockNeedsAFP
+       ScalarEmit(Dst, Vector1, Vector2);
+     } else {
+       ScalarEmit(VTMP1, Vector1, Vector2);
+@@ -391,7 +409,7 @@ void Arm64JITCore::VFScalarUnaryOperation(IR::OpSize OpSize, IR::OpSize ElementS
+       mov(Dst.Q(), Vector1.Q());
+     }
+ 
+-    if (HostSupportsAFP) { // or Dst (here Dst == Vector1)
++    if (HostSupportsAFP && CurrentBlockAFP) { // or Dst (here Dst == Vector1); neutron: CurrentBlockAFP, see BlockNeedsAFP
+       // If the host CPU supports AFP then scalar does an insert without modifying upper bits.
+       ScalarEmit(Dst, Vector2);
+     } else {
+@@ -412,7 +430,7 @@ void Arm64JITCore::VFScalarUnaryOperation(IR::OpSize OpSize, IR::OpSize ElementS
+       mov(Dst.Q(), Vector1.Q());
+     }
+ 
+-    if (HostSupportsAFP) {
++    if (HostSupportsAFP && CurrentBlockAFP) { // neutron: see BlockNeedsAFP
+       ScalarEmit(Dst, Vector2);
+     } else {
+       ScalarEmit(VTMP1, Vector2);
+@@ -1370,6 +1388,19 @@ DEF_OP(VFDiv) {
+       movprfx(Dst.Z(), Vector1.Z());
+       fdiv(SubRegSize, Dst.Z(), Mask, Dst.Z(), Vector2.Z());
+     }
++  } else if (CurrentBlockLight) { // neutron: into a temporary, NaN check, see LightNaNFixup
++    auto Emit = [&](ARMEmitter::VRegister T) {
++      if (!IsScalar) {
++        fdiv(SubRegSize, T.Q(), Vector1.Q(), Vector2.Q());
++      } else if (ElementSize == IR::OpSize::i64Bit) {
++        fdiv(T.D(), Vector1.D(), Vector2.D());
++      } else {
++        fdiv(T.S(), Vector1.S(), Vector2.S());
++      }
++    };
++    Emit(VTMP1);
++    LightNaNFixup(ElementSize, IsScalar, Vector1, Vector2, Emit);
++    mov(Dst.Q(), VTMP1.Q());
+   } else {
+     if (IsScalar) {
+       switch (ElementSize) {
