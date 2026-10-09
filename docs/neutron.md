@@ -396,6 +396,36 @@ a user-space copy of the ntsync driver:
   ends; 512K objects, 32K threads. Off unless `NEUTRON_MSYNC=1` until tested with
   more games.
 
+## GPU passes
+
+Apple GPUs are tile based: every render pass boundary loads and stores the tiles it
+touches. Measured on the M5 Max: about 7 us fixed cost per render pass, a full
+2924x1224 RGBA16F pass 19 us with lossless compression and 29 us without
+(`MTLTextureUsagePixelFormatView` turns compression off). DXMT already folds clears
+into load actions and MSAA resolves into store actions when a frame stays in one
+command buffer; the waste came from frames cut into several command buffers.
+
+- DXMT patch 0018: `GetData` no longer flushes for an event or disjoint query whose
+  event is already committed, and the commit after a query End waits (at most 8
+  pass boundaries) while clears are recorded whose pass has not started. Before, a
+  query in the middle of a frame left its clears as separate passes and the next
+  pass loaded every attachment (the "Clear passes" count in the HUD).
+- 0016: `DiscardView`, `DiscardView1` (whole view) and `DiscardResource` on render
+  targets and depth turn into DontCare load/store actions (MSAA: resolve only),
+  using DXMT's dependency scan, so a reader in between keeps the store.
+- 0017: B8G8R8A8_TYPELESS render targets without UAV keep lossless compression
+  (UNORM and sRGB views do not need the pixel format view flag).
+  `DXMT_CONFIG="d3d11.compressTypelessRenderTargets=True"` does it for all typeless
+  render targets (opt-in per game: reading through another view type is undefined
+  in Metal; `tests/d3d11_typeless_views.c` reads bit-exact on M5).
+- Benchmark: `dev/bench/gpu_headless.c`, a deferred frame (shadow cascades,
+  G-buffer, SSAO, lighting, bloom, TAA) with timestamp queries and image hashes;
+  `dev/bench/gpu-ab.sh` compares two runtimes. With queries in the frame 4 to 6%
+  less GPU time, images bit-identical in 10 configurations.
+- Seen in upstream DXMT too: under heavy machine load 1 to 10% of runs give a
+  final image with a few pixels off by 1 LSB (HDR identical), likely a
+  read-before-write race on a post-process target between frames.
+
 ## Patches
 
 All third-party code is fetched at build time at a pinned version and patched

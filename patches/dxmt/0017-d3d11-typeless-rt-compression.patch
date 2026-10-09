@@ -1,0 +1,55 @@
+Keep lossless compression for B8G8R8A8_TYPELESS render targets: no MTLTextureUsagePixelFormatView when the
+family only has sRGB variants. d3d11.compressTypelessRenderTargets=True (opt-in, per game) drops it for all
+typeless render targets; views of another type then read compressed data in a way Metal does not define.
+
+--- a/src/d3d11/d3d11_resource_helper.cpp
++++ b/src/d3d11/d3d11_resource_helper.cpp
+@@ -4,6 +4,7 @@
+ #include "d3d11_resource.hpp"
+ #include "d3d11_1.h"
+ #include "util_math.hpp"
++#include "config/config.hpp"
+ 
+ namespace dxmt {
+ 
+@@ -295,6 +296,31 @@
+   pViewDescOut->Texture3D.FirstWSlice = 0;
+   pViewDescOut->Texture3D.WSize = pResourceDesc->Depth;
+   return S_OK;
++}
++
++/*
++neutron: MTLTextureUsagePixelFormatView turns off the lossless compression of render targets on Apple GPUs.
++A view that only toggles sRGB does not need it, and the B8G8R8A8 family has no other members, so these
++textures keep the compression (not with UAV binding: UAV clears make an integer view).
++d3d11.compressTypelessRenderTargets=True also leaves it out for the other typeless render targets, for games
++that only create views in the texture's own layout (UNORM/sRGB, FLOAT); a view of another type (UINT, SNORM)
++then reinterprets compressed data, which Metal does not define (the validation layer rejects such views).
++*/
++static bool
++NeedsPixelFormatView(DXGI_FORMAT Format, UINT BindFlags) {
++  if (BindFlags & D3D11_BIND_UNORDERED_ACCESS) // UAV clears use an integer view
++    return true;
++  switch (Format) {
++  case DXGI_FORMAT_B8G8R8A8_TYPELESS:
++    return false;
++  default:
++    break;
++  }
++  static const bool compress_typeless =
++      Config::getInstance().getOption<bool>("d3d11.compressTypelessRenderTargets", false);
++  if (compress_typeless && (BindFlags & D3D11_BIND_RENDER_TARGET))
++    return false;
++  return true;
+ }
+ 
+ HRESULT
+@@ -366,7 +392,7 @@
+     // decoder not supported: D3D11_BIND_DECODER, D3D11_BIND_VIDEO_ENCODER
+   }
+ 
+-  if (metal_format.Flag & MTL_DXGI_FORMAT_TYPELESS) {
++  if ((metal_format.Flag & MTL_DXGI_FORMAT_TYPELESS) && NeedsPixelFormatView(Format, BindFlags)) {
+     // well this is necessary for passing validation layer
+     metal_usage |= WMTTextureUsagePixelFormatView;
+   }

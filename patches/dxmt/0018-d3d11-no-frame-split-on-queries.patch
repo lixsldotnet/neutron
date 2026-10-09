@@ -1,0 +1,165 @@
+Keep a frame in one command buffer around queries: GetData does not flush for an event query that is already
+committed, and the commit after a query End waits until clears recorded before a pass are in that pass.
+Both splits turned clears into separate passes and the pass after them into Load/Store.
+
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -406,17 +406,23 @@
+       return E_INVALIDARG;
+ 
+     HRESULT hr = S_FALSE;
++    /* neutron: a pending query whose event is already in a committed command buffer does not need a flush.
++       Flushing anyway cuts the frame being recorded into two command buffers, so a clear before the poll can no
++       longer become the load action of the pass after it, and passes on both sides can't be merged. */
++    bool submitted = false;
+ 
+     D3D11_QUERY_DESC desc;
+     ((ID3D11Query *)pAsync)->GetDesc(&desc);
+     switch (desc.Query) {
+     case D3D11_QUERY_EVENT:
+     case D3D11_QUERY_TIMESTAMP_DISJOINT: {
++      submitted = static_cast<MTLD3D11EventQuery *>(pAsync)->SignalSeqId() <= cmd_queue.CommittedEventSeqId();
+       switch (static_cast<MTLD3D11EventQuery *>(pAsync)->CheckEventState(cmd_queue.SignaledEventSeqId())) {
+       case EventState::Pending:
+         break;
+       case EventState::Stall:
+-        GetDataFlags &= ~D3D11_ASYNC_GETDATA_DONOTFLUSH;
++        if (!submitted)
++          GetDataFlags &= ~D3D11_ASYNC_GETDATA_DONOTFLUSH;
+         break;
+       case EventState::Signaled:
+         hr = S_OK;
+@@ -471,7 +477,8 @@
+     }
+     if (hr == S_FALSE && (GetDataFlags & D3D11_ASYNC_GETDATA_DONOTFLUSH) == 0) {
+       cmd_queue.CurrentFrameStatistics().event_stall++;
+-      Flush();
++      if (!submitted)
++        Flush();
+     }
+     return hr;
+   }
+@@ -587,6 +594,8 @@
+   void
+   Commit() override {
+     promote_flush = false;
++    pending_clears_ = 0; /* neutron: see InvalidateCurrentPass */
++    promote_deferrals_ = 0;
+     D3D11_ASSERT(cmdbuf_state == CommandBufferState::Idle);
+     ctx_state.cmd_queue.CommitCurrentChunk();
+     ctx_state.has_dirty_op_since_last_event = false;
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -4335,6 +4335,9 @@
+ #pragma region CommandEncoder Maintain State
+ 
+   bool promote_flush = false;
++  /* neutron: clears whose render pass has not started yet (approximate), see InvalidateCurrentPass */
++  uint32_t pending_clears_ = 0;
++  uint32_t promote_deferrals_ = 0;
+ 
+   /**
+   Render pass can be invalidated by reasons:
+@@ -4382,7 +4385,16 @@
+     }
+ 
+     cmdbuf_state = CommandBufferState::Idle;
++    /* neutron: a pending promote_flush (after a query End) waits while clears are recorded whose render pass has
++       not started yet: committing now would put them into another command buffer than their pass, and they could
++       not become its load action (a separate clear pass, plus Load in the pass). At most 8 pass boundaries. */
++    if (promote_flush && !defer_commit && pending_clears_ && promote_deferrals_ < 8) {
++      promote_deferrals_++;
++      return false;
++    }
+     if (promote_flush && !defer_commit) {
++      pending_clears_ = 0;
++      promote_deferrals_ = 0;
+       Commit();
+       return true;
+     }
+@@ -4424,6 +4436,7 @@
+   void
+   ClearRenderTargetView(D3D11RenderTargetView *pRenderTargetView, const FLOAT ColorRGBA[4]) {
+     InvalidateCurrentPass();
++    pending_clears_++;
+     auto clear_color = WMTClearColor{ColorRGBA[0], ColorRGBA[1], ColorRGBA[2], ColorRGBA[3]};
+     auto &props = pRenderTargetView->description();
+ 
+@@ -4438,6 +4451,7 @@
+     if (ClearFlags == 0)
+       return;
+     InvalidateCurrentPass();
++    pending_clears_++;
+     auto &props = pDepthStencilView->description();
+ 
+     EmitOP([texture = pDepthStencilView->texture(), view = pDepthStencilView->viewId(),
+@@ -4464,6 +4478,13 @@
+     if (cmdbuf_state == CommandBufferState::RenderEncoderActive)
+       return true;
+     InvalidateCurrentPass();
++    {
++      /* neutron: the attachments of this pass take up the clears recorded for them (approximate count) */
++      uint32_t attachments = state_.OutputMerger.DSV ? 1 : 0;
++      for (unsigned i = 0; i < state_.OutputMerger.NumRTVs; i++)
++        attachments += state_.OutputMerger.RTVs[i] ? 1 : 0;
++      pending_clears_ -= std::min(pending_clears_, attachments);
++    }
+ 
+     // set dirty state
+     state_.ShaderStages[PipelineStage::Vertex].ConstantBuffers.set_dirty();
+--- a/src/d3d11/d3d11_query.hpp
++++ b/src/d3d11/d3d11_query.hpp
+@@ -120,6 +120,8 @@
+ struct MTLD3D11EventQuery : public ID3D11Query1 {
+   virtual void Issue(uint64_t current_seq_id) = 0;
+   virtual EventState CheckEventState(uint64_t coherent_seq_id) = 0;
++  /* neutron: the event id that signals this query */
++  virtual uint64_t SignalSeqId() = 0;
+ };
+ 
+ template <typename DataType>
+@@ -134,6 +136,10 @@
+     state = QueryState::Issued;
+     should_be_signaled_at = current_seq_id;
+     stall_counter = 0;
++  }
++
++  uint64_t SignalSeqId() override {
++    return should_be_signaled_at;
+   }
+ 
+   EventState CheckEventState(uint64_t coherent_seq_id) override {
+--- a/src/dxmt/dxmt_command_queue.cpp
++++ b/src/dxmt/dxmt_command_queue.cpp
+@@ -96,6 +96,7 @@
+   auto &chunk = chunks[chunk_id % kCommandChunkCount];
+   chunk.chunk_id = chunk_id;
+   chunk.chunk_event_id = GetNextEventSeqId();
++  committed_event_seq_id = chunk.chunk_event_id; /* neutron */
+   chunk.frame_ = frame_count;
+   chunk.resource_initializer_event_id = initializer.flushToWait();
+   auto& statistics = CurrentFrameStatistics();
+--- a/src/dxmt/dxmt_command_queue.hpp
++++ b/src/dxmt/dxmt_command_queue.hpp
+@@ -198,6 +198,8 @@
+   ArgumentEncodingContext argument_encoding_ctx;
+   WMT::Reference<WMT::SharedEvent> event;
+   std::uint64_t current_event_seq_id = 0;
++  /* neutron: event id signaled by the last committed chunk, see CommittedEventSeqId() */
++  std::uint64_t committed_event_seq_id = 0;
+   FrameStatisticsContainer statistics;
+   ResourceInitializer initializer;
+   CounterPool counter_pool;
+@@ -230,6 +232,12 @@
+   uint64_t
+   GetCurrentEventSeqId() {
+     return current_event_seq_id;
++  };
++
++  /* neutron: an event at or below this id is in a committed command buffer, flushing does not bring it closer */
++  uint64_t
++  CommittedEventSeqId() {
++    return committed_event_seq_id;
+   };
+ 
+ 
