@@ -425,6 +425,17 @@ app-thread time per frame 45 to 80% lower, FPS 2 to 6 times, images identical.
 - Left: FEX's FPCR toggling on every x64 to ARM64EC call after float code (26.7 ns
   against 4.7 ns from integer code, 14-20% of the app thread); DXMT's encoder
   thread at about 120 ns per draw, half of it in the AGX driver.
+- FPCR, measured on M5 Max: reading costs 0.3 ns, writing the same value 2.7 ns,
+  writing a changed bit about 9 ns (any bit) and the write serializes. Under FEX
+  patch 0003 a call into ARM64EC code costs 4.3 ns after integer code and 25-27 ns
+  after any block that touched an xmm register. A prototype (not in the series,
+  needs game tests and a re-audit on every FEX update: it classifies FEX's IR ops)
+  sets the x86 float mode only for blocks that need it and checks small float
+  blocks for NaN instead: 25 ns to 5 ns per call, x86 NaN/denormal/DAZ/FTZ results
+  exact. It does not speed up `d3d11_headless` yet, because clang divides junk
+  vector lanes (0/0), so the NaN path runs every draw; fixing NaN lanes in software
+  instead of switching FPCR is the next step. `FEX_HOSTFEATURES=disableafp` makes
+  every call cheap but scalar float chains 85% slower and x86 NaN results wrong.
 - Measured and not worth changing: Wine's `arm64x_check_call` costs about 0.67 ns
   per indirect call in ARM64EC code (1.33 ns against 0.66 ns for plain ARM64),
   which is the call and return the compiler emits around the check, not the TEB
