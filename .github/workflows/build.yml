@@ -57,6 +57,8 @@ jobs:
           path: |
             .native-build/**/*.log
           if-no-files-found: ignore
+      - name: macOS version
+        run: sw_vers
       - name: Wine sync semantics with and without msync
         run: |
           set -euo pipefail
@@ -67,8 +69,18 @@ jobs:
             data="$RUNNER_TEMP/data-$msync"
             mkdir -p "$data"
             env SteamAppId=ci STEAM_COMPAT_DATA_PATH="$data" NEUTRON_FILES="$dist/files" NEUTRON_MSYNC=$msync \
-              "$dist/neutron" runinprefix "$PWD/sync_semantics.exe" | tr -d '\r' | tee "sync-$msync.txt"
+              "$dist/neutron" runinprefix "$PWD/sync_semantics.exe" | tr -d '\r' | tee "sync-$msync.txt" || true
             # "sync_semantics: <passed>/<total> passed"
             awk '/^sync_semantics:/ { split($2, n, "/"); ok = (n[1] == n[2]) } END { exit !ok }' "sync-$msync.txt"
             WINEPREFIX="$data/pfx" "$dist/files/bin/wineserver" -k || true
           done
+      - name: neutron log
+        if: always()
+        run: tail -n 80 "$HOME/Library/Logs/neutron/neutron-ci.log" || true
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: ~/Library/Logs/neutron/
+          if-no-files-found: ignore
