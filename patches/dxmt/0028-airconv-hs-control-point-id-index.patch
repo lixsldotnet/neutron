@@ -1,0 +1,151 @@
+airconv: hull shaders from vkd3d-shader (Wine's D3DCompile, used by games that compile HLSL at run
+time) index the input control points with vOutputControlPointID directly, not with a temp register.
+The relative index decoder only knew temps and crashed the converter (D3D11 and D3D12 tessellation).
+Pipeline compile errors that are not UnsupportedFeature keep their message.
+
+diff --git a/src/airconv/dxbc_converter.cpp b/src/airconv/dxbc_converter.cpp
+index 5b8cd99..ff71014 100644
+--- a/src/airconv/dxbc_converter.cpp
++++ b/src/airconv/dxbc_converter.cpp
+@@ -1392,9 +1392,11 @@ AIRCONV_API int SM50Compile(
+   if (auto err = dxmt::dxbc::convertDXBC(
+         pShader, FunctionName, context, *pModule, pArgs
+       )) {
+-    llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
+-      errorOut << u.msg;
+-    });
++    /* neutron: other LLVM errors keep their message too */
++    llvm::handleAllErrors(
++        std::move(err), [&](const UnsupportedFeature &u) { errorOut << u.msg; },
++        [&](const llvm::ErrorInfoBase &e) { errorOut << e.message(); }
++    );
+     *ppError = (sm50_error_t)errorObj;
+     return 1;
+   }
+@@ -1455,9 +1457,11 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
+         (dxbc::SM50ShaderInternal *)pVertexShader, (dxbc::SM50ShaderInternal *)pHullShader, 
+         FunctionName, context, *pModule, pHullShaderArgs
+       )) {
+-    llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
+-      errorOut << u.msg;
+-    });
++    /* neutron: other LLVM errors keep their message too */
++    llvm::handleAllErrors(
++        std::move(err), [&](const UnsupportedFeature &u) { errorOut << u.msg; },
++        [&](const llvm::ErrorInfoBase &e) { errorOut << e.message(); }
++    );
+     *ppError = (sm50_error_t)errorObj;
+     return 1;
+   }
+@@ -1520,9 +1524,11 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
+         (dxbc::SM50ShaderInternal *)pHullShader, context, *pModule,
+         pDomainShaderArgs
+       )) {
+-    llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
+-      errorOut << u.msg;
+-    });
++    /* neutron: other LLVM errors keep their message too */
++    llvm::handleAllErrors(
++        std::move(err), [&](const UnsupportedFeature &u) { errorOut << u.msg; },
++        [&](const llvm::ErrorInfoBase &e) { errorOut << e.message(); }
++    );
+     *ppError = (sm50_error_t)errorObj;
+     return 1;
+   }
+@@ -1584,9 +1590,11 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
+         (dxbc::SM50ShaderInternal *)pGeometryShader, context, *pModule,
+         pVertexShaderArgs
+       )) {
+-    llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
+-      errorOut << u.msg;
+-    });
++    /* neutron: other LLVM errors keep their message too */
++    llvm::handleAllErrors(
++        std::move(err), [&](const UnsupportedFeature &u) { errorOut << u.msg; },
++        [&](const llvm::ErrorInfoBase &e) { errorOut << e.message(); }
++    );
+     *ppError = (sm50_error_t)errorObj;
+     return 1;
+   }
+@@ -1648,9 +1656,11 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
+         (dxbc::SM50ShaderInternal *)pVertexShader, context, *pModule,
+         pGeometryShaderArgs
+       )) {
+-    llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
+-      errorOut << u.msg;
+-    });
++    /* neutron: other LLVM errors keep their message too */
++    llvm::handleAllErrors(
++        std::move(err), [&](const UnsupportedFeature &u) { errorOut << u.msg; },
++        [&](const llvm::ErrorInfoBase &e) { errorOut << e.message(); }
++    );
+     *ppError = (sm50_error_t)errorObj;
+     return 1;
+   }
+diff --git a/src/airconv/dxbc_instructions.cpp b/src/airconv/dxbc_instructions.cpp
+index e2b7f86..f2e04e8 100644
+--- a/src/airconv/dxbc_instructions.cpp
++++ b/src/airconv/dxbc_instructions.cpp
+@@ -48,6 +48,13 @@ auto readOperandRelativeIndex(
+     };
+   }
+ 
++  /* neutron: all three are the thread index within the patch */
++  case D3D11_SB_OPERAND_TYPE_OUTPUT_CONTROL_POINT_ID:
++  case D3D11_SB_OPERAND_TYPE_INPUT_FORK_INSTANCE_ID:
++  case D3D11_SB_OPERAND_TYPE_INPUT_JOIN_INSTANCE_ID: {
++    return IndexByControlPointId{.offset = offset};
++  }
++
+   default:
+     DXASSERT_DXBC(false);
+   };
+diff --git a/src/airconv/dxbc_instructions.hpp b/src/airconv/dxbc_instructions.hpp
+index f55c4c1..3699057 100644
+--- a/src/airconv/dxbc_instructions.hpp
++++ b/src/airconv/dxbc_instructions.hpp
+@@ -88,8 +88,14 @@ struct IndexByIndexableTempComponent {
+   uint32_t offset;
+ };
+ 
++/* neutron: hull shaders from vkd3d-shader (Wine's D3DCompile) index control points
++   with vOutputControlPointID itself instead of a temp register */
++struct IndexByControlPointId {
++  uint32_t offset;
++};
++
+ using OperandIndex =
+-  std::variant<uint32_t, IndexByIndexableTempComponent, IndexByTempComponent>;
++  std::variant<uint32_t, IndexByIndexableTempComponent, IndexByTempComponent, IndexByControlPointId>;
+ #pragma endregion
+ 
+ enum class OperandDataType {
+diff --git a/src/airconv/nt/dxbc_converter_base.cpp b/src/airconv/nt/dxbc_converter_base.cpp
+index 58a101c..452bee6 100644
+--- a/src/airconv/nt/dxbc_converter_base.cpp
++++ b/src/airconv/nt/dxbc_converter_base.cpp
+@@ -47,6 +47,12 @@ Converter::LoadOperandIndex(const IndexByTempComponent &SrcOpIndex) {
+   return ir.CreateAdd(Rel, ir.getInt32(SrcOpIndex.offset));
+ }
+ 
++/* neutron: relative index by vOutputControlPointID (or the fork/join instance id) */
++llvm::Value *
++Converter::LoadOperandIndex(const IndexByControlPointId &SrcOpIndex) {
++  return ir.CreateAdd(res.thread_id_in_patch, ir.getInt32(SrcOpIndex.offset));
++}
++
+ llvm::Value *
+ Converter::LoadOperandIndex(const IndexByIndexableTempComponent &SrcOpIndex) {
+   auto Comp = SrcOpIndex.component;
+diff --git a/src/airconv/nt/dxbc_converter_base.hpp b/src/airconv/nt/dxbc_converter_base.hpp
+index c600d3d..715ae0c 100644
+--- a/src/airconv/nt/dxbc_converter_base.hpp
++++ b/src/airconv/nt/dxbc_converter_base.hpp
+@@ -114,6 +114,7 @@ public:
+   }
+   llvm::Value *LoadOperandIndex(const IndexByIndexableTempComponent &SrcOpIndex);
+   llvm::Value *LoadOperandIndex(const IndexByTempComponent &SrcOpIndex);
++  llvm::Value *LoadOperandIndex(const IndexByControlPointId &SrcOpIndex);
+ 
+   llvm::Value *
+   LoadOperandIndex(const OperandIndex &SrcOpIndex) {
