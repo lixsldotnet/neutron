@@ -18,6 +18,7 @@ name the commit, `build.sh` in that commit pins the exact upstream versions and
 | mingw-w64 runtime (in the Windows DLLs) | ZPL-2.1 and public domain | https://www.mingw-w64.org |
 | GnuTLS, Nettle, GMP, libtasn1, libidn2, libunistring, p11-kit | LGPL | via Homebrew, see their projects |
 | FreeType | FreeType License (FTL) | https://freetype.org |
+| SDL3, sdl2-compat (game controllers) | Zlib | https://github.com/libsdl-org/SDL, https://github.com/libsdl-org/sdl2-compat |
 
 The full license texts of Wine, DXMT and neutron: `LICENSE` (LGPL-2.1). The
 other license texts are in the source of each project at the pinned version.
