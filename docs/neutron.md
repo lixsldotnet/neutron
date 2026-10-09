@@ -472,9 +472,13 @@ command buffer; the waste came from frames cut into several command buffers.
   G-buffer, SSAO, lighting, bloom, TAA) with timestamp queries and image hashes;
   `dev/bench/gpu-ab.sh` compares two runtimes. With queries in the frame 4 to 6%
   less GPU time, images bit-identical in 10 configurations.
-- Seen in upstream DXMT too: under heavy machine load 1 to 10% of runs give a
-  final image with a few pixels off by 1 LSB (HDR identical), likely a
-  read-before-write race on a post-process target between frames.
+- Image hashes of `gpu_headless` can differ by 1 LSB on a few pixels when another
+  process uses the GPU at the same time (10-20% of runs under GPU load, 0 under CPU
+  load). That is the Apple GPU, not DXMT: implicit-LOD sampling (`Sample`, and
+  `SampleGrad` with screen-space derivatives) in indexed draws now and then picks
+  another mip for a few 2x2 quads; `SampleLevel` is always identical, and a native
+  Metal program reproduces it without DXMT. Compare images on an otherwise idle
+  GPU.
 
 ## Patches
 
