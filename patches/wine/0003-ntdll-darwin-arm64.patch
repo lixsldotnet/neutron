@@ -2,7 +2,8 @@ ntdll on arm64 macOS: TEB and PEB without x18 (TSD slot, page after KUSER), JIT 
 (MAP_JIT), exec env strings, CPU feature registry values from sysctl, signal handling,
 and the free area search that skips host mappings in one step (no 64K mach_vm_map probing
 under the virtual lock), and with NEUTRON_SANDBOX=1 a sandboxed client refuses a wineserver
-that runs outside the sandbox (it opens files and sockets for its clients).
+that runs outside the sandbox (it opens files and sockets for its clients). Also the
+ntdll parts of msync (0015) in these files.
 --- a/include/winnt.h
 +++ b/include/winnt.h
 @@ -2575,6 +2575,10 @@
@@ -149,7 +150,19 @@ that runs outside the sandbox (it opens files and sockets for its clients).
           "bl \"#DbgBreakPoint\"\n"
 --- a/dlls/ntdll/unix/unix_private.h
 +++ b/dlls/ntdll/unix/unix_private.h
-@@ -132,6 +132,10 @@
+@@ -117,6 +117,11 @@
+     int          reply_fd;          /* fd for receiving server replies */
+     int          wait_fd[2];        /* fd for sleeping server requests */
+     int          alert_fd;          /* inproc sync fd for user apc alerts */
++    unsigned int msync_q;           /* neutron: msync wait block index */
++    volatile int msync_busy;        /* neutron: inside an msync lock section */
++    volatile int msync_pending;     /* neutron: deferred signals, 1 SIGUSR1, 2 SIGQUIT */
++    void        *msync_held;        /* neutron: inproc syncs referenced by the current wait */
++    unsigned int msync_nheld;
+     DWORD        tid;               /* thread id */
+     BOOL         allow_writes;      /* ThreadAllowWrites flags */
+     BOOL         suspend;           /* suspend on startup */
+@@ -132,6 +137,10 @@
  };
  
  extern pthread_key_t thread_data_key;
@@ -160,6 +173,18 @@ that runs outside the sandbox (it opens files and sockets for its clients).
  
  static inline struct thread_data *get_thread_data(void)
  {
+@@ -420,6 +429,11 @@
+ extern void dbg_init(void);
+ 
+ extern void close_inproc_sync( HANDLE handle );
++#ifdef __APPLE__
++extern void *msync_shm; /* neutron: msync shared memory */
++extern void msync_thread_exit( struct thread_data *data );
++extern void msync_init_client(void);
++#endif
+ 
+ extern NTSTATUS call_user_apc_dispatcher( CONTEXT *context_ptr, unsigned int flags, ULONG_PTR arg1, ULONG_PTR arg2,
+                                           ULONG_PTR arg3, PNTAPCFUNC func, NTSTATUS status );
 --- a/dlls/ntdll/unix/virtual.c
 +++ b/dlls/ntdll/unix/virtual.c
 @@ -169,6 +169,19 @@
@@ -256,10 +281,11 @@ that runs outside the sandbox (it opens files and sockets for its clients).
      }
  
      return NULL;
-@@ -1974,12 +2028,46 @@
+@@ -1973,10 +2027,44 @@
+         if (!mprotect( base, size, unix_prot | PROT_EXEC )) return 0;
          /* exec + write may legitimately fail, in that case fall back to write only */
          if (!(unix_prot & PROT_WRITE)) return -1;
-     }
++    }
 +#if defined(__APPLE__) && defined(__aarch64__)
 +    /* neutron: Apple Silicon refuses write+exec without MAP_JIT, fall back to write only.
 +     * x86 code under FEX is translated, never executed natively, so games are not affected. */
@@ -267,15 +293,15 @@ that runs outside the sandbox (it opens files and sockets for its clients).
 +    {
 +        if (!mprotect( base, size, unix_prot )) return 0;
 +        return mprotect( base, size, unix_prot & ~PROT_EXEC );
-+    }
+     }
 +#endif
  
      return mprotect( base, size, unix_prot );
  }
- 
- 
++
++
 +#if defined(__APPLE__) && defined(__aarch64__)
- /***********************************************************************
++/***********************************************************************
 + *           remap_view_jit
 + *
 + * neutron: Apple Silicon only allows write+exec on MAP_JIT memory, and MAP_JIT
@@ -297,12 +323,9 @@ that runs outside the sandbox (it opens files and sockets for its clients).
 +    return FALSE;
 +}
 +#endif
-+
-+
-+/***********************************************************************
-  *           mprotect_range
-  *
-  * Call mprotect on a page range, applying the protections from the per-page byte.
+ 
+ 
+ /***********************************************************************
 @@ -3682,6 +3770,10 @@
      pthread_mutexattr_t attr;
  
@@ -314,10 +337,23 @@ that runs outside the sandbox (it opens files and sockets for its clients).
      pthread_mutexattr_init( &attr );
      pthread_mutexattr_settype( &attr, PTHREAD_MUTEX_RECURSIVE );
      pthread_mutex_init( &virtual_mutex, &attr );
-@@ -4123,6 +4215,18 @@
-         exit(1);
-     }
- 
+@@ -4061,6 +4153,9 @@
+     data->wait_fd[0] = -1;
+     data->wait_fd[1] = -1;
+     data->alert_fd   = -1;
++    data->msync_q    = 0;  /* neutron: msync */
++    data->msync_busy = data->msync_pending = 0;
++    data->msync_nheld = 0;
+ #ifdef VALGRIND_STACK_REGISTER
+     VALGRIND_STACK_REGISTER( (char *)data + signal_stack_mask + 1, (char *)data + kernel_stack_size );
+ #endif
+@@ -4120,8 +4215,20 @@
+     if (status)
+     {
+         ERR( "wine: failed to map the shared user data: %08x\n", status );
++        exit(1);
++    }
++
 +#ifdef WINE_TEB_IN_TSD
 +    /* page PE code reads the TEB TSD offset from (see NtCurrentTeb in winnt.h) */
 +    status = map_view( &view, (char *)WINE_USER_SHARED_DATA_VA + 0x10000, page_size, 0,
@@ -325,15 +361,14 @@ that runs outside the sandbox (it opens files and sockets for its clients).
 +    if (status)
 +    {
 +        ERR( "wine: failed to map the TEB offset page: %08x\n", status );
-+        exit(1);
-+    }
+         exit(1);
+     }
 +    *(volatile unsigned long long *)view->base = __wine_teb_tsd_offset;
 +#endif
-+
+ 
      status = map_view( &view, NULL, signal_stack_mask + 1 + kernel_stack_size, MEM_TOP_DOWN,
                         VPROT_READ | VPROT_WRITE | VPROT_COMMITTED, 4 * limit_4g, 0, 0 );
-     assert( !status );
-@@ -4172,6 +4276,11 @@
+@@ -4172,6 +4279,11 @@
  
      if (arm64ec_view) peb->EcCodeBitMap = arm64ec_view->base;
      init_teb( data, ptr );
@@ -345,7 +380,7 @@ that runs outside the sandbox (it opens files and sockets for its clients).
      VIRTUAL_DEBUG_DUMP_VIEW( view );
  }
  
-@@ -5230,6 +5339,12 @@
+@@ -5230,6 +5342,12 @@
              if (status == STATUS_SUCCESS)
              {
                  base = view->base;
@@ -360,22 +395,34 @@ that runs outside the sandbox (it opens files and sockets for its clients).
          }
 --- a/dlls/ntdll/unix/server.c
 +++ b/dlls/ntdll/unix/server.c
-@@ -1394,6 +1394,27 @@
+@@ -77,6 +77,9 @@
+ #include "winioctl.h"
+ #include "wine/server.h"
+ #include "wine/debug.h"
++#ifdef __APPLE__
++#include "wine/msync.h"  /* neutron: msync */
++#endif
+ #include "unix_private.h"
+ #include "ddk/wdm.h"
+ 
+@@ -1392,8 +1395,29 @@
+           "   You should make sure no wine server is running, remove that file and try again.\n",
+                  serverdir );
  }
- 
- 
++
++
 +#ifdef __APPLE__
 +/* neutron: tool/neutron runs a game's Wine processes in a macOS sandbox
 + * (NEUTRON_SANDBOX=1). The wineserver opens files and sockets for its clients, so a
 + * sandboxed client must not use a server that runs outside a sandbox (started by a
 + * Wine call without the setting): it would open everything the sandbox denies. */
 +int sandbox_check( pid_t pid, const char *operation, int type, ... );
-+
+ 
 +static void check_server_sandbox( int s )
 +{
 +    pid_t pid = 0;
 +    socklen_t len = sizeof(pid);
-+
+ 
 +    if (sandbox_check( getpid(), NULL, 0 ) <= 0) return;  /* we are not sandboxed */
 +    if (getsockopt( s, SOL_LOCAL, LOCAL_PEERPID, &pid, &len ) == -1 || pid <= 0)
 +        fatal_perror( "wineserver pid" );
@@ -388,7 +435,7 @@ that runs outside the sandbox (it opens files and sockets for its clients).
  /***********************************************************************
   *           server_connect
   *
-@@ -1459,6 +1480,9 @@
+@@ -1459,6 +1483,9 @@
  #endif
          if (connect( s, (struct sockaddr *)&addr, slen ) != -1)
          {
@@ -398,7 +445,21 @@ that runs outside the sandbox (it opens files and sockets for its clients).
              fchdir( initial_cwd );  /* switch back to the starting directory */
              fcntl( s, F_SETFD, FD_CLOEXEC );
              return s;
-@@ -1784,6 +1808,9 @@
+@@ -1698,6 +1725,13 @@
+             {
+                 inproc_device_fd = wine_server_receive_fd( &handle );
+                 assert( handle == reply->inproc_device );
++#ifdef __APPLE__
++                /* neutron: msync, the inproc device is the shared object memory */
++                msync_shm = mmap( NULL, MSYNC_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, inproc_device_fd, 0 );
++                if (msync_shm == MAP_FAILED || ((struct msync_header *)msync_shm)->magic != MSYNC_MAGIC)
++                    fatal_error( "cannot map the msync shared memory\n" );
++                msync_init_client();
++#endif
+             }
+         }
+     }
+@@ -1784,6 +1818,9 @@
  
      data->pthread_id = pthread_self();
      pthread_setspecific( thread_data_key, data );
@@ -410,11 +471,10 @@ that runs outside the sandbox (it opens files and sockets for its clients).
      SERVER_START_REQ( init_thread )
 --- a/dlls/ntdll/unix/signal_arm64.c
 +++ b/dlls/ntdll/unix/signal_arm64.c
-@@ -60,6 +60,20 @@
- #include "wine/debug.h"
+@@ -61,6 +61,20 @@
  
  WINE_DEFAULT_DEBUG_CHANNEL(seh);
-+
+ 
 +#ifdef WINE_TEB_IN_TSD
 +/* neutron: macOS clears x18 at any time (syscalls, preemption), so the dispatchers
 + * load the TEB from its TSD slot: TPIDRRO_EL0 (CPU number in the low 3 bits) plus
@@ -428,9 +488,10 @@ that runs outside the sandbox (it opens files and sockets for its clients).
 +#else
 +#define LOAD_TEB(reg, tmp) "mov " reg ", x18\n\t"
 +#endif
- 
++
  #define NTDLL_DWARF_H_NO_UNWINDER
  #include "dwarf.h"
+ 
 @@ -776,6 +790,7 @@
      struct exc_stack_layout *stack;
      void *stack_ptr = (void *)(SP_sig(sigcontext) & ~15);
@@ -558,7 +619,30 @@ that runs outside the sandbox (it opens files and sockets for its clients).
      switch (ESR_ELx_EC(esr))
      {
      case ESR_ELx_EC_IABT_LOW:
-@@ -1721,8 +1814,9 @@
+@@ -1378,6 +1471,10 @@
+     ucontext_t *sigcontext = _sigcontext;
+     struct thread_data *data = get_thread_data();
+ 
++#ifdef __APPLE__
++    /* neutron: never terminate a thread inside an msync lock section, raised again after it */
++    if (data->msync_busy) { data->msync_pending |= 2; return; }
++#endif
+     if (is_inside_syscall( data, SP_sig(sigcontext) )) abort_thread(0);
+     user_mode_abort_thread( 0, get_syscall_frame( data ));
+ }
+@@ -1425,6 +1522,11 @@
+     extern const ULONG_PTR __wine_unix_call_dispatcher_kernel_stack_ptr;
+     extern const ULONG_PTR __wine_unix_call_dispatcher_user_stack;
+     extern const ULONG_PTR call_user_mode_callback_user_stack_ptr;
++
++#ifdef __APPLE__
++    /* neutron: never suspend a thread inside an msync lock section, raised again after it */
++    if (data->msync_busy) { data->msync_pending |= 1; return; }
++#endif
+ 
+     /* if we're in a syscall dispatcher, but not yet on the syscall stack, construct
+      * the frame now from the signal context. */
+@@ -1721,8 +1823,9 @@
   */
  __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                     "hint 34\n\t" /* bti c */
@@ -570,7 +654,7 @@ that runs outside the sandbox (it opens files and sockets for its clients).
                     "stp x20, x21, [x10, #0xa0]\n\t"
                     "stp x22, x23, [x10, #0xb0]\n\t"
                     "stp x24, x25, [x10, #0xc0]\n\t"
-@@ -1774,7 +1868,8 @@
+@@ -1774,7 +1877,8 @@
                     __ASM_CFI_CFA_IS_AT2(x22, 0x98, 0x02) /* frame->syscall_cfa */
                     "and x20, x8, #0xfff\n\t"    /* syscall number */
                     "ubfx x21, x8, #12, #2\n\t"  /* syscall table number */
@@ -580,7 +664,7 @@ that runs outside the sandbox (it opens files and sockets for its clients).
                     "add x21, x16, x21, lsl #5\n\t"
                     "ldr x16, [x21, #16]\n\t"    /* table->ServiceLimit */
                     "cmp x20, x16\n\t"
-@@ -1792,7 +1887,8 @@
+@@ -1792,7 +1896,8 @@
                     "cbnz x9, 1b\n"
                     "2:\tldr x16, [x21]\n\t"     /* table->ServiceTable */
                     "ldr x23, [x16, x20, lsl 3]\n\t"
@@ -590,7 +674,7 @@ that runs outside the sandbox (it opens files and sockets for its clients).
                     "cbnz x11, " __ASM_LOCAL_LABEL("trace_syscall") "\n\t"
                     "blr x23\n\t"
                     "mov sp, x22\n"
-@@ -1882,7 +1978,8 @@
+@@ -1882,7 +1987,8 @@
                     "b " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") )
  
  __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_return,
@@ -600,7 +684,7 @@ that runs outside the sandbox (it opens files and sockets for its clients).
                     "cbnz x11, " __ASM_LOCAL_LABEL("trace_syscall_ret") "\n\t"
                     "b " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") )
  
-@@ -1892,8 +1989,9 @@
+@@ -1892,8 +1998,9 @@
   */
  __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                     "hint 34\n\t" /* bti c */

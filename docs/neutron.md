@@ -333,6 +333,38 @@ log, `NEUTRON_HUD=2` shows the Metal HUD with DXMT's per-frame statistics.
 - **HUD cost.** `NEUTRON_HUD=2` loads libMetalMetricsInterpose and costs about
   11% game CPU per frame in the Gamble menu. Benchmarks run without it.
 
+## msync
+
+Every Windows sync call (SetEvent, WaitForSingleObject, ReleaseSemaphore) was a
+round trip to wineserver: 16.6 us for an event ping-pong between two threads,
+6.7 us for a wait on a signaled event, 5.7 us for SetEvent (M5 Max). Unreal's
+render thread spends its time there. Wine 11 routes every waitable object through
+its `inproc_sync` layer (ntsync on Linux); patch 0015 adds a macOS backend for it,
+a user-space copy of the ntsync driver:
+
+- wineserver creates a 64 MB `shm_open` region (pages are only backed when
+  touched) and sends its fd as the inproc device. Objects are 64-byte slots, the
+  slot index replaces the ntsync object fd in the `get_inproc_sync_fd` and
+  `get_inproc_alert_fd` replies.
+- Each thread has a wait block; a wait links one entry per object into the
+  object's waiter list, a signaler satisfies waiters under the object lock and
+  wakes them with `os_sync_wake_by_address_any` after unlocking, waiters spin
+  2 us (`NEUTRON_MSYNC_SPIN`) before `os_sync_wait_on_address`. Wait-all takes
+  one global lock like ntsync.
+- wineserver still owns lifetime, names, handles and access checks, signals the
+  internal syncs (process and thread exit, APC alert) and abandons mutexes through
+  the same code. Lock sections are protected against Wine's suspend and terminate
+  signals by a per-thread busy flag (the handlers re-raise when the section ends).
+- Measured (median of 5): event and semaphore ping-pong 0.55 us (was 18 us), wait
+  on a signaled event 27 ns (7.7 us), SetEvent 24 ns (6.9 us). `tests/sync_semantics.c`
+  (56 checks: wait any/all, alertable waits and APCs, abandoned mutexes, PulseEvent,
+  SignalObjectAndWait, cross-process and named objects, killed waiters, stress)
+  passes with and without msync.
+- Limits: a process killed with SIGKILL inside a lock section blocks the users of
+  that object; slots of objects still open at process exit stay until wineserver
+  ends; 512K objects, 32K threads. Off unless `NEUTRON_MSYNC=1` until tested with
+  more games.
+
 ## Patches
 
 All third-party code is fetched at build time at a pinned version and patched

@@ -26,6 +26,10 @@
 #   NEUTRON_RAW_MOUSE=0         raw input (mouse look) from the accelerated macOS
 #                               cursor deltas instead of the GCMouse device deltas
 #   NEUTRON_PRECISE_TIMERS=0    Sleep() through select() again instead of a kqueue timer
+#   NEUTRON_MSYNC=1             events, semaphores and mutexes in the game process (shared
+#                               memory) instead of a wineserver round trip; off by default
+#                               until tested with more games. NEUTRON_MSYNC_SPIN=<ns> sets
+#                               the spin before a wait sleeps (default 2000)
 #   NEUTRON_APP_NAME=<name>     name in the menu bar and Dock (default from Steam's
 #                               app manifest)
 #   NEUTRON_LOG=1               Wine debug output in the log (WINEDEBUG overrides it)
@@ -116,6 +120,8 @@ tso_var="APP_TSO_$APP_ID"
 NEUTRON_FEX_TSO="${NEUTRON_FEX_TSO:-${!tso_var:-fast}}"
 # Borderless fullscreen games go into macOS native fullscreen (direct scanout, Game Mode).
 export NEUTRON_NATIVE_FULLSCREEN="${NEUTRON_NATIVE_FULLSCREEN:-1}"
+# msync (Wine patch 0015) is decided when wineserver starts, which inherits this.
+export NEUTRON_MSYNC="${NEUTRON_MSYNC:-0}"
 # Wine dlopens FreeType and GnuTLS by soname: bundled copies first, then Homebrew.
 export DYLD_FALLBACK_LIBRARY_PATH="$FILES/lib:/opt/homebrew/lib:/usr/local/lib:/usr/lib"
 # Light upscaling: Wine reports the display at this scale, MetalFX brings it back.

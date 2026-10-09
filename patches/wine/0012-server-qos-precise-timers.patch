@@ -1,5 +1,6 @@
 wineserver at the top QoS class and latency tier 0, per-thread kqueue timers for
-precise sleeps (NEUTRON_PRECISE_TIMERS=0 disables).
+precise sleeps (NEUTRON_PRECISE_TIMERS=0 disables). Also the msync parts (0015) of
+server/thread.c and dlls/ntdll/unix/sync.c.
 --- a/server/main.c
 +++ b/server/main.c
 @@ -35,6 +35,11 @@
@@ -36,9 +37,361 @@ precise sleeps (NEUTRON_PRECISE_TIMERS=0 disables).
          break;
      case THREAD_PRIORITY_HIGHEST: /* THREAD_QOS_USER_INTERACTIVE */
          throughput_qos = THROUGHPUT_QOS_TIER_0;
+@@ -2383,6 +2383,12 @@
+     else
+     {
+         reply->handle = get_thread_id( current ) | 1; /* arbitrary token */
++#ifdef __APPLE__
++        /* neutron: msync, the alert event goes by index */
++        reply->index = fd;
++        inproc_sync_ref( fd );
++#else
+         send_client_fd( current->process, fd, reply->handle );
++#endif
+     }
+ }
 --- a/dlls/ntdll/unix/sync.c
 +++ b/dlls/ntdll/unix/sync.c
-@@ -2416,6 +2416,31 @@
+@@ -447,8 +447,231 @@
+     if (errno == EOWNERDEAD) return STATUS_ABANDONED + (type != WaitAll ? args.index : 0);
+     if (errno == ETIMEDOUT) return STATUS_TIMEOUT;
+     return errno_to_status( errno );
++}
++
++#elif defined(__APPLE__)
++
++/* neutron: msync, the ntsync object model on shared memory (include/wine/msync.h).
++ * "fd" values are msync object indices, the inproc device fd is the shared memory. */
++
++#include "wine/msync.h"
++
++void *msync_shm;
++static uint64_t msync_spin;
++
++/* No pthread_sigmask (two syscalls per operation): while msync_busy is set, the
++ * SIGUSR1 (suspend) and SIGQUIT (terminate) handlers only note the signal, and it
++ * is raised again here when the lock section ends. */
++static void msync_block( void *unused )
++{
++    struct thread_data *data = get_thread_data();
++    data->msync_busy = 1;
++    __asm__ __volatile__( "" ::: "memory" );
++}
++
++static void msync_unblock( void *unused )
++{
++    struct thread_data *data = get_thread_data();
++    int pending;
++
++    __asm__ __volatile__( "" ::: "memory" );
++    data->msync_busy = 0;
++    __asm__ __volatile__( "" ::: "memory" );
++    if ((pending = data->msync_pending))
++    {
++        data->msync_pending = 0;
++        if (pending & 2) pthread_kill( pthread_self(), SIGQUIT );
++        if (pending & 1) pthread_kill( pthread_self(), SIGUSR1 );
++    }
++}
++
++void msync_init_client(void)
++{
++    const char *env = getenv( "NEUTRON_MSYNC_SPIN" );
++    long ns = env ? atol( env ) : 2000;  /* default: poll 2 us before sleeping */
++    if (ns > 0) msync_spin = msync_ns_to_abs( ns );
++}
++
++static NTSTATUS linux_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count )
++{
++    uint32_t c = count;
++    int ret;
++
++    msync_block( NULL );
++    ret = msync_sem_release( msync_shm, obj, &c );
++    msync_unblock( NULL );
++    if (ret == -EOVERFLOW) return STATUS_SEMAPHORE_LIMIT_EXCEEDED;
++    if (prev_count) *prev_count = c;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS linux_query_semaphore_obj( int obj, SEMAPHORE_BASIC_INFORMATION *info )
++{
++    uint32_t count, max;
++
++    msync_block( NULL );
++    msync_sem_read( msync_shm, obj, &count, &max );
++    msync_unblock( NULL );
++    info->CurrentCount = count;
++    info->MaximumCount = max;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS msync_event( int obj, int op, LONG *prev_state )
++{
++    uint32_t prev;
++
++    msync_block( NULL );
++    msync_event_op( msync_shm, obj, op, &prev );
++    msync_unblock( NULL );
++    if (prev_state) *prev_state = prev;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS linux_set_event_obj( int obj, LONG *prev_state )
++{
++    return msync_event( obj, 1, prev_state );
++}
++
++static NTSTATUS linux_reset_event_obj( int obj, LONG *prev_state )
++{
++    return msync_event( obj, 0, prev_state );
++}
++
++static NTSTATUS linux_pulse_event_obj( int obj, LONG *prev_state )
++{
++    return msync_event( obj, 2, prev_state );
++}
++
++static NTSTATUS linux_query_event_obj( int obj, EVENT_BASIC_INFORMATION *info )
++{
++    uint32_t signaled, manual;
++
++    msync_block( NULL );
++    msync_event_read( msync_shm, obj, &signaled, &manual );
++    msync_unblock( NULL );
++    info->EventType = manual ? NotificationEvent : SynchronizationEvent;
++    info->EventState = signaled;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS linux_release_mutex_obj( int obj, LONG *prev_count )
++{
++    uint32_t count;
++    int ret;
++
++    msync_block( NULL );
++    ret = msync_mutex_unlock( msync_shm, obj, GetCurrentThreadId(), &count );
++    msync_unblock( NULL );
++    if (ret == -EPERM) return STATUS_MUTANT_NOT_OWNED;
++    if (prev_count) *prev_count = 1 - count;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS linux_query_mutex_obj( int obj, MUTANT_BASIC_INFORMATION *info )
++{
++    uint32_t count, owner;
++    int ret;
++
++    msync_block( NULL );
++    ret = msync_mutex_read( msync_shm, obj, &count, &owner );
++    msync_unblock( NULL );
++    if (ret == -EOWNERDEAD)
++    {
++        info->AbandonedState = TRUE;
++        info->OwnedByCaller = FALSE;
++        info->CurrentCount = 1;
++        return STATUS_SUCCESS;
++    }
++    info->AbandonedState = FALSE;
++    info->OwnedByCaller = (owner == GetCurrentThreadId());
++    info->CurrentCount = 1 - count;
++    return STATUS_SUCCESS;
++}
++
++static uint32_t msync_get_q(void)
++{
++    struct thread_data *data = get_thread_data();
++
++    if (!data->msync_q)
++    {
++        msync_block( NULL );
++        data->msync_q = msync_alloc_q( msync_shm, GetCurrentProcessId(), GetCurrentThreadId() );
++        msync_unblock( NULL );
++        if (!data->msync_q) ERR( "out of msync wait blocks\n" );
++    }
++    return data->msync_q;
++}
++
++static void msync_release_held( struct thread_data *data );
++
++/* called on thread exit: unlink a wait interrupted by thread termination, free the wait block */
++void msync_thread_exit( struct thread_data *data )
++{
++    if (!msync_shm) return;
++    msync_block( NULL );
++    if (data->msync_q)
++    {
++        msync_unregister( msync_shm, data->msync_q );
++        msync_free_q( msync_shm, data->msync_q, GetCurrentProcessId(), GetCurrentThreadId() );
++        data->msync_q = 0;
++    }
++    if (data->alert_fd > 0) msync_unref_obj( msync_shm, data->alert_fd );
++    data->alert_fd = -1;
++    /* references a wait held when the thread was terminated inside it; otherwise their
++     * cache entries stay busy and reused handle values are never cached again */
++    msync_release_held( data );
++    msync_unblock( NULL );
+ }
+ 
++static NTSTATUS linux_wait_objs( int device, DWORD count, const int *objs, WAIT_TYPE type,
++                                 int alert_fd, const LARGE_INTEGER *timeout )
++{
++    uint32_t idx[64], index = 0, qi;
++    uint64_t deadline = 0;
++    DWORD i;
++    int ret;
++
++    if (!(qi = msync_get_q())) return STATUS_NOT_IMPLEMENTED;
++    for (i = 0; i < count; i++) idx[i] = objs[i];
++
++    if (timeout && timeout->QuadPart != TIMEOUT_INFINITE)
++    {
++        LONGLONG rel;
++        if (timeout->QuadPart <= 0) rel = -timeout->QuadPart;
++        else
++        {
++            struct timespec now;
++            clock_gettime( CLOCK_REALTIME, &now );
++            rel = timeout->QuadPart - ((now.tv_sec + SECS_1601_TO_1970) * (LONGLONG)TICKSPERSEC + now.tv_nsec / 100);
++            if (rel < 0) rel = 0;
++        }
++        /* zero: a deadline in the past, no kernel timer; about 3 years and more: infinite */
++        if (!rel) deadline = 1;
++        else if (rel < (LONGLONG)1000000000000000LL) deadline = mach_absolute_time() + msync_ns_to_abs( rel * 100 ) + 1;
++    }
++
++    ret = msync_wait( msync_shm, qi, GetCurrentThreadId(), count, idx, type == WaitAll,
++                      alert_fd > 0 ? alert_fd : 0, deadline, msync_spin, &index, msync_block, msync_unblock, NULL );
++
++    if (!ret)
++    {
++        if (index == count)
++        {
++            static const LARGE_INTEGER zero;
++
++            ret = server_wait( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, &zero );
++            assert( ret == STATUS_USER_APC );
++            return ret;
++        }
++        return type != WaitAll ? index : 0;
++    }
++    if (ret == -EOWNERDEAD) return STATUS_ABANDONED + (type != WaitAll ? index : 0);
++    if (ret == -ETIMEDOUT) return STATUS_TIMEOUT;
++    if (ret == -EINVAL) return STATUS_INVALID_PARAMETER;
++    return errno_to_status( -ret );
++}
++
+ #else /* NTSYNC_IOC_EVENT_READ */
+ 
+ static NTSTATUS linux_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count )
+@@ -634,7 +857,11 @@
+     LONG ref = InterlockedDecrement( &sync->refcount );
+ 
+     assert( ref >= 0 );
++#if !defined(NTSYNC_IOC_EVENT_READ) && defined(__APPLE__)
++    if (!ref) msync_unref_obj( msync_shm, fd );  /* neutron: msync object reference */
++#else
+     if (!ref) close( fd );
++#endif
+ }
+ 
+ static struct inproc_sync *get_cached_inproc_sync( HANDLE handle )
+@@ -663,6 +890,17 @@
+     return cache;
+ }
+ 
++#if !defined(NTSYNC_IOC_EVENT_READ) && defined(__APPLE__)
++static void msync_release_held( struct thread_data *data )
++{
++    struct inproc_sync **held = data->msync_held;
++    unsigned int n = data->msync_nheld;
++
++    data->msync_nheld = 0;
++    while (n--) release_inproc_sync( held[n] );
++}
++#endif
++
+ /* fd_cache_mutex must be held to avoid races with other thread receiving fds */
+ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync )
+ {
+@@ -673,10 +911,16 @@
+         req->handle = wine_server_obj_handle( handle );
+         if (!(ret = wine_server_call( req )))
+         {
+-            obj_handle_t fd_handle;
+             sync->refcount = 1;
+-            sync->fd = wine_server_receive_fd( &fd_handle );
+-            assert( wine_server_ptr_handle(fd_handle) == handle );
++#if !defined(NTSYNC_IOC_EVENT_READ) && defined(__APPLE__)
++            sync->fd = reply->index;  /* neutron: msync object index */
++#else
++            {
++                obj_handle_t fd_handle;
++                sync->fd = wine_server_receive_fd( &fd_handle );
++                assert( wine_server_ptr_handle(fd_handle) == handle );
++            }
++#endif
+             sync->access = reply->access;
+             sync->type = reply->type;
+             sync->closed = 0;
+@@ -884,8 +1128,13 @@
+         {
+             if (!server_call_unlocked( req ))
+             {
++#if !defined(NTSYNC_IOC_EVENT_READ) && defined(__APPLE__)
++                data->alert_fd = fd = reply->index;  /* neutron: msync object index */
++                (void)token;
++#else
+                 data->alert_fd = fd = wine_server_receive_fd( &token );
+                 assert( token == reply->handle );
++#endif
+             }
+         }
+         SERVER_END_REQ;
+@@ -918,7 +1167,15 @@
+     }
+ 
+     if (alertable) alert_fd = get_inproc_alert_fd();
++#if !defined(NTSYNC_IOC_EVENT_READ) && defined(__APPLE__)
++    /* neutron: a thread terminated inside the wait releases these in msync_thread_exit */
++    get_thread_data()->msync_held = syncs;
++    get_thread_data()->msync_nheld = count;
++#endif
+     ret = linux_wait_objs( inproc_device_fd, count, objs, type, alert_fd, timeout );
++#if !defined(NTSYNC_IOC_EVENT_READ) && defined(__APPLE__)
++    get_thread_data()->msync_nheld = 0;
++#endif
+ 
+     while (count--) release_inproc_sync( syncs[count] );
+     return ret;
+@@ -929,6 +1186,9 @@
+ {
+     struct inproc_sync stack_signal, stack_wait, *signal_sync = &stack_signal, *wait_sync = &stack_wait;
+     int alert_fd = 0;
++#if !defined(NTSYNC_IOC_EVENT_READ) && defined(__APPLE__)
++    struct inproc_sync *held[2];  /* neutron: msync */
++#endif
+     NTSTATUS ret;
+ 
+     if (inproc_device_fd < 0) return STATUS_NOT_IMPLEMENTED;
+@@ -949,7 +1209,16 @@
+     if (!ret)
+     {
+         if (alertable) alert_fd = get_inproc_alert_fd();
++#if !defined(NTSYNC_IOC_EVENT_READ) && defined(__APPLE__)
++        held[0] = signal_sync;
++        held[1] = wait_sync;
++        get_thread_data()->msync_held = held;  /* neutron: see inproc_wait */
++        get_thread_data()->msync_nheld = 2;
++#endif
+         ret = linux_wait_objs( inproc_device_fd, 1, &wait_sync->fd, WaitAny, alert_fd, timeout );
++#if !defined(NTSYNC_IOC_EVENT_READ) && defined(__APPLE__)
++        get_thread_data()->msync_nheld = 0;
++#endif
+     }
+ 
+     release_inproc_sync( wait_sync );
+@@ -2416,6 +2685,31 @@
  }
  
  
@@ -70,7 +423,7 @@ precise sleeps (NEUTRON_PRECISE_TIMERS=0 disables).
  /******************************************************************
   *		NtDelayExecution (NTDLL.@)
   */
-@@ -2459,6 +2484,28 @@
+@@ -2459,6 +2753,28 @@
              NtQuerySystemTime( &now );
              diff = (when - now.QuadPart + 9) / 10;
              if (diff <= 0) break;

@@ -1,0 +1,1129 @@
+msync: in-process NT synchronization for macOS, the ntsync object model on shared memory
+behind Wine 11's inproc_sync layer. Events, semaphores, mutexes and the internal syncs
+(process, thread, APC alert) live in a wineserver-owned shm region; waits and signals run
+in the client with os_sync_wait_on_address. Off unless NEUTRON_MSYNC=1 (tool default);
+NEUTRON_MSYNC_SPIN=<ns> sets the spin before sleeping (default 2000). The ntdll parts in
+server.c, signal_arm64.c, unix_private.h, virtual.c are in 0003, server/thread.c and
+dlls/ntdll/unix/sync.c in 0012.
+--- a/include/wine/msync.h
++++ b/include/wine/msync.h
+@@ -0,0 +1,760 @@
++/*
++ * neutron: msync, in-process NT synchronization objects for macOS
++ *
++ * The same object model and wait algorithm as the Linux ntsync driver
++ * (drivers/misc/ntsync.c), done in user space: the wineserver creates a shared
++ * memory region and sends its fd to every client process as the "inproc device".
++ * Objects (semaphores, mutexes, events) are 64-byte slots in it, identified by
++ * their index, which replaces the ntsync object fd. Every thread has a wait block
++ * (struct msync_q) in the region; a wait links one entry per object into the
++ * object's waiter list, and whoever changes an object's state satisfies waiters
++ * under the object lock and wakes them with os_sync_wake_by_address (ulock, works
++ * across processes for MAP_SHARED memory). Wait-all takes one global lock, like
++ * ntsync's wait_all_lock.
++ *
++ * Callers in client processes must keep suspension and thread termination away
++ * from every call that takes a lock (a suspended thread must never hold one);
++ * msync_wait() releases that around the sleep itself through the callbacks.
++ *
++ * This header is used by the wineserver and by ntdll.
++ */
++
++#ifndef __WINE_WINE_MSYNC_H
++#define __WINE_WINE_MSYNC_H
++
++#ifdef __APPLE__
++
++#include <stdint.h>
++#include <errno.h>
++#include <string.h>
++#include <mach/mach_time.h>
++#include <os/os_sync_wait_on_address.h>
++#include <os/clock.h>
++
++#define MSYNC_MAGIC      0x6e73796d   /* "msyn" */
++#define MSYNC_VERSION    1
++#define MSYNC_MAX_OBJS   (1u << 19)   /* 512K objects of 64 bytes: 32 MB */
++#define MSYNC_MAX_QS     (1u << 15)   /* 32K wait blocks of 1 KB: 32 MB */
++#define MSYNC_MAX_WAIT   65           /* 64 objects plus the alert event */
++#define MSYNC_SIZE       ((size_t)MSYNC_MAX_OBJS * 64 + (size_t)MSYNC_MAX_QS * 1024)
++#define MSYNC_NONE       0xffffffffu  /* q->signaled while waiting */
++#define MSYNC_DEAD_PID   0xffffffffu  /* q->pid after the owner process died */
++
++enum msync_type { MSYNC_FREE = 0, MSYNC_SEM = 1, MSYNC_MUTEX = 2, MSYNC_EVENT = 3 };
++
++struct msync_obj   /* 64 bytes, slot 0 is the header */
++{
++    uint32_t lock;
++    uint32_t type;
++    uint32_t refcount;
++    uint32_t all_hint;   /* number of wait-all waiters, changed under wait_all_lock + lock */
++    uint32_t any_head;   /* entry refs of the waiter lists, 0 = empty */
++    uint32_t all_head;
++    uint32_t next_free;
++    uint32_t count;      /* sem: count, mutex: recursion count, event: signaled */
++    uint32_t max;        /* sem: maximum, mutex: owner tid, event: manual reset */
++    uint32_t ownerdead;  /* mutex: abandoned */
++    uint32_t pad[6];
++};
++
++struct msync_header   /* overlays object slot 0 */
++{
++    uint32_t magic;
++    uint32_t version;
++    uint32_t alloc_lock;
++    uint32_t wait_all_lock;
++    uint32_t obj_bump;
++    uint32_t obj_free;
++    uint32_t q_bump;
++    uint32_t q_free;
++    uint32_t pad[8];
++};
++
++struct msync_entry { uint32_t obj, next, prev; };
++
++struct msync_q   /* 1 KB wait block, one per thread */
++{
++    uint32_t signaled;   /* futex word: MSYNC_NONE while waiting, else the entry index */
++    uint32_t owner;      /* thread id */
++    uint32_t ownerdead;
++    uint32_t count;      /* entries used (objects plus alert) */
++    uint32_t nobjs;      /* objects without the alert */
++    uint32_t all;
++    uint32_t in_wait;    /* entries are linked */
++    uint32_t pid;        /* Windows process id of the owner, 0 = free */
++    uint32_t next_free;
++    uint32_t sleeping;   /* the owner sleeps in os_sync_wait_on_address, signalers must wake it */
++    uint32_t lock;       /* serializes (un)registration with the wineserver's cleanup */
++    uint32_t dead_time;  /* wineserver: when the owner process died (seconds) */
++    struct msync_entry entries[MSYNC_MAX_WAIT];
++    uint32_t pad2[256 - 12 - 3 * MSYNC_MAX_WAIT];
++};
++
++/* entry ref: (q index << 7) | entry index, q index >= 1 so a ref is never 0 */
++#define MSYNC_REF(qi, ei)  (((qi) << 7) | (ei))
++
++static inline struct msync_header *msync_header( void *shm ) { return shm; }
++static inline struct msync_obj *msync_obj( void *shm, uint32_t idx ) { return (struct msync_obj *)shm + idx; }
++static inline struct msync_q *msync_q( void *shm, uint32_t qi )
++{
++    return (struct msync_q *)((char *)shm + (size_t)MSYNC_MAX_OBJS * 64) + qi;
++}
++static inline struct msync_entry *msync_entry( void *shm, uint32_t ref )
++{
++    return &msync_q( shm, ref >> 7 )->entries[ref & 127];
++}
++
++/* locks: 0 free, 1 locked, 2 locked with sleepers */
++
++static inline void msync_lock( uint32_t *l )
++{
++    uint64_t start;
++    uint32_t c = 0;
++    int i;
++
++    if (__atomic_compare_exchange_n( l, &c, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED )) return;
++    /* lock sections are a few dozen instructions (no syscalls inside), so spin up to
++     * about 10 us (240 ticks at 24 MHz) before sleeping */
++    for (i = 0, start = mach_absolute_time(); i < 64 || mach_absolute_time() - start < 240; i++)
++    {
++#ifdef __aarch64__
++        __asm__ __volatile__( "yield" );
++#endif
++        c = 0;
++        if (__atomic_load_n( l, __ATOMIC_RELAXED ) == 0 &&
++            __atomic_compare_exchange_n( l, &c, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED )) return;
++    }
++    c = __atomic_exchange_n( l, 2, __ATOMIC_ACQUIRE );
++    while (c)
++    {
++        os_sync_wait_on_address( l, 2, 4, OS_SYNC_WAIT_ON_ADDRESS_SHARED );
++        c = __atomic_exchange_n( l, 2, __ATOMIC_ACQUIRE );
++    }
++}
++
++static inline void msync_unlock( uint32_t *l )
++{
++    if (__atomic_exchange_n( l, 0, __ATOMIC_RELEASE ) == 2)
++        os_sync_wake_by_address_any( l, 4, OS_SYNC_WAKE_BY_ADDRESS_SHARED );
++}
++
++/* lock an object; also takes the wait-all lock when wait-all waiters use it (returns 1) */
++static inline int msync_lock_obj( void *shm, struct msync_obj *obj )
++{
++    msync_lock( &obj->lock );
++    if (!obj->all_hint) return 0;
++    msync_unlock( &obj->lock );
++    msync_lock( &msync_header( shm )->wait_all_lock );
++    msync_lock( &obj->lock );
++    return 1;
++}
++
++static inline void msync_unlock_obj( void *shm, struct msync_obj *obj, int all )
++{
++    msync_unlock( &obj->lock );
++    if (all) msync_unlock( &msync_header( shm )->wait_all_lock );
++}
++
++static inline void msync_list_add( void *shm, uint32_t *head, uint32_t ref )
++{
++    struct msync_entry *e = msync_entry( shm, ref );
++    uint32_t first = *head;
++
++    if (!first)
++    {
++        e->next = e->prev = ref;
++        *head = ref;
++        return;
++    }
++    /* circular list, append at the tail */
++    e->next = first;
++    e->prev = msync_entry( shm, first )->prev;
++    msync_entry( shm, e->prev )->next = ref;
++    msync_entry( shm, first )->prev = ref;
++}
++
++static inline void msync_list_del( void *shm, uint32_t *head, uint32_t ref )
++{
++    struct msync_entry *e = msync_entry( shm, ref );
++
++    if (e->next == ref) *head = 0;
++    else
++    {
++        msync_entry( shm, e->prev )->next = e->next;
++        msync_entry( shm, e->next )->prev = e->prev;
++        if (*head == ref) *head = e->next;
++    }
++}
++
++/* Wakes are collected while the object locks are held and done after unlocking
++ * (msync_flush), so the woken thread does not run into a held lock. A late wake
++ * of a block that was reused meanwhile is harmless, waiters always recheck. */
++struct msync_wl
++{
++    unsigned int n;
++    struct msync_q *q[16];
++};
++
++static inline void msync_wake_now( struct msync_q *q )
++{
++    /* the wake syscall only when the owner sleeps (Dekker pairing with the
++     * sleeping store and signaled load in msync_wait) */
++    __atomic_thread_fence( __ATOMIC_SEQ_CST );
++    if (__atomic_load_n( &q->sleeping, __ATOMIC_RELAXED ))
++        os_sync_wake_by_address_any( &q->signaled, 4, OS_SYNC_WAKE_BY_ADDRESS_SHARED );
++}
++
++/* after a successful msync_claim_q() */
++static inline void msync_wake_q( struct msync_wl *wl, struct msync_q *q )
++{
++    if (wl->n < 16) wl->q[wl->n++] = q;
++    else msync_wake_now( q );
++}
++
++static inline void msync_flush( struct msync_wl *wl )
++{
++    unsigned int i;
++    for (i = 0; i < wl->n; i++) msync_wake_now( wl->q[i] );
++    wl->n = 0;
++}
++
++static inline int msync_claim_q( struct msync_q *q, uint32_t index )
++{
++    uint32_t none = MSYNC_NONE;
++    return __atomic_compare_exchange_n( &q->signaled, &none, index, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED );
++}
++
++static inline int msync_is_signaled( struct msync_obj *obj, uint32_t owner )
++{
++    switch (obj->type)
++    {
++    case MSYNC_SEM:   return obj->count != 0;
++    case MSYNC_MUTEX: return (!obj->max || obj->max == owner) && obj->count != 0xffffffffu;
++    case MSYNC_EVENT: return obj->count != 0;
++    }
++    return 0;
++}
++
++/* take the object for a satisfied wait; caller checked msync_is_signaled() */
++static inline void msync_consume( struct msync_obj *obj, uint32_t owner, uint32_t *ownerdead )
++{
++    switch (obj->type)
++    {
++    case MSYNC_SEM: obj->count--; break;
++    case MSYNC_MUTEX:
++        if (obj->ownerdead) { *ownerdead = 1; obj->ownerdead = 0; }
++        obj->count++;
++        obj->max = owner;
++        break;
++    case MSYNC_EVENT: if (!obj->max) obj->count = 0; break;
++    }
++}
++
++/* caller holds the wait-all lock and the lock of "locked" (an object index or 0) */
++static inline void msync_try_wake_all( void *shm, uint32_t qi, uint32_t locked, struct msync_wl *wl )
++{
++    struct msync_q *q = msync_q( shm, qi );
++    uint32_t i, n = q->nobjs;
++    int can_wake = 1;
++
++    for (i = 0; i < n; i++)
++        if (q->entries[i].obj != locked) msync_lock( &msync_obj( shm, q->entries[i].obj )->lock );
++
++    for (i = 0; i < n; i++)
++        if (!msync_is_signaled( msync_obj( shm, q->entries[i].obj ), q->owner )) { can_wake = 0; break; }
++
++    if (can_wake && msync_claim_q( q, 0 ))
++    {
++        for (i = 0; i < n; i++) msync_consume( msync_obj( shm, q->entries[i].obj ), q->owner, &q->ownerdead );
++        msync_wake_q( wl, q );
++    }
++
++    for (i = 0; i < n; i++)
++        if (q->entries[i].obj != locked) msync_unlock( &msync_obj( shm, q->entries[i].obj )->lock );
++}
++
++static inline void msync_try_wake_all_obj( void *shm, uint32_t idx, struct msync_wl *wl )
++{
++    struct msync_obj *obj = msync_obj( shm, idx );
++    uint32_t ref = obj->all_head, first = ref;
++
++    if (!ref) return;
++    do
++    {
++        msync_try_wake_all( shm, ref >> 7, idx, wl );
++        ref = msync_entry( shm, ref )->next;
++    } while (ref != first);
++}
++
++static inline void msync_try_wake_any( void *shm, struct msync_obj *obj, struct msync_wl *wl )
++{
++    uint32_t ref = obj->any_head, first = ref;
++
++    if (!ref) return;
++    do
++    {
++        struct msync_q *q = msync_q( shm, ref >> 7 );
++
++        if (!msync_is_signaled( obj, q->owner ))
++        {
++            if (obj->type != MSYNC_MUTEX) break;  /* a mutex may still be free for its owner */
++        }
++        else if (msync_claim_q( q, ref & 127 ))
++        {
++            msync_consume( obj, q->owner, &q->ownerdead );
++            msync_wake_q( wl, q );
++        }
++        ref = msync_entry( shm, ref )->next;
++    } while (ref != first);
++}
++
++/* after a state change, with the object locked (and the wait-all lock if all) */
++static inline void msync_wake_obj( void *shm, uint32_t idx, int all, struct msync_wl *wl )
++{
++    if (all) msync_try_wake_all_obj( shm, idx, wl );
++    msync_try_wake_any( shm, msync_obj( shm, idx ), wl );
++}
++
++/* allocation */
++
++static inline uint32_t msync_alloc_obj( void *shm, enum msync_type type, uint32_t count, uint32_t max, uint32_t ownerdead )
++{
++    struct msync_header *h = msync_header( shm );
++    struct msync_obj *obj;
++    uint32_t idx;
++
++    msync_lock( &h->alloc_lock );
++    if ((idx = h->obj_free)) h->obj_free = msync_obj( shm, idx )->next_free;
++    else if (h->obj_bump < MSYNC_MAX_OBJS) idx = h->obj_bump++;
++    msync_unlock( &h->alloc_lock );
++    if (!idx) return 0;
++
++    obj = msync_obj( shm, idx );
++    memset( obj, 0, sizeof(*obj) );
++    obj->count = count;
++    obj->max = max;
++    obj->ownerdead = ownerdead;
++    obj->refcount = 1;
++    __atomic_store_n( &obj->type, type, __ATOMIC_RELEASE );
++    return idx;
++}
++
++static inline void msync_ref_obj( void *shm, uint32_t idx )
++{
++    __atomic_fetch_add( &msync_obj( shm, idx )->refcount, 1, __ATOMIC_RELAXED );
++}
++
++static inline void msync_unref_obj( void *shm, uint32_t idx )
++{
++    struct msync_header *h = msync_header( shm );
++    struct msync_obj *obj;
++
++    if (!idx || idx >= MSYNC_MAX_OBJS) return;
++    obj = msync_obj( shm, idx );
++    if (__atomic_sub_fetch( &obj->refcount, 1, __ATOMIC_ACQ_REL )) return;
++    msync_lock( &h->alloc_lock );
++    obj->type = MSYNC_FREE;
++    obj->next_free = h->obj_free;
++    h->obj_free = idx;
++    msync_unlock( &h->alloc_lock );
++}
++
++static inline uint32_t msync_alloc_q( void *shm, uint32_t pid, uint32_t owner )
++{
++    struct msync_header *h = msync_header( shm );
++    struct msync_q *q;
++    uint32_t qi;
++
++    msync_lock( &h->alloc_lock );
++    if ((qi = h->q_free)) h->q_free = msync_q( shm, qi )->next_free;
++    else if (h->q_bump < MSYNC_MAX_QS) qi = h->q_bump++;
++    if (qi)
++    {
++        q = msync_q( shm, qi );
++        q->signaled = MSYNC_NONE;
++        q->in_wait = 0;
++        q->sleeping = 0;
++        q->lock = 0;
++        q->owner = owner;
++        q->pid = pid;
++    }
++    msync_unlock( &h->alloc_lock );
++    return qi;
++}
++
++/* free a wait block if it still belongs to pid/tid (the wineserver may have reaped it) */
++static inline void msync_free_q( void *shm, uint32_t qi, uint32_t pid, uint32_t tid )
++{
++    struct msync_header *h = msync_header( shm );
++    struct msync_q *q = msync_q( shm, qi );
++
++    msync_lock( &h->alloc_lock );
++    if (q->pid == pid && q->owner == tid)
++    {
++        q->pid = 0;
++        q->next_free = h->q_free;
++        h->q_free = qi;
++    }
++    msync_unlock( &h->alloc_lock );
++}
++
++static inline void msync_init( void *shm )
++{
++    struct msync_header *h = msync_header( shm );
++    h->obj_bump = 1;
++    h->q_bump = 1;
++    h->version = MSYNC_VERSION;
++    h->magic = MSYNC_MAGIC;
++}
++
++/* object operations, return 0 or a negative errno like the ntsync ioctls */
++
++static inline int msync_sem_release( void *shm, uint32_t idx, uint32_t *count )
++{
++    struct msync_obj *obj = msync_obj( shm, idx );
++    struct msync_wl wl = { 0 };
++    uint32_t prev;
++    int all = msync_lock_obj( shm, obj ), ret = 0;
++
++    prev = obj->count;
++    if (prev + *count < prev || prev + *count > obj->max) ret = -EOVERFLOW;
++    else
++    {
++        obj->count += *count;
++        msync_wake_obj( shm, idx, all, &wl );
++        *count = prev;
++    }
++    msync_unlock_obj( shm, obj, all );
++    msync_flush( &wl );
++    return ret;
++}
++
++static inline int msync_sem_read( void *shm, uint32_t idx, uint32_t *count, uint32_t *max )
++{
++    struct msync_obj *obj = msync_obj( shm, idx );
++    msync_lock( &obj->lock );
++    *count = obj->count;
++    *max = obj->max;
++    msync_unlock( &obj->lock );
++    return 0;
++}
++
++/* op: 0 reset, 1 set, 2 pulse */
++static inline int msync_event_op( void *shm, uint32_t idx, int op, uint32_t *prev )
++{
++    struct msync_obj *obj = msync_obj( shm, idx );
++    struct msync_wl wl = { 0 };
++    int all;
++
++    if (op == 0)
++    {
++        msync_lock( &obj->lock );
++        *prev = obj->count;
++        obj->count = 0;
++        msync_unlock( &obj->lock );
++        return 0;
++    }
++    all = msync_lock_obj( shm, obj );
++    *prev = obj->count;
++    obj->count = 1;
++    msync_wake_obj( shm, idx, all, &wl );
++    if (op == 2) obj->count = 0;
++    msync_unlock_obj( shm, obj, all );
++    msync_flush( &wl );
++    return 0;
++}
++
++static inline int msync_event_read( void *shm, uint32_t idx, uint32_t *signaled, uint32_t *manual )
++{
++    struct msync_obj *obj = msync_obj( shm, idx );
++    msync_lock( &obj->lock );
++    *signaled = obj->count;
++    *manual = obj->max;
++    msync_unlock( &obj->lock );
++    return 0;
++}
++
++/* *count returns the recursion count before the release */
++static inline int msync_mutex_unlock( void *shm, uint32_t idx, uint32_t owner, uint32_t *count )
++{
++    struct msync_obj *obj = msync_obj( shm, idx );
++    struct msync_wl wl = { 0 };
++    int all = msync_lock_obj( shm, obj ), ret = 0;
++
++    *count = obj->count;
++    if (obj->max != owner || !obj->count) ret = -EPERM;
++    else if (!--obj->count)
++    {
++        obj->max = 0;
++        msync_wake_obj( shm, idx, all, &wl );
++    }
++    msync_unlock_obj( shm, obj, all );
++    msync_flush( &wl );
++    return ret;
++}
++
++static inline int msync_mutex_read( void *shm, uint32_t idx, uint32_t *count, uint32_t *owner )
++{
++    struct msync_obj *obj = msync_obj( shm, idx );
++    int ret;
++
++    msync_lock( &obj->lock );
++    *count = obj->count;
++    *owner = obj->max;
++    ret = obj->ownerdead ? -EOWNERDEAD : 0;
++    msync_unlock( &obj->lock );
++    return ret;
++}
++
++static inline int msync_mutex_kill( void *shm, uint32_t idx, uint32_t owner )
++{
++    struct msync_obj *obj = msync_obj( shm, idx );
++    struct msync_wl wl = { 0 };
++    int all, ret = 0;
++
++    if (__atomic_load_n( &obj->max, __ATOMIC_RELAXED ) != owner) return -EPERM;  /* cheap check, rechecked */
++    all = msync_lock_obj( shm, obj );
++    if (obj->max != owner) ret = -EPERM;
++    else
++    {
++        obj->ownerdead = 1;
++        obj->max = 0;
++        obj->count = 0;
++        msync_wake_obj( shm, idx, all, &wl );
++    }
++    msync_unlock_obj( shm, obj, all );
++    msync_flush( &wl );
++    return ret;
++}
++
++/* waits */
++
++/* unlink all entries of a wait block; called with signals blocked */
++static inline void msync_unregister( void *shm, uint32_t qi )
++{
++    struct msync_q *q = msync_q( shm, qi );
++    uint32_t i;
++
++    msync_lock( &q->lock );
++    if (!q->in_wait)
++    {
++        msync_unlock( &q->lock );
++        return;
++    }
++    if (q->all)
++    {
++        struct msync_header *h = msync_header( shm );
++        msync_lock( &h->wait_all_lock );
++        for (i = 0; i < q->nobjs; i++)
++        {
++            struct msync_obj *obj = msync_obj( shm, q->entries[i].obj );
++            msync_lock( &obj->lock );
++            msync_list_del( shm, &obj->all_head, MSYNC_REF( qi, i ));
++            obj->all_hint--;
++            msync_unlock( &obj->lock );
++        }
++        msync_unlock( &h->wait_all_lock );
++        i = q->nobjs;
++    }
++    else i = 0;
++    for (; i < q->count; i++)
++    {
++        struct msync_obj *obj = msync_obj( shm, q->entries[i].obj );
++        int all = msync_lock_obj( shm, obj );
++        msync_list_del( shm, &obj->any_head, MSYNC_REF( qi, i ));
++        msync_unlock_obj( shm, obj, all );
++    }
++    q->in_wait = 0;
++    msync_unlock( &q->lock );
++}
++
++/* convert nanoseconds to mach absolute time units */
++static inline uint64_t msync_ns_to_abs( uint64_t ns )
++{
++    static mach_timebase_info_data_t tb;
++    if (!tb.denom) mach_timebase_info( &tb );
++    if (tb.numer == tb.denom) return ns;
++    return (uint64_t)((__uint128_t)ns * tb.denom / tb.numer);
++}
++
++/* Wait for count objects (any or all) plus an optional alert event (0 = none).
++ * deadline is in mach absolute time, 0 = infinite; spin (mach absolute time units) is
++ * how long to poll before sleeping. block/unblock are called around
++ * the lock sections (signal masking in the client).
++ * Returns 0 with *index set, -EOWNERDEAD with *index set, -ETIMEDOUT or -EINVAL.
++ * *index == count means the alert was signaled. */
++static inline int msync_wait( void *shm, uint32_t qi, uint32_t owner, uint32_t count, const uint32_t *objs,
++                              int wait_all, uint32_t alert, uint64_t deadline, uint64_t spin, uint32_t *index,
++                              void (*block)(void *), void (*unblock)(void *), void *ctx )
++{
++    struct msync_q *q = msync_q( shm, qi );
++    struct msync_wl wl = { 0 };
++    uint32_t i, j, sig;
++    int all;
++
++    if (wait_all && count > 1)
++        for (i = 0; i < count; i++)
++            for (j = i + 1; j < count; j++)
++                if (objs[i] == objs[j]) return -EINVAL;
++    if (count == 1) wait_all = 0;
++
++    block( ctx );
++
++    /* fast path for wait-any: take the first signaled object without queueing */
++    if (!wait_all)
++    {
++        for (i = 0; i < count; i++)
++        {
++            struct msync_obj *obj = msync_obj( shm, objs[i] );
++            int ret = -EAGAIN;
++
++            all = msync_lock_obj( shm, obj );
++            if (msync_is_signaled( obj, owner ))
++            {
++                uint32_t dead = 0;
++                msync_consume( obj, owner, &dead );
++                *index = i;
++                ret = dead ? -EOWNERDEAD : 0;
++            }
++            msync_unlock_obj( shm, obj, all );
++            if (ret != -EAGAIN)
++            {
++                unblock( ctx );
++                return ret;
++            }
++        }
++    }
++
++    msync_lock( &q->lock );
++    q->owner = owner;
++    q->ownerdead = 0;
++    q->nobjs = count;
++    q->count = count + (alert ? 1 : 0);
++    q->all = wait_all;
++    for (i = 0; i < count; i++) q->entries[i].obj = objs[i];
++    if (alert) q->entries[count].obj = alert;
++    __atomic_store_n( &q->signaled, MSYNC_NONE, __ATOMIC_RELEASE );
++    q->in_wait = 1;
++
++    if (wait_all)
++    {
++        struct msync_header *h = msync_header( shm );
++        msync_lock( &h->wait_all_lock );
++        for (i = 0; i < count; i++)
++        {
++            struct msync_obj *obj = msync_obj( shm, objs[i] );
++            msync_lock( &obj->lock );
++            obj->all_hint++;
++            msync_list_add( shm, &obj->all_head, MSYNC_REF( qi, i ));
++            msync_unlock( &obj->lock );
++        }
++        msync_try_wake_all( shm, qi, 0, &wl );
++        msync_unlock( &h->wait_all_lock );
++        i = count;
++    }
++    else i = 0;
++
++    for (j = i; j < q->count; j++)
++    {
++        struct msync_obj *obj = msync_obj( shm, q->entries[j].obj );
++        all = msync_lock_obj( shm, obj );
++        msync_list_add( shm, &obj->any_head, MSYNC_REF( qi, j ));
++        msync_unlock_obj( shm, obj, all );
++    }
++    msync_unlock( &q->lock );
++    for (j = i; j < q->count; j++)
++    {
++        struct msync_obj *obj = msync_obj( shm, q->entries[j].obj );
++        if (__atomic_load_n( &q->signaled, __ATOMIC_ACQUIRE ) != MSYNC_NONE) break;
++        all = msync_lock_obj( shm, obj );
++        msync_try_wake_any( shm, obj, &wl );
++        msync_unlock_obj( shm, obj, all );
++    }
++    unblock( ctx );
++    msync_flush( &wl );  /* only ever ourselves, and we do not sleep yet: no syscall */
++
++    if (spin && __atomic_load_n( &q->signaled, __ATOMIC_ACQUIRE ) == MSYNC_NONE)
++    {
++        /* short handoffs (producer/consumer pairs) finish before a sleep and wake-up would */
++        uint64_t end = mach_absolute_time() + spin;
++        if (deadline && end > deadline) end = deadline;
++        while (__atomic_load_n( &q->signaled, __ATOMIC_ACQUIRE ) == MSYNC_NONE && mach_absolute_time() < end)
++        {
++#ifdef __aarch64__
++            __asm__ __volatile__( "yield" );
++#endif
++        }
++    }
++
++    __atomic_store_n( &q->sleeping, 1, __ATOMIC_RELAXED );
++    __atomic_thread_fence( __ATOMIC_SEQ_CST );
++    while (__atomic_load_n( &q->signaled, __ATOMIC_ACQUIRE ) == MSYNC_NONE)
++    {
++        if (deadline)
++        {
++            if (mach_absolute_time() >= deadline) break;
++            os_sync_wait_on_address_with_deadline( &q->signaled, MSYNC_NONE, 4, OS_SYNC_WAIT_ON_ADDRESS_SHARED,
++                                                   OS_CLOCK_MACH_ABSOLUTE_TIME, deadline );
++        }
++        else os_sync_wait_on_address( &q->signaled, MSYNC_NONE, 4, OS_SYNC_WAIT_ON_ADDRESS_SHARED );
++    }
++    __atomic_store_n( &q->sleeping, 0, __ATOMIC_RELAXED );
++
++    block( ctx );
++    msync_unregister( shm, qi );
++    unblock( ctx );
++
++    /* final state: a signaler may have claimed us before we unlinked */
++    sig = __atomic_load_n( &q->signaled, __ATOMIC_ACQUIRE );
++    if (sig == MSYNC_NONE) return -ETIMEDOUT;
++    *index = sig;
++    return q->ownerdead ? -EOWNERDEAD : 0;
++}
++
++/* wineserver: unlink the waits of a dead process and mark its wait blocks dead.
++ * Its unix threads may still be finishing (they exit on SIGQUIT and unregister
++ * themselves too, which is fine under q->lock), so the blocks are only freed by
++ * msync_reap_dead() a while later. Returns the number of blocks marked. */
++static inline unsigned int msync_cleanup_pid( void *shm, uint32_t pid, uint32_t now )
++{
++    struct msync_header *h = msync_header( shm );
++    uint32_t qi, end = __atomic_load_n( &h->q_bump, __ATOMIC_ACQUIRE );
++    unsigned int n = 0;
++
++    for (qi = 1; qi < end; qi++)
++    {
++        struct msync_q *q = msync_q( shm, qi );
++        if (q->pid != pid) continue;
++        msync_unregister( shm, qi );
++        msync_lock( &h->alloc_lock );
++        if (q->pid == pid)
++        {
++            q->pid = MSYNC_DEAD_PID;
++            q->dead_time = now;
++            n++;
++        }
++        msync_unlock( &h->alloc_lock );
++    }
++    return n;
++}
++
++/* wineserver: free wait blocks marked dead at or before "before" */
++static inline void msync_reap_dead( void *shm, uint32_t before )
++{
++    struct msync_header *h = msync_header( shm );
++    uint32_t qi, end = __atomic_load_n( &h->q_bump, __ATOMIC_ACQUIRE );
++
++    msync_lock( &h->alloc_lock );
++    for (qi = 1; qi < end; qi++)
++    {
++        struct msync_q *q = msync_q( shm, qi );
++        if (q->pid != MSYNC_DEAD_PID || (int32_t)(before - q->dead_time) < 0) continue;
++        q->pid = 0;
++        q->next_free = h->q_free;
++        h->q_free = qi;
++    }
++    msync_unlock( &h->alloc_lock );
++}
++
++#endif /* __APPLE__ */
++#endif /* __WINE_WINE_MSYNC_H */
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -6068,6 +6068,8 @@
+     struct reply_header __header;
+     int           type;
+     unsigned int access;
++    int           index;
++    char __pad_20[4];
+ };
+ 
+ 
+@@ -6081,7 +6083,7 @@
+ {
+     struct reply_header __header;
+     obj_handle_t handle;
+-    char __pad_12[4];
++    int          index;
+ };
+ 
+ 
+@@ -7184,6 +7186,6 @@
+     struct alpc_create_port_reply alpc_create_port_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 962
++#define SERVER_PROTOCOL_VERSION 963
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+--- a/server/inproc_sync.c
++++ b/server/inproc_sync.c
+@@ -204,8 +204,216 @@
+ 
+     LIST_FOR_EACH_ENTRY( mutex, &inproc_mutexes, struct inproc_sync, entry )
+         ioctl( mutex->fd, NTSYNC_IOC_MUTEX_KILL, &tid );
++}
++
++void inproc_sync_process_exit( process_id_t pid )
++{
++}
++
++static int get_obj_inproc_sync( struct object *obj, int *type )
++{
++    struct object *sync;
++    int fd = -1;
++
++    if (!(sync = get_obj_sync( obj ))) return -1;
++    if (sync->ops == &inproc_sync_ops)
++    {
++        struct inproc_sync *inproc = (struct inproc_sync *)sync;
++        *type = inproc->type;
++        fd = inproc->fd;
++    }
++
++    release_object( sync );
++    return fd;
++}
++
++#elif defined(__APPLE__)
++
++/* neutron: msync backend, ntsync semantics on shared memory (include/wine/msync.h) */
++
++#include <fcntl.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include "wine/msync.h"
++
++static void *msync_shm;
++
++int get_inproc_device_fd(void)
++{
++    static int fd = -2;
++    const char *env;
++    char name[32];
++    void *shm;
++
++    if (fd != -2) return fd;
++    fd = -1;
++    if ((env = getenv( "NEUTRON_MSYNC" )) && !strcmp( env, "0" )) return -1;
++
++    snprintf( name, sizeof(name), "/wmsync-%d", (int)getpid() );
++    shm_unlink( name );
++    if ((fd = shm_open( name, O_RDWR | O_CREAT | O_EXCL, 0600 )) < 0)
++    {
++        fprintf( stderr, "wineserver: msync: shm_open failed (%d), using server sync\n", errno );
++        return fd = -1;
++    }
++    shm_unlink( name );
++    fcntl( fd, F_SETFD, FD_CLOEXEC );
++    if (ftruncate( fd, MSYNC_SIZE ) < 0 ||
++        (shm = mmap( NULL, MSYNC_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 )) == MAP_FAILED)
++    {
++        fprintf( stderr, "wineserver: msync: cannot map shared memory (%d), using server sync\n", errno );
++        close( fd );
++        return fd = -1;
++    }
++    msync_init( shm );
++    msync_shm = shm;
++    return fd;
++}
++
++struct inproc_sync
++{
++    struct object          obj;  /* object header */
++    enum inproc_sync_type  type;
++    int                    fd;   /* msync object index */
++    struct list            entry;
++};
++
++static struct list inproc_mutexes = LIST_INIT( inproc_mutexes );
++
++static void inproc_sync_dump( struct object *obj, int verbose );
++static int inproc_sync_signal( struct object *obj, unsigned int access, int signal );
++static void inproc_sync_destroy( struct object *obj );
++
++static const struct object_ops inproc_sync_ops =
++{
++    .size    = sizeof(struct inproc_sync),
++    .type    = &no_type,
++    .dump    = inproc_sync_dump,
++    .signal  = inproc_sync_signal,
++    .destroy = inproc_sync_destroy,
++};
++
++int get_inproc_sync_fd( struct inproc_sync *sync )
++{
++    if (!sync) return -1;
++    return sync->fd;
++}
++
++static struct inproc_sync *create_msync( enum inproc_sync_type type, enum msync_type mtype,
++                                         uint32_t count, uint32_t max )
++{
++    struct inproc_sync *sync;
++
++    if (!(sync = alloc_object( &inproc_sync_ops ))) return NULL;
++    sync->type = type;
++    sync->fd   = msync_alloc_obj( msync_shm, mtype, count, max, 0 );
++    if (mtype == MSYNC_MUTEX) list_add_tail( &inproc_mutexes, &sync->entry );
++    else list_init( &sync->entry );
++
++    if (!sync->fd)
++    {
++        sync->fd = -1;
++        set_error( STATUS_TOO_MANY_OPENED_FILES );
++        release_object( sync );
++        return NULL;
++    }
++    return sync;
+ }
+ 
++struct inproc_sync *create_inproc_internal_sync( int manual, int signaled )
++{
++    return create_msync( INPROC_SYNC_INTERNAL, MSYNC_EVENT, !!signaled, !!manual );
++}
++
++struct inproc_sync *create_inproc_event_sync( int manual, int signaled )
++{
++    return create_msync( INPROC_SYNC_EVENT, MSYNC_EVENT, !!signaled, !!manual );
++}
++
++struct inproc_sync *create_inproc_mutex_sync( thread_id_t owner, unsigned int count )
++{
++    return create_msync( INPROC_SYNC_MUTEX, MSYNC_MUTEX, count, owner );
++}
++
++struct inproc_sync *create_inproc_semaphore_sync( unsigned int initial, unsigned int max )
++{
++    return create_msync( INPROC_SYNC_SEMAPHORE, MSYNC_SEM, initial, max );
++}
++
++static void inproc_sync_dump( struct object *obj, int verbose )
++{
++    struct inproc_sync *sync = (struct inproc_sync *)obj;
++    assert( obj->ops == &inproc_sync_ops );
++    fprintf( stderr, "Inproc sync type=%d, msync=%d\n", sync->type, sync->fd );
++}
++
++void signal_inproc_sync( struct inproc_sync *sync )
++{
++    uint32_t prev;
++    if (debug_level) fprintf( stderr, "set_inproc_event %d\n", sync->fd );
++    msync_event_op( msync_shm, sync->fd, 1, &prev );
++}
++
++void reset_inproc_sync( struct inproc_sync *sync )
++{
++    uint32_t prev;
++    if (debug_level) fprintf( stderr, "reset_inproc_event %d\n", sync->fd );
++    msync_event_op( msync_shm, sync->fd, 0, &prev );
++}
++
++static int inproc_sync_signal( struct object *obj, unsigned int access, int signal )
++{
++    struct inproc_sync *sync = (struct inproc_sync *)obj;
++    assert( obj->ops == &inproc_sync_ops );
++
++    assert( sync->type == INPROC_SYNC_INTERNAL || sync->type == INPROC_SYNC_EVENT ); /* never called for mutex / semaphore */
++    assert( signal == 0 || signal == 1 ); /* never called from signal_object */
++
++    if (signal) signal_inproc_sync( sync );
++    else reset_inproc_sync( sync );
++    return 1;
++}
++
++static void inproc_sync_destroy( struct object *obj )
++{
++    struct inproc_sync *sync = (struct inproc_sync *)obj;
++    assert( obj->ops == &inproc_sync_ops );
++    list_remove( &sync->entry );
++    if (sync->fd > 0) msync_unref_obj( msync_shm, sync->fd );
++}
++
++void abandon_inproc_mutexes( thread_id_t tid )
++{
++    struct inproc_sync *mutex;
++
++    LIST_FOR_EACH_ENTRY( mutex, &inproc_mutexes, struct inproc_sync, entry )
++        msync_mutex_kill( msync_shm, mutex->fd, tid );
++}
++
++static void msync_reap( void *private )
++{
++    msync_reap_dead( msync_shm, (uint32_t)(ULONG_PTR)private );
++}
++
++void inproc_sync_process_exit( process_id_t pid )
++{
++    uint32_t now = (uint32_t)(monotonic_time / TICKS_PER_SEC);
++
++    if (!msync_shm) return;
++    /* free the blocks once the process's unix threads are surely gone */
++    if (msync_cleanup_pid( msync_shm, pid, now ))
++        add_timeout_user( -2 * TICKS_PER_SEC, msync_reap, (void *)(ULONG_PTR)now );
++}
++
++/* hand an msync object to a client: one reference, dropped by the client */
++void inproc_sync_ref( int idx )
++{
++    msync_ref_obj( msync_shm, idx );
++}
++
+ static int get_obj_inproc_sync( struct object *obj, int *type )
+ {
+     struct object *sync;
+@@ -272,6 +480,10 @@
+     return -1;
+ }
+ 
++void inproc_sync_process_exit( process_id_t pid )
++{
++}
++
+ #endif /* NTSYNC_IOC_EVENT_READ */
+ 
+ DECL_HANDLER(get_inproc_sync_fd)
+@@ -284,7 +496,15 @@
+     reply->access = get_handle_access( current->process, req->handle );
+ 
+     if ((fd = get_obj_inproc_sync( obj, &reply->type )) < 0) set_error( STATUS_NOT_IMPLEMENTED );
++#if !defined(NTSYNC_IOC_EVENT_READ) && defined(__APPLE__)
++    else /* neutron: msync objects go by index, the client holds one reference */
++    {
++        reply->index = fd;
++        inproc_sync_ref( fd );
++    }
++#else
+     else send_client_fd( current->process, fd, req->handle );
++#endif
+ 
+     release_object( obj );
+ }
+--- a/server/object.h
++++ b/server/object.h
+@@ -270,6 +270,8 @@
+ extern void abandon_inproc_mutexes( thread_id_t owner );
+ extern void signal_inproc_sync( struct inproc_sync *sync );
+ extern void reset_inproc_sync( struct inproc_sync *sync );
++extern void inproc_sync_process_exit( process_id_t pid ); /* neutron: msync */
++extern void inproc_sync_ref( int index ); /* neutron: msync */
+ 
+ /* serial functions */
+ 
+--- a/server/process.c
++++ b/server/process.c
+@@ -941,6 +941,7 @@
+     finish_process_tracing( process );
+     release_job_process( process );
+     start_sigkill_timer( process );
++    inproc_sync_process_exit( get_process_id( process ) ); /* neutron: msync wait blocks of the process */
+     signal_sync( process->sync );
+ }
+ 
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -4230,6 +4230,7 @@
+ @REPLY
+     int           type;         /* inproc sync type */
+     unsigned int access;        /* handle access rights */
++    int           index;        /* neutron: msync object index (macOS) */
+ @END
+ 
+ 
+@@ -4237,6 +4238,7 @@
+ @REQ(get_inproc_alert_fd)
+ @REPLY
+     obj_handle_t handle;        /* alert fd is in flight with this handle */
++    int          index;         /* neutron: msync object index (macOS) */
+ @END
+ 
+ 
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -2332,9 +2332,11 @@
+ C_ASSERT( sizeof(struct get_inproc_sync_fd_request) == 16 );
+ C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, type) == 8 );
+ C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, access) == 12 );
+-C_ASSERT( sizeof(struct get_inproc_sync_fd_reply) == 16 );
++C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, index) == 16 );
++C_ASSERT( sizeof(struct get_inproc_sync_fd_reply) == 24 );
+ C_ASSERT( sizeof(struct get_inproc_alert_fd_request) == 16 );
+ C_ASSERT( offsetof(struct get_inproc_alert_fd_reply, handle) == 8 );
++C_ASSERT( offsetof(struct get_inproc_alert_fd_reply, index) == 12 );
+ C_ASSERT( sizeof(struct get_inproc_alert_fd_reply) == 16 );
+ C_ASSERT( offsetof(struct d3dkmt_object_create_request, type) == 12 );
+ C_ASSERT( offsetof(struct d3dkmt_object_create_request, fd) == 16 );
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -3413,6 +3413,7 @@
+ {
+     fprintf( stderr, " type=%d", req->type );
+     fprintf( stderr, ", access=%08x", req->access );
++    fprintf( stderr, ", index=%d", req->index );
+ }
+ 
+ static void dump_get_inproc_alert_fd_request( const struct get_inproc_alert_fd_request *req )
+@@ -3422,6 +3423,7 @@
+ static void dump_get_inproc_alert_fd_reply( const struct get_inproc_alert_fd_reply *req )
+ {
+     fprintf( stderr, " handle=%04x", req->handle );
++    fprintf( stderr, ", index=%d", req->index );
+ }
+ 
+ static void dump_d3dkmt_object_create_request( const struct d3dkmt_object_create_request *req )
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1116,6 +1116,10 @@
+ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
+ {
+     struct thread_data *data = get_thread_data();
++#ifdef __APPLE__
++    if (msync_shm) msync_thread_exit( data );  /* neutron: msync wait block and alert event */
++    else
++#endif
+     close( data->alert_fd );
+     close( data->wait_fd[0] );
+     close( data->wait_fd[1] );
