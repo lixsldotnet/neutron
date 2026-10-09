@@ -1,0 +1,1154 @@
+D3D11 shader and pipeline stutter. The task pool grows with queued work (a burst of pipelines ran on 2 to 4
+threads) and has a background priority. A new VS or PS is compiled in the background soon after creation in a
+pipeline with a partner that links with it and the most used render state (Metal caches the vertex and fragment
+parts), compute pipelines at CreateComputeShader; pixel shader variant keys drop bits that do not change the code.
+
+diff --git a/src/d3d11/d3d11_pipeline.cpp b/src/d3d11/d3d11_pipeline.cpp
+index 8ea32be..6f2d225 100644
+--- a/src/d3d11/d3d11_pipeline.cpp
++++ b/src/d3d11/d3d11_pipeline.cpp
+@@ -12,13 +12,13 @@ class MTLCompiledGraphicsPipelineImpl
+     : public MTLCompiledGraphicsPipeline {
+ public:
+   MTLCompiledGraphicsPipelineImpl(MTLD3D11Device *pDevice,
+-                              MTL_GRAPHICS_PIPELINE_DESC *pDesc)
++                              MTL_GRAPHICS_PIPELINE_DESC *pDesc, bool background)
+       : num_rtvs(pDesc->NumColorAttachments),
+         depth_stencil_format(pDesc->DepthStencilFormat),
+         topology_class(pDesc->TopologyClass), device_(pDevice),
+         pBlendState(pDesc->BlendState),
+         RasterizationEnabled(pDesc->RasterizationEnabled),
+-        SampleCount(pDesc->SampleCount) {
++        SampleCount(pDesc->SampleCount), background_(background) {
+     uint32_t unorm_output_reg_mask = 0;
+     for (unsigned i = 0; i < num_rtvs; i++) {
+       rtv_formats[i] = pDesc->ColorAttachmentFormats[i];
+@@ -28,17 +28,17 @@ public:
+     if (pDesc->SOLayout) {
+       VertexShader =
+           pDesc->VertexShader->get_shader(ShaderVariantVertexStreamOutput{
+-              pDesc->InputLayout, (uint64_t)pDesc->SOLayout});
++              pDesc->InputLayout, (uint64_t)pDesc->SOLayout}, background);
+     } else {
+       VertexShader = pDesc->VertexShader->get_shader(ShaderVariantVertex{
+-          pDesc->InputLayout, pDesc->GSPassthrough, !pDesc->RasterizationEnabled});
++          pDesc->InputLayout, pDesc->GSPassthrough, !pDesc->RasterizationEnabled}, background);
+     }
+ 
+     if (pDesc->PixelShader) {
+       PixelShader = pDesc->PixelShader->get_shader(ShaderVariantPixel{
+           pDesc->SampleMask, pDesc->BlendState->IsDualSourceBlending(),
+           depth_stencil_format == WMTPixelFormatInvalid,
+-          unorm_output_reg_mask});
++          unorm_output_reg_mask}, background);
+       ps_valid_render_targets = pDesc->PixelShader->reflection().PSValidRenderTargets;
+     } else {
+       PixelShader = nullptr;
+@@ -99,7 +99,11 @@ public:
+     state_ = device_->GetMTLDevice().newRenderPipelineState(info, err);
+ 
+     if (state_ == nullptr) {
+-      ERR("Failed to create PSO: ", err.description().getUTF8String());
++      /* neutron: a primed pipeline pairs the shader with a guessed partner */
++      if (background_)
++        TRACE("Failed to create primed PSO: ", err.description().getUTF8String());
++      else
++        ERR("Failed to create PSO: ", err.description().getUTF8String());
+       return this;
+     }
+ 
+@@ -115,6 +119,10 @@ public:
+     ready_.notify_all();
+   }
+ 
++  ThreadpoolWork *GetDependency(unsigned index) {
++    return index == 0 ? VertexShader : index == 1 ? PixelShader : nullptr;
++  }
++
+ private:
+   UINT num_rtvs;
+   UINT ps_valid_render_targets;
+@@ -129,20 +137,21 @@ private:
+   WMT::Reference<WMT::RenderPipelineState> state_;
+   bool RasterizationEnabled;
+   UINT SampleCount;
++  bool background_;
+ };
+ 
+ std::unique_ptr<MTLCompiledGraphicsPipeline>
+ CreateGraphicsPipeline(MTLD3D11Device *pDevice,
+-                       MTL_GRAPHICS_PIPELINE_DESC *pDesc) {
+-  return std::make_unique<MTLCompiledGraphicsPipelineImpl>(pDevice, pDesc);
++                       MTL_GRAPHICS_PIPELINE_DESC *pDesc, bool background) {
++  return std::make_unique<MTLCompiledGraphicsPipelineImpl>(pDevice, pDesc, background);
+ }
+ 
+ class MTLCompiledComputePipelineImpl
+     : public MTLCompiledComputePipeline {
+ public:
+-  MTLCompiledComputePipelineImpl(MTLD3D11Device *pDevice, ManagedShader shader)
++  MTLCompiledComputePipelineImpl(MTLD3D11Device *pDevice, ManagedShader shader, bool background)
+       : device_(pDevice) {
+-    ComputeShader = shader->get_shader(ShaderVariantDefault{});
++    ComputeShader = shader->get_shader(ShaderVariantDefault{}, background);
+     uint32_t total_tgsize = shader->reflection().ThreadgroupSize[0] *
+                             shader->reflection().ThreadgroupSize[1] *
+                             shader->reflection().ThreadgroupSize[2];
+@@ -191,6 +200,8 @@ public:
+     ready_.notify_all();
+   }
+ 
++  ThreadpoolWork *GetDependency(unsigned index) { return index == 0 ? ComputeShader : nullptr; }
++
+ private:
+   MTLD3D11Device *device_;
+   std::atomic_bool ready_;
+@@ -200,8 +211,8 @@ private:
+ };
+ 
+ std::unique_ptr<MTLCompiledComputePipeline>
+-CreateComputePipeline(MTLD3D11Device *pDevice, ManagedShader ComputeShader) {
+-  return std::make_unique<MTLCompiledComputePipelineImpl>(pDevice, ComputeShader);
++CreateComputePipeline(MTLD3D11Device *pDevice, ManagedShader ComputeShader, bool background) {
++  return std::make_unique<MTLCompiledComputePipelineImpl>(pDevice, ComputeShader, background);
+ }
+ 
+ } // namespace dxmt
+\ No newline at end of file
+diff --git a/src/d3d11/d3d11_pipeline.hpp b/src/d3d11/d3d11_pipeline.hpp
+index c703abf..dc03853 100644
+--- a/src/d3d11/d3d11_pipeline.hpp
++++ b/src/d3d11/d3d11_pipeline.hpp
+@@ -167,10 +167,13 @@ public:
+   virtual void GetPipeline(MTL_COMPILED_TESSELLATION_MESH_PIPELINE *pTessellationPipeline) = 0;
+ };
+ 
++/* neutron: background = speculative pipeline (priming, compute shader creation): its shaders are
++   converted with background priority */
+ std::unique_ptr<MTLCompiledGraphicsPipeline>
+-CreateGraphicsPipeline(MTLD3D11Device *pDevice, MTL_GRAPHICS_PIPELINE_DESC *pDesc);
++CreateGraphicsPipeline(MTLD3D11Device *pDevice, MTL_GRAPHICS_PIPELINE_DESC *pDesc, bool background = false);
+ 
+-std::unique_ptr<MTLCompiledComputePipeline> CreateComputePipeline(MTLD3D11Device *pDevice, ManagedShader ComputeShader);
++std::unique_ptr<MTLCompiledComputePipeline>
++CreateComputePipeline(MTLD3D11Device *pDevice, ManagedShader ComputeShader, bool background = false);
+ 
+ std::unique_ptr<MTLCompiledGeometryPipeline>
+ CreateGeometryPipeline(MTLD3D11Device *pDevice, MTL_GRAPHICS_PIPELINE_DESC *pDesc);
+diff --git a/src/d3d11/d3d11_pipeline_cache.cpp b/src/d3d11/d3d11_pipeline_cache.cpp
+index ec17d04..a4cf9a7 100644
+--- a/src/d3d11/d3d11_pipeline_cache.cpp
++++ b/src/d3d11/d3d11_pipeline_cache.cpp
+@@ -9,7 +9,10 @@
+ #include "sha1/sha1_util.hpp"
+ #include "../d3d10/d3d10_shader.hpp"
+ #include "../d3d10/d3d10_input_layout.hpp"
++#include "config/config.hpp"
+ #include <cstring>
++#include <chrono>
++#include <deque>
+ #include <shared_mutex>
+ 
+ namespace dxmt {
+@@ -57,6 +60,144 @@ private:
+   MTLD3D10InputLayout d3d10;
+ };
+ 
++/* neutron: the interpolants a VS writes and a PS reads, from the DXBC signature chunks. airconv links
++   them by name "reg<register>_<first component>" and component type, so a VS output signature that
++   holds every user input of a PS links with it in Metal (used to find partners for pipeline priming). */
++struct SignatureElement {
++  uint32_t reg;
++  uint32_t first_component;
++  uint32_t component_type;
++  bool operator==(const SignatureElement &o) const {
++    return reg == o.reg && first_component == o.first_component && component_type == o.component_type;
++  }
++};
++
++static uint32_t
++DxbcProgramType(const void *pBytecode, size_t BytecodeLength) {
++  auto p = (const uint8_t *)pBytecode;
++  if (BytecodeLength < 32 || memcmp(p, "DXBC", 4))
++    return ~0u;
++  uint32_t count;
++  memcpy(&count, p + 28, 4);
++  for (uint32_t i = 0; i < count && 32 + i * 4 + 4 <= BytecodeLength; i++) {
++    uint32_t off;
++    memcpy(&off, p + 32 + i * 4, 4);
++    if (off + 12 > BytecodeLength)
++      continue;
++    if (!memcmp(p + off, "SHDR", 4) || !memcmp(p + off, "SHEX", 4)) {
++      uint32_t version;
++      memcpy(&version, p + off + 8, 4);
++      return version >> 16; /* 0 PS, 1 VS, 2 GS, 3 HS, 4 DS, 5 CS */
++    }
++  }
++  return ~0u;
++}
++
++/* output = false: the input signature (ISGN, ISG1), true: the output signature (OSGN, OSG1, OSG5).
++   Only elements without a system value. */
++static std::vector<SignatureElement>
++DxbcSignature(const void *pBytecode, size_t BytecodeLength, bool output) {
++  std::vector<SignatureElement> ret;
++  auto p = (const uint8_t *)pBytecode;
++  if (BytecodeLength < 32 || memcmp(p, "DXBC", 4))
++    return ret;
++  uint32_t count;
++  memcpy(&count, p + 28, 4);
++  for (uint32_t i = 0; i < count && 32 + i * 4 + 4 <= BytecodeLength; i++) {
++    uint32_t off, size;
++    memcpy(&off, p + 32 + i * 4, 4);
++    if (off + 16 > BytecodeLength)
++      continue;
++    memcpy(&size, p + off + 4, 4);
++    const uint8_t *c = p + off;
++    size_t stride = 0, skip = 0;
++    if (!memcmp(c, output ? "OSGN" : "ISGN", 4))
++      stride = 24;
++    else if (output && !memcmp(c, "OSG5", 4))
++      stride = 28, skip = 4;
++    else if (!memcmp(c, output ? "OSG1" : "ISG1", 4))
++      stride = 32, skip = 4;
++    if (!stride)
++      continue;
++    const uint8_t *data = c + 8;
++    uint32_t n;
++    memcpy(&n, data, 4);
++    if (8 + (size_t)n * stride > size || off + 8 + size > BytecodeLength)
++      return {};
++    for (uint32_t e = 0; e < n; e++) {
++      const uint8_t *el = data + 8 + e * stride + skip;
++      uint32_t sysval, type, reg;
++      memcpy(&sysval, el + 8, 4);
++      memcpy(&type, el + 12, 4);
++      memcpy(&reg, el + 16, 4);
++      uint8_t mask = el[20];
++      if (sysval != 0 || !(mask & 0xf))
++        continue;
++      ret.push_back({reg, (uint32_t)std::countr_zero((uint32_t)(mask & 0xf)), type});
++    }
++    return ret;
++  }
++  return ret;
++}
++
++/* neutron: which pixel shader variant bits change the converted code. airconv only applies the unorm
++   output fix to float SV_Target outputs and only drops oDepth when the shader writes it, so a PS drawn
++   with and without a depth target, or with other render target formats where it writes nothing,
++   compiled the same function again (airconv and Metal). Returns false if the signature is unreadable. */
++static bool
++DxbcPixelOutputs(const void *pBytecode, size_t BytecodeLength, bool *writes_depth, uint32_t *float_targets) {
++  auto p = (const uint8_t *)pBytecode;
++  *writes_depth = false;
++  *float_targets = 0;
++  if (BytecodeLength < 32 || memcmp(p, "DXBC", 4))
++    return false;
++  uint32_t count;
++  memcpy(&count, p + 28, 4);
++  for (uint32_t i = 0; i < count && 32 + i * 4 + 4 <= BytecodeLength; i++) {
++    uint32_t off, size;
++    memcpy(&off, p + 32 + i * 4, 4);
++    if (off + 16 > BytecodeLength)
++      continue;
++    memcpy(&size, p + off + 4, 4);
++    const uint8_t *c = p + off;
++    size_t stride = 0, skip = 0;
++    if (!memcmp(c, "OSGN", 4))
++      stride = 24;
++    else if (!memcmp(c, "OSG1", 4))
++      stride = 32, skip = 4;
++    if (!stride)
++      continue;
++    const uint8_t *data = c + 8;
++    uint32_t n;
++    memcpy(&n, data, 4);
++    if (8 + (size_t)n * stride > size || off + 8 + size > BytecodeLength)
++      return false;
++    for (uint32_t e = 0; e < n; e++) {
++      const uint8_t *el = data + 8 + e * stride + skip;
++      uint32_t name_off, type, reg;
++      memcpy(&name_off, el, 4);
++      memcpy(&type, el + 12, 4);
++      memcpy(&reg, el + 16, 4);
++      if (name_off >= size)
++        return false;
++      const char *name = (const char *)data + name_off;
++      size_t max_len = size - name_off;
++      if (!strnlen(name, max_len) || strnlen(name, max_len) == max_len)
++        return false;
++      if (!strncasecmp(name, "SV_Depth", 8)) {
++        *writes_depth = true;
++      } else if (!strcasecmp(name, "SV_Target")) {
++        if (reg < 8 && type == 3 /* D3D_REGISTER_COMPONENT_FLOAT32 */)
++          *float_targets |= 1u << reg;
++      } else {
++        return false; /* SV_Coverage, SV_StencilRef: keep the variant as it is */
++      }
++    }
++    return true;
++  }
++  return false;
++}
++
+ template <> struct task_trait<ThreadpoolWork *> {
+   ThreadpoolWork *run_task(ThreadpoolWork *task) {
+     return task->RunThreadpoolWork();
+@@ -74,8 +215,21 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+     MTL_SHADER_REFLECTION reflection_;
+     MTL_SM50_SHADER_ARGUMENT *arguments_info_buffer;
+     std::unordered_map<ShaderVariant, std::unique_ptr<CompiledShader>> variants;
++    /* neutron: get_shader is called from pipeline creation (one mutex per pipeline kind) and now also
++       from shader creation and pipeline priming on other threads */
++    dxmt::mutex variants_mutex_;
+ 
+   public:
++    /* neutron: for pipeline priming */
++    uint32_t program_type = ~0u;
++    std::vector<SignatureElement> link_signature; /* VS: outputs, PS: inputs */
++    std::atomic_bool used = false;                /* part of a pipeline a draw asked for */
++    std::atomic_bool prime_queued = false;
++    /* neutron: see DxbcPixelOutputs */
++    bool ps_outputs_known = false;
++    bool ps_writes_depth = true;
++    uint32_t ps_float_targets = ~0u;
++
+     CachedSM50Shader(PipelineCache *cache, sm50_shader_t shader_transferred,
+                      const Sha1Digest &hash, MTL_SHADER_REFLECTION &reflection)
+         : cache(cache), shader(shader_transferred), sha1_(hash),
+@@ -112,7 +266,13 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+     virtual MTL_SM50_SHADER_ARGUMENT *arguments_info() {
+       return arguments_info_buffer + reflection_.NumConstantBuffers;
+     };
+-    virtual CompiledShader *get_shader(ShaderVariant variant) {
++    virtual CompiledShader *get_shader(ShaderVariant variant, bool background) {
++      if (auto pixel = std::get_if<ShaderVariantPixel>(&variant); pixel && ps_outputs_known) {
++        if (!ps_writes_depth)
++          pixel->disable_depth_output = false;
++        pixel->unorm_output_reg_mask &= ps_float_targets;
++      }
++      std::lock_guard<dxmt::mutex> lock(variants_mutex_);
+       auto c = variants.insert({variant, nullptr});
+       if (c.second) {
+         c.first->second = std::visit(
+@@ -120,7 +280,10 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+               return CreateVariantShader(cache->device, this, var);
+             },
+             variant);
+-        cache->scheduler_.submit(c.first->second.get());
++        if (background)
++          cache->scheduler_.submit_background(c.first->second.get());
++        else
++          cache->scheduler_.submit(c.first->second.get());
+       }
+       return c.first->second.get();
+     }
+@@ -217,8 +380,257 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+   std::unordered_map<ManagedShader, std::unique_ptr<MTLCompiledComputePipeline>> pipelines_cs_;
+   dxmt::mutex mutex_cs_;
+ 
++  /* neutron: pipeline priming. Measured on an M5 Max (dev/bench/shader_stutter.c, docs/neutron.md):
++     newRenderPipelineState is about 90% of the cost of a new shader pair (20 ms against 2 ms for
++     airconv), and Metal compiles a pipeline in parts it caches on its own: the vertex function (about
++     5 ms, independent of the fragment function and the render state), the fragment function (about
++     13 ms, per color formats and blend state, independent of the vertex function) and a link (about
++     3 ms). A new VS or PS is therefore compiled in the background, right after its creation, in a
++     pipeline with a partner that links with it (the VS created next to it, or one a draw used) and
++     with the render state draws used most with as many render targets. The draw that needs the real
++     pipeline then finds it compiled (same partner and state) or only pays the link and the parts
++     that were guessed wrong. DXMT_CONFIG "d3d11.primePipelines = False" turns it off. */
++  struct PrimeEvent {
++    CachedSM50Shader *shader;
++    ManagedInputLayout layout;
++    bool is_vs;
++    std::chrono::steady_clock::time_point created;
++  };
++  struct PrimeTemplate {
++    MTL_GRAPHICS_PIPELINE_DESC desc; /* shaders and input layout are null */
++    uint32_t rt_mask;
++    uint64_t uses;
++  };
++  class PrimeTask final : public ThreadpoolWork {
++  public:
++    PipelineCache *cache;
++    std::atomic_bool queued = false;
++    std::atomic_bool done = false;
++    ThreadpoolWork *RunThreadpoolWork() override {
++      queued.store(false);
++      cache->RunPriming();
++      return this;
++    }
++    bool GetIsDone() override { return done; }
++    void SetIsDone(bool state) override { done = state; }
++  };
++  bool prime_enabled_ = true;
++  dxmt::mutex prime_mutex_;
++  dxmt::mutex prime_run_mutex_;
++  std::vector<PrimeEvent> prime_new_;  /* creation order since the last priming run */
++  std::vector<PrimeEvent> prime_left_; /* no partner or no render state yet */
++  std::vector<PrimeTemplate> prime_templates_;
++  std::deque<std::pair<CachedSM50Shader *, ManagedInputLayout>> prime_known_vs_;
++  std::deque<std::pair<CachedSM50Shader *, MTL_GRAPHICS_PIPELINE_DESC>> prime_known_ps_;
++  std::unordered_set<MTLCompiledGraphicsPipeline *> prime_speculative_;
++  PrimeTask prime_task_;
++  uint64_t prime_count_ = 0;
++  uint64_t prime_hits_ = 0;
++  uint64_t compute_prime_count_ = 0;
++  static constexpr uint64_t kMaxPrimedPipelines = 8192;
++  static constexpr size_t kMaxPrimeLeft = 4096;
++  static constexpr size_t kMaxKnown = 64;
++  static constexpr int kPairDistance = 8;
++  /* a shader a draw uses within this time is compiled for that draw, with foreground priority: a
++     background compile started at utility QoS stays slow in MTLCompilerService even when its worker
++     is raised later (shaders created in the frame that draws them: 2130 ms over the frame budget
++     without the delay, 1890 ms with it) */
++  static constexpr auto kPrimeDelay = std::chrono::milliseconds(50);
++
++  static bool
++  Links(CachedSM50Shader *vs, CachedSM50Shader *ps) {
++    for (auto &in : ps->link_signature) {
++      if (std::find(vs->link_signature.begin(), vs->link_signature.end(), in) == vs->link_signature.end())
++        return false;
++    }
++    return true;
++  }
++
++  void
++  KickPriming() {
++    if (!prime_task_.queued.exchange(true))
++      scheduler_.submit_background(&prime_task_);
++  }
++
++  void
++  AddPrimeEvent(CachedSM50Shader *shader, ManagedInputLayout layout, bool is_vs) {
++    if (!prime_enabled_ || shader->used.load() || shader->prime_queued.exchange(true))
++      return;
++    bool kick;
++    {
++      std::lock_guard<dxmt::mutex> lock(prime_mutex_);
++      prime_new_.push_back({shader, layout, is_vs, std::chrono::steady_clock::now()});
++      kick = !prime_templates_.empty();
++    }
++    if (kick)
++      KickPriming();
++  }
++
++  /* the render state most pipelines used for pixel shaders with the same render targets; none yet:
++     the PS waits for one (the fragment part is compiled per color formats and blend state) */
++  const MTL_GRAPHICS_PIPELINE_DESC *
++  TemplateFor(CachedSM50Shader *ps) {
++    const PrimeTemplate *best = nullptr;
++    uint32_t mask = ps->reflection().PixelShader.ValidRenderTargets;
++    for (auto &t : prime_templates_) {
++      if (t.rt_mask == mask && (!best || t.uses > best->uses))
++        best = &t;
++    }
++    return best ? &best->desc : nullptr;
++  }
++
++  /* a draw asked for this pipeline: remember its render state and its shaders as partners */
++  void
++  RecordPipelineUse(const MTL_GRAPHICS_PIPELINE_DESC &desc) {
++    if (!prime_enabled_ || desc.HullShader || desc.DomainShader || desc.GeometryShader || desc.SOLayout ||
++        !desc.PixelShader || !desc.RasterizationEnabled)
++      return;
++    auto vs = static_cast<CachedSM50Shader *>(desc.VertexShader);
++    auto ps = static_cast<CachedSM50Shader *>(desc.PixelShader);
++    vs->used.store(true);
++    ps->used.store(true);
++    MTL_GRAPHICS_PIPELINE_DESC t = desc;
++    t.VertexShader = nullptr;
++    t.PixelShader = nullptr;
++    t.InputLayout = nullptr;
++    bool kick;
++    {
++      std::lock_guard<dxmt::mutex> lock(prime_mutex_);
++      bool added = false;
++      auto it = std::find_if(prime_templates_.begin(), prime_templates_.end(), [&](const PrimeTemplate &x) {
++        return std::equal_to<MTL_GRAPHICS_PIPELINE_DESC>{}(x.desc, t);
++      });
++      if (it != prime_templates_.end()) {
++        it->uses++;
++      } else if (prime_templates_.size() < 64) {
++        added = true;
++        uint32_t rt_mask = 0;
++        for (unsigned i = 0; i < t.NumColorAttachments; i++)
++          if (t.ColorAttachmentFormats[i] != WMTPixelFormatInvalid)
++            rt_mask |= 1u << i;
++        prime_templates_.push_back({t, rt_mask, 1});
++      }
++      if (prime_known_vs_.size() >= kMaxKnown)
++        prime_known_vs_.pop_back();
++      prime_known_vs_.push_front({vs, desc.InputLayout});
++      if (prime_known_ps_.size() >= kMaxKnown)
++        prime_known_ps_.pop_back();
++      prime_known_ps_.push_front({ps, t});
++      /* events wait for the first render state; leftovers retry with a new one */
++      kick = !prime_new_.empty() || (added && !prime_left_.empty());
++    }
++    if (kick)
++      KickPriming();
++  }
++
++  void
++  RunPriming() {
++    std::lock_guard<dxmt::mutex> run_lock(prime_run_mutex_);
++    std::vector<MTL_GRAPHICS_PIPELINE_DESC> descs;
++    {
++      std::lock_guard<dxmt::mutex> lock(prime_mutex_);
++      if (prime_templates_.empty())
++        return;
++      std::vector<PrimeEvent> events;
++      events.swap(prime_left_);
++      /* events younger than kPrimeDelay stay for a later run (a new pipeline or shader kicks it) */
++      auto now = std::chrono::steady_clock::now();
++      size_t old = 0;
++      while (old < prime_new_.size() && now - prime_new_[old].created >= kPrimeDelay)
++        old++;
++      events.insert(events.end(), prime_new_.begin(), prime_new_.begin() + old);
++      prime_new_.erase(prime_new_.begin(), prime_new_.begin() + old);
++      std::vector<bool> taken(events.size(), false);
++      auto make = [&](CachedSM50Shader *vs, ManagedInputLayout layout, CachedSM50Shader *ps,
++                      const MTL_GRAPHICS_PIPELINE_DESC *t) {
++        MTL_GRAPHICS_PIPELINE_DESC d = *t;
++        d.VertexShader = vs;
++        d.PixelShader = ps;
++        d.InputLayout = layout;
++        descs.push_back(d);
++      };
++      /* a PS and the closest VS created next to it that links with it (engines create a
++         material's shaders together) */
++      for (int i = 0; i < (int)events.size(); i++) {
++        if (taken[i] || events[i].is_vs)
++          continue;
++        auto ps = events[i].shader;
++        if (ps->used.load()) {
++          taken[i] = true;
++          continue;
++        }
++        for (int d = 1; d <= kPairDistance; d++) {
++          int j = -1;
++          if (i - d >= 0 && !taken[i - d] && events[i - d].is_vs && Links(events[i - d].shader, ps))
++            j = i - d;
++          else if (i + d < (int)events.size() && !taken[i + d] && events[i + d].is_vs &&
++                   Links(events[i + d].shader, ps))
++            j = i + d;
++          if (j < 0)
++            continue;
++          if (auto t = TemplateFor(ps)) {
++            make(events[j].shader, events[j].layout, ps, t);
++            taken[i] = taken[j] = true;
++          }
++          break;
++        }
++      }
++      /* the rest with a partner a draw used */
++      for (unsigned i = 0; i < events.size(); i++) {
++        if (taken[i] || events[i].shader->used.load())
++          continue;
++        auto &e = events[i];
++        bool done = false;
++        if (e.is_vs) {
++          for (auto &[ps, t] : prime_known_ps_) {
++            if (Links(e.shader, ps)) {
++              make(e.shader, e.layout, ps, &t);
++              done = true;
++              break;
++            }
++          }
++        } else if (auto t = TemplateFor(e.shader)) {
++          for (auto &[vs, layout] : prime_known_vs_) {
++            if (Links(vs, e.shader)) {
++              make(vs, layout, e.shader, t);
++              done = true;
++              break;
++            }
++          }
++        }
++        if (!done && prime_left_.size() < kMaxPrimeLeft)
++          prime_left_.push_back(e);
++      }
++    }
++    for (auto &d : descs) {
++      std::lock_guard<dxmt::mutex> lock(mutex_);
++      if (prime_count_ >= kMaxPrimedPipelines)
++        break;
++      if (pipelines_.contains(d))
++        continue;
++      auto [iter, inserted] = pipelines_.insert({d, CreateGraphicsPipeline(device, &d, true)});
++      prime_speculative_.insert(iter->second.get());
++      scheduler_.submit_background(iter->second.get());
++      prime_count_++;
++    }
++  }
++
++  /* a draw needs a pipeline that may still wait in the background queue */
++  void
++  Promote(ThreadpoolWork *work) {
++    if (work->GetIsDone())
++      return;
++    scheduler_.promote(work);
++    for (unsigned i = 0; i < 2; i++) {
++      if (auto dep = work->GetDependency(i); dep && !dep->GetIsDone())
++        scheduler_.promote(dep);
++    }
++  }
++
+   CachedSM50Shader *CreateShader(const void *pBytecode,
+-                                 uint32_t BytecodeLength) {
++                                 uint32_t BytecodeLength, bool *created = nullptr) {
++    if (created)
++      *created = false;
+     auto sha1 = Sha1HashState::compute(pBytecode, BytecodeLength);
+     {
+       std::shared_lock<std::shared_mutex> lock(mutex_shares);
+@@ -236,6 +648,18 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+       return nullptr;
+     }
+     auto shader = std::make_unique<CachedSM50Shader>(this, sm50, sha1, reflection);
++    shader->program_type = DxbcProgramType(pBytecode, BytecodeLength);
++    if (shader->program_type == 1)
++      shader->link_signature = DxbcSignature(pBytecode, BytecodeLength, true);
++    else if (shader->program_type == 0) {
++      shader->link_signature = DxbcSignature(pBytecode, BytecodeLength, false);
++      shader->ps_outputs_known =
++          DxbcPixelOutputs(pBytecode, BytecodeLength, &shader->ps_writes_depth, &shader->ps_float_targets);
++      if (!shader->ps_outputs_known) {
++        shader->ps_writes_depth = true;
++        shader->ps_float_targets = ~0u;
++      }
++    }
+     {
+       std::unique_lock<std::shared_mutex> lock(mutex_shares);
+       auto result = shaders_.find(sha1);
+@@ -247,6 +671,8 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+       shader->bytecode_length = BytecodeLength;
+       memcpy(shader->bytecode, pBytecode, BytecodeLength);
+ #endif
++      if (created)
++        *created = true;
+       return shaders_.emplace(sha1, std::move(shader)).first->second.get();
+     }
+   }
+@@ -254,10 +680,18 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+   virtual HRESULT AddVertexShader(const void *pBytecode,
+                                   uint32_t BytecodeLength,
+                                   ID3D11VertexShader **ppShader) override {
+-    auto managed_shader = CreateShader(pBytecode, BytecodeLength);
++    bool created;
++    auto managed_shader = CreateShader(pBytecode, BytecodeLength, &created);
+     if (!managed_shader) {
+       return E_FAIL;
+     }
++    /* neutron: a VS without vertex inputs needs no input layout: convert it now, in the background,
++       and prime its pipeline (with input it waits for CreateInputLayout) */
++    if (created && prime_enabled_ && managed_shader->program_type == 1 &&
++        DxbcSignature(pBytecode, BytecodeLength, false).empty()) {
++      managed_shader->get_shader(ShaderVariantVertex{nullptr, ~0u, false}, true);
++      AddPrimeEvent(managed_shader, nullptr, true);
++    }
+     *ppShader =
+         ref(new TShaderBase<ID3D11VertexShader, MTLD3D10VertexShader>(device, managed_shader));
+     return S_OK;
+@@ -265,10 +699,14 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+ 
+   virtual HRESULT AddPixelShader(const void *pBytecode, uint32_t BytecodeLength,
+                                  ID3D11PixelShader **ppShader) override {
+-    auto managed_shader = CreateShader(pBytecode, BytecodeLength);
++    bool created;
++    auto managed_shader = CreateShader(pBytecode, BytecodeLength, &created);
+     if (!managed_shader) {
+       return E_FAIL;
+     }
++    /* neutron: its variant depends on the render targets, it is converted with its primed pipeline */
++    if (created && managed_shader->program_type == 0)
++      AddPrimeEvent(managed_shader, nullptr, false);
+     *ppShader = ref(new TShaderBase<ID3D11PixelShader, MTLD3D10PixelShader>(device, managed_shader));
+     return S_OK;
+   }
+@@ -310,10 +748,22 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+   virtual HRESULT AddComputeShader(const void *pBytecode,
+                                    uint32_t BytecodeLength,
+                                    ID3D11ComputeShader **ppShader) override {
+-    auto managed_shader = CreateShader(pBytecode, BytecodeLength);
++    bool created;
++    auto managed_shader = CreateShader(pBytecode, BytecodeLength, &created);
+     if (!managed_shader) {
+       return E_FAIL;
+     }
++    /* neutron: a compute pipeline depends on nothing but the shader: compile it now, in the
++       background, instead of at the first Dispatch */
++    if (created && prime_enabled_ && managed_shader->program_type == 5) {
++      std::lock_guard<dxmt::mutex> lock(mutex_cs_);
++      auto [iter, inserted] =
++          pipelines_cs_.insert({managed_shader, CreateComputePipeline(device, managed_shader, true)});
++      if (inserted) {
++        scheduler_.submit_background(iter->second.get());
++        compute_prime_count_++;
++      }
++    }
+     *ppShader =
+         ref(new TShaderBase<ID3D11ComputeShader>(device, managed_shader));
+     return S_OK;
+@@ -341,8 +791,28 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+       input_layouts.emplace(buffer, std::make_unique<CachedInputLayout>(
+                                         std::move(buffer), input_slot_mask));
+     }
+-    *ppInputLayout =
+-        ref(new MTLD3D11InputLayout(device, input_layouts.at(buffer).get()));
++    auto layout = input_layouts.at(buffer).get();
++    *ppInputLayout = ref(new MTLD3D11InputLayout(device, layout));
++    /* neutron: the layout and the VS it was created with give the exact VS variant a draw will use */
++    if (prime_enabled_) {
++      auto p = (const uint8_t *)pShaderBytecodeWithInputSignature;
++      uint32_t size = 0;
++      if (!memcmp(p, "DXBC", 4))
++        memcpy(&size, p + 24, 4);
++      if (size >= 32) {
++        auto sha1 = Sha1HashState::compute(pShaderBytecodeWithInputSignature, size);
++        CachedSM50Shader *vs = nullptr;
++        {
++          std::shared_lock<std::shared_mutex> lock(mutex_shares);
++          if (auto it = shaders_.find(sha1); it != shaders_.end())
++            vs = it->second.get();
++        }
++        if (vs && vs->program_type == 1 && !vs->used.load() && !vs->prime_queued.load()) {
++          vs->get_shader(ShaderVariantVertex{layout, ~0u, false}, true);
++          AddPrimeEvent(vs, layout, true);
++        }
++      }
++    }
+     return hr;
+   }
+ 
+@@ -379,19 +849,29 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+ 
+   void GetGraphicsPipeline(MTL_GRAPHICS_PIPELINE_DESC *pDesc,
+                            MTLCompiledGraphicsPipeline **ppPipeline) override {
+-    std::lock_guard<dxmt::mutex> lock(mutex_);
+-
+-    if (auto iter = pipelines_.find(*pDesc); iter != pipelines_.end()) {
+-      *ppPipeline = iter->second.get();
+-      return;
+-    }
+-    auto [iter, inserted] = pipelines_.insert({*pDesc, CreateGraphicsPipeline(device, pDesc)});
+-    if (!inserted) {
+-      D3D11_ASSERT(0 && "duplicated graphics pipeline");
+-    } else {
+-      scheduler_.submit(iter->second.get());
++    {
++      std::lock_guard<dxmt::mutex> lock(mutex_);
++
++      if (auto found = pipelines_.find(*pDesc); found != pipelines_.end()) {
++        *ppPipeline = found->second.get();
++        /* neutron: primed in the background: move it to the front */
++        if (prime_speculative_.empty() || !prime_speculative_.erase(*ppPipeline))
++          return;
++        prime_hits_++;
++        Promote(*ppPipeline);
++      } else {
++        /* neutron: shaders converted in the background (CreateInputLayout) move to the front with
++           the pipeline when it waits for them, see task_scheduler::worker_func */
++        auto [iter, inserted] = pipelines_.insert({*pDesc, CreateGraphicsPipeline(device, pDesc)});
++        if (!inserted) {
++          D3D11_ASSERT(0 && "duplicated graphics pipeline");
++        } else {
++          scheduler_.submit(iter->second.get());
++        }
++        *ppPipeline = iter->second.get();
++      }
+     }
+-    *ppPipeline = iter->second.get();
++    RecordPipelineUse(*pDesc);
+   }
+ 
+   void GetGeometryPipeline(
+@@ -436,6 +916,8 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+ 
+     if (auto iter = pipelines_cs_.find(pDesc->ComputeShader); iter != pipelines_cs_.end()) {
+       *ppPipeline = iter->second.get();
++      /* neutron: compiled in the background since CreateComputeShader */
++      Promote(*ppPipeline);
+       return;
+     }
+     auto [iter, inserted] = pipelines_cs_.insert({pDesc->ComputeShader, CreateComputePipeline(device, pDesc->ComputeShader)});
+@@ -452,7 +934,18 @@ public:
+       scache_(ShaderCache::getInstance(pDevice->GetDXMTDevice().metalVersion())),
+       device(pDevice),
+       blend_states(pDevice),
+-      so_layouts(pDevice) {};
++      so_layouts(pDevice) {
++    prime_enabled_ = Config::getInstance().getOption<bool>("d3d11.primePipelines", true);
++    prime_task_.cache = this;
++  };
++
++  ~PipelineCache() {
++    /* neutron: workers run tasks that point into the maps below (destroyed before scheduler_) */
++    scheduler_.shutdown();
++    if (prime_count_ || compute_prime_count_)
++      Logger::info(str::format("Pipeline priming: ", prime_count_, " primed, ", prime_hits_, " used by draws, ",
++                               compute_prime_count_, " compute pipelines at shader creation"));
++  }
+ };
+ 
+ std::unique_ptr<MTLD3D11PipelineCacheBase>
+diff --git a/src/d3d11/d3d11_shader.hpp b/src/d3d11/d3d11_shader.hpp
+index fd31bd9..98b35f0 100644
+--- a/src/d3d11/d3d11_shader.hpp
++++ b/src/d3d11/d3d11_shader.hpp
+@@ -191,6 +191,9 @@ public:
+   virtual ThreadpoolWork *RunThreadpoolWork() = 0;
+   virtual bool GetIsDone() = 0;
+   virtual void SetIsDone(bool state) = 0;
++  /* neutron: the shader tasks a pipeline waits for, to move them to the foreground queue when a
++     draw needs a pipeline that was compiled in the background */
++  virtual ThreadpoolWork *GetDependency(unsigned index) { return nullptr; }
+ };
+ 
+ class CompiledShader : public ThreadpoolWork {
+@@ -211,7 +214,8 @@ public:
+   virtual MTL_SHADER_REFLECTION &reflection() = 0;
+   virtual MTL_SM50_SHADER_ARGUMENT *constant_buffers_info() = 0;
+   virtual MTL_SM50_SHADER_ARGUMENT *arguments_info() = 0;
+-  virtual CompiledShader *get_shader(ShaderVariant variant) = 0;
++  /* neutron: background = speculative (shader creation, pipeline priming), see dxmt_tasks.hpp */
++  virtual CompiledShader *get_shader(ShaderVariant variant, bool background = false) = 0;
+   virtual const Sha1Digest& sha1() = 0;
+   virtual void dump() = 0;
+ 
+diff --git a/src/dxmt/dxmt_tasks.hpp b/src/dxmt/dxmt_tasks.hpp
+index 6762d47..45b1828 100644
+--- a/src/dxmt/dxmt_tasks.hpp
++++ b/src/dxmt/dxmt_tasks.hpp
+@@ -2,9 +2,11 @@
+ 
+ #include "thread.hpp"
+ #include "util_win32_compat.h"
++#include <algorithm>
+ #include <atomic>
+-#include <queue>
++#include <deque>
+ #include <unordered_map>
++#include <unordered_set>
+ 
+ namespace dxmt {
+ 
+@@ -14,9 +16,24 @@ template <typename Task> struct task_trait {
+   void set_done(Task task);
+ };
+ 
++/* neutron: two priorities and a pool that grows with the queued work.
++   - submit() is for work a draw waits for (pipelines and their shaders), submit_background() for
++     speculative work (shader conversion at creation, primed and compute pipelines). Background tasks
++     run when no foreground task is queued, on at most half the workers. promote() moves a background
++     task a draw now needs to the front (queued), to the foreground once its dependency is done
++     (parked), or raises the priority of its worker (running); a foreground task that waits for a
++     background one promotes it.
++   - The pool grew only when every worker was running at the moment of a submit: a burst of pipelines
++     from one draw loop found the workers still waking up and compiled on 2 to 4 threads, while Metal
++     compiles about 16 pipelines in parallel on an 18 core M5 Max (2.1 ms wall per pipeline against
++     5.4 ms with 4 threads). Now a worker is added while queued tasks outnumber idle workers, up to the
++     number of cores (more threads gave no throughput, only longer latency per pipeline). */
+ template <typename Task> class task_scheduler {
+ public:
+   void submit(Task task);
++  void submit_background(Task task);
++  void promote(Task task);
++  void shutdown();
+ 
+   task_scheduler();
+   ~task_scheduler();
+@@ -28,25 +45,42 @@ public:
+ 
+ private:
+   void worker_func();
++  bool should_grow_locked();
++  void add_worker();
+ 
+   dxmt::mutex worker_mutex_;
+   dxmt::condition_variable worker_cond_;
+-  std::queue<Task> task_queue_;
+-  std::queue<Task> task_continuation_queue_;
++  std::deque<Task> task_queue_;
++  std::deque<Task> task_background_queue_;
++  std::deque<Task> task_continuation_queue_;
+ 
+   dxmt::mutex deps_mutex_;
+   std::unordered_multimap<Task, Task> task_continuation_;
++  std::unordered_set<Task> background_parked_; /* background tasks waiting for a dependency */
+ 
+   std::vector<dxmt::thread> workers_;
+ 
++  /* what each worker runs, to raise the priority of a background task a draw now waits for */
++  struct worker_slot {
++    HANDLE thread = nullptr;
++    Task task = {};
++    bool background = false;
++    bool boosted = false;
++  };
++  std::vector<worker_slot *> slots_; /* under worker_mutex_ */
++
+   std::atomic_bool destroyed = false;
+   std::atomic_uint64_t running = 0;
++  uint64_t idle = 0;             /* workers waiting for a task, under worker_mutex_ */
++  uint64_t running_background = 0; /* under worker_mutex_ */
+   uint64_t threads;
+   uint64_t max_threads;
++  uint64_t max_background;
+ };
+ 
+ template <typename Task> task_scheduler<Task>::task_scheduler() {
+-  max_threads = dxmt::thread::hardware_concurrency() * 2;
++  max_threads = std::max<uint64_t>(dxmt::thread::hardware_concurrency(), 4);
++  max_background = std::max<uint64_t>(max_threads / 2, 1);
+   workers_.reserve(max_threads);
+   threads = 2;
+ 
+@@ -55,11 +89,20 @@ template <typename Task> task_scheduler<Task>::task_scheduler() {
+   }
+ }
+ 
+-template <typename Task> task_scheduler<Task>::~task_scheduler() {
+-  destroyed.store(true);
++template <typename Task> task_scheduler<Task>::~task_scheduler() { shutdown(); }
++
++template <typename Task>
++void
++task_scheduler<Task>::shutdown() {
++  std::vector<dxmt::thread> workers;
++  {
++    std::unique_lock<dxmt::mutex> lock(worker_mutex_);
++    destroyed.store(true);
++    workers.swap(workers_);
++  }
+   worker_cond_.notify_all();
+ 
+-  for (auto &worker : workers_) {
++  for (auto &worker : workers) {
+     if (worker.joinable())
+       worker.join();
+   }
+@@ -71,28 +114,64 @@ template <typename Task>
+ void
+ task_scheduler<Task>::worker_func() {
+   struct task_trait<Task> task_trait;
+-  std::vector<Task> continuation_buffer;
+-  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
++  std::vector<std::pair<Task, bool>> continuation_buffer;
++  /* neutron: Wine on macOS makes a TIME_CRITICAL thread a fixed priority Mach thread of the highest
++     importance. Up to half the cores busy with speculative work at that priority took cores from the
++     game thread (its draw loop 2x slower in frames that created shaders); background tasks run at
++     BELOW_NORMAL (QoS utility), work a draw waits for keeps TIME_CRITICAL. */
++  int priority = THREAD_PRIORITY_TIME_CRITICAL;
++  SetThreadPriority(GetCurrentThread(), priority);
++  worker_slot slot;
++  DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &slot.thread, 0, FALSE,
++                  DUPLICATE_SAME_ACCESS);
++  {
++    std::unique_lock<dxmt::mutex> lock(worker_mutex_);
++    slots_.push_back(&slot);
++  }
+   while (!destroyed.load()) {
+     Task task;
++    bool background = false;
++    bool grow = false;
+     {
+       std::unique_lock<dxmt::mutex> lock(worker_mutex_);
+ 
+-      if (task_queue_.empty() && task_continuation_queue_.empty()) {
+-        worker_cond_.wait(lock, [this]() {
+-          return task_queue_.size() || task_continuation_queue_.size() || destroyed.load();
+-        });
++      auto has_work = [this]() {
++        return task_queue_.size() || task_continuation_queue_.size() ||
++               (task_background_queue_.size() && running_background < max_background);
++      };
++      if (!has_work()) {
++        idle++;
++        worker_cond_.wait(lock, [&]() { return has_work() || destroyed.load(); });
++        idle--;
+       }
+ 
+       if (!task_continuation_queue_.empty()) {
+         task = task_continuation_queue_.front();
+-        task_continuation_queue_.pop();
++        task_continuation_queue_.pop_front();
+       } else if (!task_queue_.empty()) {
+         task = task_queue_.front();
+-        task_queue_.pop();
++        task_queue_.pop_front();
++      } else if (!task_background_queue_.empty() && running_background < max_background) {
++        task = task_background_queue_.front();
++        task_background_queue_.pop_front();
++        background = true;
++        running_background++;
+       } else {
+         break;
+       }
++      grow = should_grow_locked();
++      slot.task = task;
++      slot.background = background;
++      if (slot.boosted) {
++        slot.boosted = false;
++        priority = THREAD_PRIORITY_TIME_CRITICAL;
++      }
++    }
++    if (grow)
++      add_worker();
++    if (int want = background ? THREAD_PRIORITY_BELOW_NORMAL : THREAD_PRIORITY_TIME_CRITICAL; want != priority) {
++      priority = want;
++      SetThreadPriority(GetCurrentThread(), priority);
+     }
+     running.fetch_add(1, std::memory_order_relaxed);
+     while (true) {
+@@ -102,44 +181,135 @@ task_scheduler<Task>::worker_func() {
+           std::unique_lock<dxmt::mutex> lock(deps_mutex_);
+           auto range = task_continuation_.equal_range(continuation);
+           for (auto itr = range.first; itr != range.second; ++itr) {
+-            continuation_buffer.push_back(itr->second);
++            continuation_buffer.push_back({itr->second, background_parked_.erase(itr->second) != 0});
+           }
+           task_continuation_.erase(range.first, range.second);
+           task_trait.set_done(continuation);
+         }
+-        {
++        if (!continuation_buffer.empty()) {
+           std::unique_lock<dxmt::mutex> lock(worker_mutex_);
+-          for (auto &task : continuation_buffer) {
+-            task_continuation_queue_.push(task);
++          for (auto &[task, bg] : continuation_buffer) {
++            if (bg)
++              task_background_queue_.push_back(task);
++            else
++              task_continuation_queue_.push_back(task);
+           }
+         }
+         worker_cond_.notify_all();
+         continuation_buffer.clear();
+       } else {
+-        std::unique_lock<dxmt::mutex> lock(deps_mutex_);
+-        // spurious dependency
+-        if (task_trait.get_done(continuation)) {
+-          continue;
++        {
++          std::unique_lock<dxmt::mutex> lock(deps_mutex_);
++          // spurious dependency
++          if (task_trait.get_done(continuation)) {
++            continue;
++          }
++          task_continuation_.insert({continuation, task});
++          if (background)
++            background_parked_.insert(task);
+         }
+-        task_continuation_.insert({continuation, task});
++        /* neutron: the dependency may still wait in the background queue */
++        if (!background)
++          promote(continuation);
+       }
+       break;
+     }
+     running.fetch_sub(1, std::memory_order_relaxed);
++    if (background) {
++      std::unique_lock<dxmt::mutex> lock(worker_mutex_);
++      running_background--;
++      slot.background = false;
++      if (!task_background_queue_.empty())
++        worker_cond_.notify_one();
++    }
++  }
++  {
++    std::unique_lock<dxmt::mutex> lock(worker_mutex_);
++    slots_.erase(std::find(slots_.begin(), slots_.end(), &slot));
+   }
++  if (slot.thread)
++    CloseHandle(slot.thread);
+ };
+ 
++/* adds one worker while queued tasks outnumber the idle workers. Creating a thread takes 1 to 2 ms
++   in Wine, so the game thread adds at most one per submit, and only for work a draw waits for; the
++   workers add the rest when they take a task. */
++template <typename Task>
++bool
++task_scheduler<Task>::should_grow_locked() {
++  if (destroyed.load() || threads >= max_threads)
++    return false;
++  uint64_t queued = task_queue_.size() + task_continuation_queue_.size() +
++                    std::min<uint64_t>(task_background_queue_.size(), max_background - running_background);
++  if (queued <= idle)
++    return false;
++  threads++; /* reserved, add_worker() creates it outside the lock */
++  return true;
++}
++
+ template <typename Task>
+ void
+-task_scheduler<Task>::submit(Task task) {
++task_scheduler<Task>::add_worker() {
++  dxmt::thread worker([this]() { worker_func(); });
+   std::unique_lock<dxmt::mutex> lock(worker_mutex_);
+-  task_queue_.push(task);
++  if (destroyed.load()) {
++    /* shutdown() has joined the others already */
++    lock.unlock();
++    worker_cond_.notify_all();
++    worker.join();
++    return;
++  }
++  workers_.push_back(std::move(worker));
++}
+ 
+-  if (running.load(std::memory_order_relaxed) == threads && threads < max_threads) {
+-    workers_.emplace_back([this]() { worker_func(); });
+-    threads++;
++template <typename Task>
++void
++task_scheduler<Task>::submit(Task task) {
++  bool grow;
++  {
++    std::unique_lock<dxmt::mutex> lock(worker_mutex_);
++    task_queue_.push_back(task);
++    grow = idle == 0 && should_grow_locked();
++  }
++  worker_cond_.notify_one();
++  if (grow)
++    add_worker();
++}
++
++template <typename Task>
++void
++task_scheduler<Task>::submit_background(Task task) {
++  {
++    std::unique_lock<dxmt::mutex> lock(worker_mutex_);
++    task_background_queue_.push_back(task);
+   }
++  worker_cond_.notify_one();
++}
+ 
++template <typename Task>
++void
++task_scheduler<Task>::promote(Task task) {
++  {
++    /* parked: it goes to the foreground queue once its dependency is done */
++    std::unique_lock<dxmt::mutex> lock(deps_mutex_);
++    background_parked_.erase(task);
++  }
++  {
++    std::unique_lock<dxmt::mutex> lock(worker_mutex_);
++    auto it = std::find(task_background_queue_.begin(), task_background_queue_.end(), task);
++    if (it == task_background_queue_.end()) {
++      /* already running in the background: raise its worker */
++      for (auto slot : slots_) {
++        if (slot->task == task && slot->background && !slot->boosted && slot->thread) {
++          slot->boosted = true;
++          SetThreadPriority(slot->thread, THREAD_PRIORITY_TIME_CRITICAL);
++        }
++      }
++      return;
++    }
++    task_background_queue_.erase(it);
++    task_queue_.push_front(task);
++  }
+   worker_cond_.notify_one();
+ }
+ 

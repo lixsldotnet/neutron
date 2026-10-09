@@ -796,6 +796,108 @@ specific workarounds), and an NVIDIA path that needs a real NVIDIA driver or NvA
 call that is not implemented can fail. Depth as D24S8 (Depth32Float_Stencil8 in
 Metal) and R11G11B10 color or output have not been tried with the scaler.
 
+## Shader and pipeline stutter
+
+D3D11 games hitch when they draw with a shader or render state for the first time
+(new area, new effect): DXMT converts the DXBC with airconv and creates the Metal
+pipeline when the first draw needs it, and its encoder thread waits for it.
+Benchmark: `dev/bench/shader_stutter.c`, headless, 400 generated material-like VS/PS
+pairs (skinning, normal maps, 1 to 6 textures, 1 to 8 lights, parallax loops), 720
+frames paced to 60 Hz, a burst of 24 new pairs every 60 frames and one every 4
+frames, every 8th pair also with 3 other blend states and in an RGBA16F pass without
+depth. Frame time runs from frame start to GPU completion.
+
+Where the time went (M5 Max, cold cache, 840 shader variants, 600 pipelines):
+
+- `newRenderPipelineState`: 23 ms median, 15.4 s in total. airconv: 1.6 ms median,
+  1.6 s in total. `newLibraryWithData` and `newFunctionWithName` 0.06 ms: Metal
+  compiles AIR to GPU code only for a pipeline.
+- DXMT compiled pipelines on a task pool, but added a thread only when all workers
+  were running at the moment of a submit. A draw loop submits a burst before the
+  workers wake up, so 24 new pairs compiled on about 4 threads: 200 ms frames.
+  Metal scales to about 16 pipelines in parallel (native test with DXMT's
+  metallibs: 120 pipelines in 2.3 s on 1 thread, 0.25 s on 16, the same with the
+  async API); `newRenderPipelineState` is not behind a lock for ordinary pipelines
+  (upstream keeps one for D3D11 tessellation and D3D12 mesh pipelines).
+- Metal caches parts of a pipeline (native tests, 19 pipelines each): a new pair
+  20.6 ms; with its VS compiled before in a pipeline with another PS 15.0 ms; with
+  its PS compiled before with another VS 7.1 ms; both 2.9 ms. The PS part depends
+  on color formats and blend state (another blend state: 18.7 ms), not on the
+  depth format (0 ms). A pipeline with the VS alone does not help.
+- Warm cache: airconv is skipped (DXMT's `shaders_320.db`) and Metal's cache in
+  compatdata answers `newRenderPipelineState` in 0.3 ms median, so warm runs had no
+  frame over budget already. A binary archive for warm starts would gain nothing
+  measurable.
+- Wine on macOS turns a `THREAD_PRIORITY_TIME_CRITICAL` thread into a fixed
+  priority Mach thread of the highest importance. DXMT's workers use it; many busy
+  workers made the game thread twice as slow in frames that created shaders.
+- Creating a thread takes 1 to 2 ms in Wine; growing the pool on the game thread
+  cost up to 25 ms in one call.
+
+DXMT patch 0032:
+
+- The pool adds a worker while queued tasks outnumber idle workers, up to the
+  number of cores. Workers create the threads, the game thread at most one per
+  submit. A background queue for speculative work runs on at most half the
+  workers at `BELOW_NORMAL` (QoS utility); work a draw waits for keeps
+  `TIME_CRITICAL`. A draw that needs a background task moves it to the front, or
+  raises its worker when it already runs.
+- Pipeline priming: 50 ms after a VS or PS is created and not drawn, it is compiled
+  in the background in a pipeline with a partner whose signature links with it
+  (the VS created next to the PS, or a shader a draw used) and the render state
+  most pipelines used for as many render targets. The VS variant is exact from
+  `CreateInputLayout`. When the guess is the real pipeline, the draw finds it
+  compiled; otherwise only the link and the guessed-wrong part remain. Within
+  50 ms a shader is compiled for its draw with foreground priority (a background
+  compile started at utility QoS stays slow in MTLCompilerService). Compute
+  pipelines are compiled at `CreateComputeShader`. `DXMT_CONFIG="d3d11.primePipelines
+  = False"` turns priming off.
+- Pixel shader variant keys drop bits that do not change the code (depth target
+  bound for a PS without `SV_Depth`, unorm fix for targets the PS does not write as
+  float), so such draws do not convert and compile the same function again.
+
+Results (M5 Max, macOS 27, medians of 3 cold and 6 warm runs, alternating with the
+build before; frame time in ms, "over" = frames over 16.7 ms of 720, "excess" = their
+time above it, "app" = worst app thread time of a frame):
+
+| Case | Worst frame | p99 | Over | Excess | App |
+|---|---|---|---|---|---|
+| load, cold, before | 214 | 113 | 149 | 2787 | 2.3 |
+| load, cold, 0032 | 59 | 49 | 28 | 718 | 7.5 |
+| load, warm, before | 7.7 | 4.1 | 0 | 0 | 4.2 |
+| load, warm, 0032 | 8.2 | 3.0 | 0 | 0 | 3.0 |
+| stream, cold, before | 213 | 113 | 149 | 2802 | 4.7 |
+| stream, cold, 0032 | 89 | 78 | 149 | 2168 | 5.3 |
+| stream, warm, before | 12.6 | 8.5 | 0 | 0 | 8.7 |
+| stream, warm, 0032 | 13.8 | 9.7 | 0 | 0 | 9.4 |
+
+`load` creates all shaders before the first frame, `stream` each pair in the frame
+that draws it. Images are identical (`hash_rgba8`, `hash_rgba16f`), and so are the
+`gpu_headless` hashes (default, `msaa`, `bgra discard`), the `d3d11_headless` numbers
+(`base`, `state`, `deferred` within 2%) and the D3D11 and D3D12 tests. Of 384 primed
+pipelines in a cold `load` run, 358 were the ones the draws asked for, all compiled
+before the draw. Cache size after a cold run: Metal 12.8 MB (12.7 before), DXMT
+6.3 MB (7.2 before).
+
+What is left:
+
+- A new pair costs about 20 ms of Metal compile, more than a 60 Hz frame. Shaders
+  created in the frame that draws them (`stream`) still miss that frame; only the
+  larger pool helps there.
+- Other blend states and render target formats for a shader cannot be guessed from
+  the shader; the heavy pairs' variants are most of the remaining 40 to 60 ms frames
+  in `load`.
+- In `stream` warm the frames take about 1 ms more CPU (p99 8.5 to 9.7 ms, still
+  none over budget): conversion of each new VS at `CreateInputLayout` and the
+  priming runs.
+- In `load` cold the worst app thread time rises from 2.3 to 7.5 ms while the
+  background compiles run (lookups of primed pipelines, CPU shared with
+  MTLCompilerService).
+- Priming compiles shaders a game creates but never draws (CPU in
+  MTLCompilerService, at utility QoS, capped at 8192 pipelines and half the cores).
+- D3D12 creates its pipelines in `CreateGraphicsPipelineState`, as the API wants,
+  and still has no DXMT cache for DXIL.
+
 ## Patches
 
 All third-party code is fetched at build time at a pinned version and patched
