@@ -6,6 +6,12 @@ With neutron the normal Mac Steam client can install and run Windows games, like
 
 You dont need CrossOver, Apple's Game Porting Toolkit (D3DMetal) or any other paid or closed product for it. Everything is built from source. Wine, FEX, DXMT, LLVM and mingw-w64 are open source and neutron itself is too (LGPL-2.1-or-later). The only exception is the Steam bridge from Proton (lsteamclient), it is under Valve's Steamworks SDK license, so the build downloads it from Valve's Proton repo and this repo only has the patches for it.
 
+## AI usage
+
+I want to be clear about this. Im a C# developer, not a Wine or translation layer developer. I built neutron together with AI (Claude Code from Anthropic). Most of the patches, scripts and docs were written by the AI. I set the direction, tested everything on my Mac with real games and decided what goes in. The numbers and test results in the docs come from real runs, not from guesses.
+
+So please read the patches with that in mind, especially the deep parts like ntdll, FEX, the DXMT shader translation and msync. If you know this stuff and see something wrong, an issue or PR is very welcome.
+
 ## Status
 
 Its early. Real games run, but expect problems, only a few games are tested so far. I tested only on macOS 27 with a M5 Max.

@@ -18,6 +18,12 @@ version and Mac you use. "Works" reports help too (which settings, how it runs).
 
 `main` only changes through pull requests; they are merged as one squash commit.
 
+## AI tools
+
+Using AI tools is fine, neutron itself was mostly written with AI (see the README).
+Say in the pull request if you used one, and only send changes you understand and
+tested. You are responsible for what you submit.
+
 ## Developer Certificate of Origin
 
 Every commit needs a `Signed-off-by: Your Name <you@example.com>` line
