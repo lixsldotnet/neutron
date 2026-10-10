@@ -6,6 +6,8 @@
 // Compatibility page, the settings go into that page instead.
 // The settings are stored as NEUTRON_<NAME>=<value> words in the game's launch
 // options; tool/neutron takes them out of the command line and exports them.
+// On and Off are written as values (=1, =0): no word means the value from
+// neutron.env, which would win over an Off.
 // Lives in the running Steam UI only, it changes no Steam file.
 (() => {
   if (window.__neutronPanel) return 'already installed';
@@ -13,21 +15,21 @@
   const TAB = 'Compatibility';
   const OPTIONS = [
     { key: 'NEUTRON_HUD', label: 'Performance HUD',
-      choices: [['', 'Off'], ['1', 'FPS and frame time'], ['2', 'Full (with DXMT statistics)']] },
+      choices: [['0', 'Off'], ['1', 'FPS and frame time'], ['2', 'Full (with DXMT statistics)']] },
     { key: 'NEUTRON_RENDER_SCALE', label: 'Render scale',
       choices: [['', 'Default (85%, MetalFX upscaling)'], ['1', '100% (native, no upscaling)'], ['0.75', '75%']] },
     { key: 'NEUTRON_FEX_TSO', label: 'x86 memory ordering',
       choices: [['', 'Default for this game'], ['fast', 'Fast'], ['strict', 'Strict (slower, for threading bugs)']] },
     { key: 'NEUTRON_NATIVE_FULLSCREEN', label: 'macOS fullscreen and Game Mode',
-      choices: [['', 'On'], ['0', 'Off']] },
+      choices: [['1', 'On'], ['0', 'Off']] },
     { key: 'NEUTRON_DLSS', label: 'DLSS on MetalFX (game sees an NVIDIA GPU)',
-      choices: [['', 'Off'], ['1', 'On (experimental)']] },
+      choices: [['0', 'Off'], ['1', 'On (experimental)']] },
     { key: 'NEUTRON_D3D12_SM6', label: 'DirectX 12 shader model 6 (Unreal 5)',
-      choices: [['', 'Off'], ['1', 'On (experimental)']] },
+      choices: [['0', 'Off'], ['1', 'On (experimental)']] },
     { key: 'NEUTRON_FPS_LOG', label: 'FPS log',
-      choices: [['', 'Off'], ['1', 'On (~/Library/Logs/neutron)']] },
+      choices: [['0', 'Off'], ['1', 'On (~/Library/Logs/neutron)']] },
     { key: 'NEUTRON_SANDBOX', label: 'Sandbox (game cannot read your files or start programs)',
-      choices: [['', 'Off'], ['1', 'On (experimental)']] },
+      choices: [['0', 'Off'], ['1', 'On (experimental)']] },
   ];
 
   const details = appid => new Promise(resolve => {
@@ -68,6 +70,7 @@
       s.appendChild(o);
     }
     s.value = value;
+    if (s.selectedIndex < 0) s.selectedIndex = 0;
     s.addEventListener('change', () => onChange(s.value));
     return s;
   };
