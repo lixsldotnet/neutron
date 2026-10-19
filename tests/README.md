@@ -1,7 +1,9 @@
 # tests
 
 Small Windows programs that check one part of the stack each. They are built
-as x86_64 Windows executables, like games, so they also run through FEX.
+as x86_64 Windows executables, like games, so they also run through FEX. The
+one exception is `metal_mesh_no_pixel_shader.mm`, a native Mac program (see
+below).
 
 | Test | Checks | Window | Libraries |
 |---|---|---|---|
@@ -21,7 +23,7 @@ as x86_64 Windows executables, like games, so they also run through FEX.
 | `d3d12_dxil_pso.c` | pipeline creation for 12 pixel shaders (derivatives, LOD, MSAA, coverage, UAV, wave) | no | `-ld3d12` |
 | `d3d12_dxil_gs.c` | DXIL geometry shaders: the `d3d12_gs.c` cases plus GS instancing (`[instance(2)]`, SV_GSInstanceID) | no | `-ld3d12` |
 | `d3d12_dxil_tess.c` | DXIL hull and domain shaders: the `d3d12_tess.c` cases, the patch constant function reads an output control point | no | `-ld3d12` |
-| `d3d12_gs.c` | geometry shaders (DXBC): point to quad, strips, indexed 16/32-bit with base vertex, instancing, line input with an SRV, render target array index, root parameters visible to the GS only, mixed with ordinary draws | no | `-ld3d12 -ld3dcompiler` |
+| `d3d12_gs.c` | geometry shaders (DXBC): point to quad, strips, indexed 16/32-bit with base vertex, instancing, line input with an SRV, render target array index, root parameters visible to the GS only, mixed with ordinary draws, no pixel shader, no render target (also with ForcedSampleCount) | no | `-ld3d12 -ld3dcompiler` |
 | `d3d12_tess.c` | tessellation (DXBC): tri and quad domains, patch constants, a displaced edge that only shows when the patch is tessellated, factors from root constants, indexed and instanced patches | no | `-ld3d12 -ld3dcompiler` |
 | `d3d12_queries.c` | occlusion and binary occlusion counts, timestamps across submissions (order, frequency), pipeline statistics as zeros, via `ResolveQueryData` | no | `-ld3d12 -ld3dcompiler` |
 | `d3d12_cmdlist.c` | buffer to buffer `CopyTextureRegion`, `WriteBufferImmediate`, `ResolveSubresourceRegion`, `ExecuteBundle`, `DiscardResource` | no | `-ld3d12 -ld3dcompiler` |
@@ -31,6 +33,7 @@ as x86_64 Windows executables, like games, so they also run through FEX.
 | `qpc.c` | QueryPerformanceCounter: frequency, monotonic in one thread and across threads, agrees with the `NtQueryPerformanceCounter` syscall, same rate as `GetTickCount64`, `timeGetTime` and the system time; prints the cost per call. Build it for x86_64 and for arm64ec | no | |
 | `gamepad_list.c` | game controllers as games see them: XInput slots (VID/PID, battery), DirectInput 8 game controllers, raw input HID devices (what SDL and Unity open), Windows.Gaming.Input gamepads, each with its current state. `watch [sec]` prints every change and hotplug (default 30 s), `rumble` runs the XInput motors and the trigger motors. `selftest` checks winebus' virtual pad (`NEUTRON_PAD_VIRTUAL=1`): buttons, axes, rumble loopback, rumble held over 1 s, hotplug, in all four APIs; `selftest absent` with `NEUTRON_PAD_VIRTUAL=054c:0ce6 NEUTRON_PAD_HIDRAW=1` checks that SDL devices of raw HID pads are dropped | no | `-ldinput8 -ldxguid -lhid -lruntimeobject -lole32` |
 | `sync_semantics.c` | 56 checks of Windows sync semantics (wait any/all, APCs, abandoned mutexes, cross-process), with and without `NEUTRON_MSYNC=1` | no | |
+| `metal_mesh_no_pixel_shader.mm` | native Metal, no Wine: a mesh pipeline with a color attachment and the no-output fragment keeps color and writes depth | no | `xcrun clang++`, see below |
 | `sandbox/sbtest.sh` | the game sandbox (`NEUTRON_SANDBOX=1`): 35 checks of what is denied and allowed, D3D11, audio and controllers inside it | no | builds its own |
 
 Exit code 0 means the test passed.
@@ -67,13 +70,16 @@ logged-in Mac Steam for a non-zero pipe. `d3d11_present.exe` takes
 
 ## D3D12 pipeline and DXIL bounds regressions
 
-`d3d12_gs.c` also creates a geometry pipeline without a pixel shader, draws over
-existing colored geometry, and checks that the color remains unchanged. It
-creates an attachment-free pipeline with SampleDesc.Count = 0 to exercise the
-Metal sample-count fallback.
+`d3d12_gs.c` also draws with a geometry pipeline without a pixel shader and
+with additive blending, on a cleared target and over existing colored geometry,
+and checks that the color does not change. It draws with two attachment-free
+pipelines (SampleDesc.Count 0, and ForcedSampleCount 4) without a render target;
+run it with `MTL_SHADER_VALIDATION=1` to see sample count mismatches.
 
-The native Metal companion checks that a no-output fragment preserves color and
-still writes depth on a mesh pipeline:
+The native Metal companion checks that a mesh pipeline with the no-output
+fragment and color write mask 0 keeps the color and still writes depth. Metal
+leaves outputs that a fragment does not write undefined, so the write mask is
+what keeps the color, not the empty fragment:
 
 ```sh
 xcrun clang++ -std=c++17 -framework Foundation -framework Metal \

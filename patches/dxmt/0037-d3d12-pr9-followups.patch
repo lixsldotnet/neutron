@@ -1,12 +1,15 @@
 Follow-ups to 0034 to 0036.
 0034: a mesh pipeline without a PS keeps its color formats (they must match
 the render pass) but gets write mask 0 and no blending, so nothing undefined
-is written. 0035: attachment-free pipelines always use the command list's
-sample count, also with ForcedSampleCount and Count 1. 0036: no branch when the
-buffer has no bounds metadata, and DXIL buffer stores are guarded like loads.
+is written. The no-output fragment is looked up once in the internal library.
+0035: attachment-free pipelines always use the command list's sample count,
+also with ForcedSampleCount and Count 1.
+0036: every access through the null pointer of a failed bound check is skipped:
+DXIL loads, stores and atomics, DXBC raw and structured loads and stores.
+Buffers without bounds metadata get no branch.
 
 diff --git a/src/airconv/dxil_converter.cpp b/src/airconv/dxil_converter.cpp
-index 5857872..d1db0ad 100644
+index 5857872..4814ea7 100644
 --- a/src/airconv/dxil_converter.cpp
 +++ b/src/airconv/dxil_converter.cpp
 @@ -1962,7 +1962,7 @@ private:
@@ -87,8 +90,170 @@ index 5857872..d1db0ad 100644
      }
      return llvm::Error::success();
    }
+@@ -2699,6 +2711,21 @@ private:
+     auto idx = dword_index(*buf, call->getArgOperand(3), call->getArgOperand(4));
+     AtomicBufferResourceHandle abuf{buf->Pointer, buf->Metadata, buf->StructureStride, 1, buf->GlobalCoherent};
+     auto ptr = conv.CreateGEPInt32WithBoundCheck(abuf, idx);
++    /* neutron: no atomic on the null pointer of a failed bound check, returns 0 */
++    if (abuf.Metadata) {
++      auto before = call->getParent();
++      auto then = llvm::SplitBlockAndInsertIfThen(B.CreateIsNotNull(ptr), call, false);
++      B.SetInsertPoint(then);
++      auto value = air.CreateAtomicRMW(ops[kind], ptr, call->getArgOperand(6));
++      if (!value)
++        return unsupported("atomic op lowering failed");
++      auto phi = llvm::PHINode::Create(B.getInt32Ty(), 2, "bounded.atomic", &call->getParent()->front());
++      phi->addIncoming(B.getInt32(0), before);
++      phi->addIncoming(value, then->getParent());
++      B.SetInsertPoint(call);
++      result = phi;
++      return llvm::Error::success();
++    }
+     result = air.CreateAtomicRMW(ops[kind], ptr, call->getArgOperand(6));
+     if (!result)
+       return unsupported("atomic op lowering failed");
+diff --git a/src/airconv/nt/dxbc_converter_base.cpp b/src/airconv/nt/dxbc_converter_base.cpp
+index 452bee6..5497842 100644
+--- a/src/airconv/nt/dxbc_converter_base.cpp
++++ b/src/airconv/nt/dxbc_converter_base.cpp
+@@ -2257,16 +2257,20 @@ Converter::operator()(const InstLoadRaw &load) {
+ 
+   if (auto Comp = ComponentFromScalarMask(Mask, Buf->Swizzle); Comp >= 0) {
+     auto Ptr = CreateGEPInt32WithBoundCheck(Buf.value(), ir.CreateAdd(Index, ir.getInt32(Comp)));
+-    auto ValueInt = Buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
+-                                        : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
++    auto ValueInt = CreateBoundCheckedAccess(Ptr, Buf->Metadata, ir.getInt32Ty(), [&]() {
++      return Buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
++                                 : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
++    });
+     return StoreOperand(load.dst, MaskSwizzle(ValueInt, Mask));
+   }
+ 
+   llvm::Value *ValueVec = llvm::PoisonValue::get(air.getIntTy(4));
+   for (auto [DstComp, _] : EnumerateComponents(MemoryAccessMask(Mask, Buf->Swizzle))) {
+     auto Ptr = CreateGEPInt32WithBoundCheck(Buf.value(), ir.CreateAdd(Index, ir.getInt32(DstComp)));
+-    auto ValueInt = Buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
+-                                        : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
++    auto ValueInt = CreateBoundCheckedAccess(Ptr, Buf->Metadata, ir.getInt32Ty(), [&]() {
++      return Buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
++                                 : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
++    });
+     ValueVec = ir.CreateInsertElement(ValueVec, ValueInt, DstComp);
+   }
+   StoreOperand(load.dst, MaskSwizzle(ValueVec, Mask, Buf->Swizzle));
+@@ -2289,16 +2293,20 @@ Converter::operator()(const InstLoadStructured &load) {
+ 
+   if (auto Comp = ComponentFromScalarMask(Mask, Buf->Swizzle); Comp >= 0) {
+     auto Ptr = CreateGEPInt32WithBoundCheck(Buf.value(), ir.CreateAdd(Index, ir.getInt32(Comp)));
+-    auto ValueInt = Buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
+-                                        : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
++    auto ValueInt = CreateBoundCheckedAccess(Ptr, Buf->Metadata, ir.getInt32Ty(), [&]() {
++      return Buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
++                                 : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
++    });
+     return StoreOperand(load.dst, MaskSwizzle(ValueInt, Mask));
+   }
+ 
+   llvm::Value *ValueVec = llvm::PoisonValue::get(air.getIntTy(4));
+   for (auto [DstComp, _] : EnumerateComponents(MemoryAccessMask(Mask, Buf->Swizzle))) {
+     auto Ptr = CreateGEPInt32WithBoundCheck(Buf.value(), ir.CreateAdd(Index, ir.getInt32(DstComp)));
+-    auto ValueInt = Buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
+-                                        : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
++    auto ValueInt = CreateBoundCheckedAccess(Ptr, Buf->Metadata, ir.getInt32Ty(), [&]() {
++      return Buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
++                                 : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
++    });
+     ValueVec = ir.CreateInsertElement(ValueVec, ValueInt, DstComp);
+   }
+   StoreOperand(load.dst, MaskSwizzle(ValueVec, Mask, Buf->Swizzle));
+@@ -2329,10 +2337,14 @@ Converter::operator()(const InstStoreRaw &store) {
+ 
+   for (auto [DstComp, _] : EnumerateComponents(Buf->Mask)) {
+     auto Ptr = CreateGEPInt32WithBoundCheck(Buf.value(), ir.CreateAdd(Index, ir.getInt32(DstComp)));
+-    if (Buf->GlobalCoherent)
+-      air.CreateDeviceCoherentStore(ExtractElement(Value, DstComp), Ptr);
+-    else
+-      ir.CreateStore(ExtractElement(Value, DstComp), Ptr, Volatile);
++    auto Element = ExtractElement(Value, DstComp);
++    CreateBoundCheckedAccess(Ptr, Buf->Metadata, nullptr, [&]() -> llvm::Value * {
++      if (Buf->GlobalCoherent)
++        air.CreateDeviceCoherentStore(Element, Ptr);
++      else
++        ir.CreateStore(Element, Ptr, Volatile);
++      return nullptr;
++    });
+   }
+ }
+ 
+@@ -2363,10 +2375,14 @@ Converter::operator()(const InstStoreStructured &store) {
+ 
+   for (auto [DstComp, _] : EnumerateComponents(Buf->Mask)) {
+     auto Ptr = CreateGEPInt32WithBoundCheck(Buf.value(), ir.CreateAdd(Index, ir.getInt32(DstComp)));
+-    if (Buf->GlobalCoherent)
+-      air.CreateDeviceCoherentStore(ExtractElement(Value, DstComp), Ptr);
+-    else
+-      ir.CreateStore(ExtractElement(Value, DstComp), Ptr, Volatile);
++    auto Element = ExtractElement(Value, DstComp);
++    CreateBoundCheckedAccess(Ptr, Buf->Metadata, nullptr, [&]() -> llvm::Value * {
++      if (Buf->GlobalCoherent)
++        air.CreateDeviceCoherentStore(Element, Ptr);
++      else
++        ir.CreateStore(Element, Ptr, Volatile);
++      return nullptr;
++    });
+   }
+ }
+ 
+@@ -2932,6 +2948,32 @@ Converter::CreateGEPInt32WithBoundCheck(AtomicBufferResourceHandle &Buffer, llvm
+   );
+ }
+ 
++/* neutron: Metal must not load from or store to the null pointer that the bound
++   check selects for out-of-range indices and null descriptors. */
++llvm::Value *
++Converter::CreateBoundCheckedAccess(
++    llvm::Value *Ptr, bool Checked, llvm::Type *Ty, llvm::function_ref<llvm::Value *()> Access
++) {
++  if (!Checked)
++    return Access();
++  auto Fn = ir.GetInsertBlock()->getParent();
++  auto Before = ir.GetInsertBlock();
++  auto Then = llvm::BasicBlock::Create(ir.getContext(), "bound.ok", Fn);
++  auto Merge = llvm::BasicBlock::Create(ir.getContext(), "bound.end", Fn);
++  ir.CreateCondBr(ir.CreateIsNotNull(Ptr), Then, Merge);
++  ir.SetInsertPoint(Then);
++  auto Value = Access();
++  auto ThenEnd = ir.GetInsertBlock();
++  ir.CreateBr(Merge);
++  ir.SetInsertPoint(Merge);
++  if (!Ty)
++    return nullptr;
++  auto Phi = ir.CreatePHI(Ty, 2);
++  Phi->addIncoming(llvm::Constant::getNullValue(Ty), Before);
++  Phi->addIncoming(Value, ThenEnd);
++  return Phi;
++}
++
+ std::unique_ptr<llvm::IRBuilder<>::FastMathFlagGuard>
+ Converter::UseFastMath(bool OptOut) {
+   if (OptOut)
+diff --git a/src/airconv/nt/dxbc_converter_base.hpp b/src/airconv/nt/dxbc_converter_base.hpp
+index 715ae0c..e9dd666 100644
+--- a/src/airconv/nt/dxbc_converter_base.hpp
++++ b/src/airconv/nt/dxbc_converter_base.hpp
+@@ -500,6 +500,10 @@ public:
+   llvm::Value * CreateGEPInt32WithBoundCheck(BufferResourceHandle &Buffer, llvm::Value* Index);
+ 
+   llvm::Value * CreateGEPInt32WithBoundCheck(AtomicBufferResourceHandle &Buffer, llvm::Value* Index);
++  /* neutron: runs Access only when Ptr from CreateGEPInt32WithBoundCheck is not
++     null, returns zero of Ty otherwise (Ty null for stores) */
++  llvm::Value *
++  CreateBoundCheckedAccess(llvm::Value *Ptr, bool Checked, llvm::Type *Ty, llvm::function_ref<llvm::Value *()> Access);
+ 
+   [[nodiscard]]
+   std::unique_ptr<llvm::IRBuilder<>::FastMathFlagGuard> UseFastMath(bool OptOut);
 diff --git a/src/d3d12/d3d12_pipeline_graphics.cpp b/src/d3d12/d3d12_pipeline_graphics.cpp
-index c97c917..b69eb9f 100644
+index c97c917..7f1734d 100644
 --- a/src/d3d12/d3d12_pipeline_graphics.cpp
 +++ b/src/d3d12/d3d12_pipeline_graphics.cpp
 @@ -363,10 +363,10 @@ public:
@@ -106,7 +271,13 @@ index c97c917..b69eb9f 100644
        info.raster_sample_count = std::max(1u, pDesc->RasterizerState.ForcedSampleCount);
      info.support_indirect_command_buffers = true;
  
-@@ -854,6 +854,12 @@ public:
+@@ -849,11 +849,17 @@ public:
+          attachments, although D3D12 permits a null PS. Keep the attachment formats
+          and rasterization enabled so depth/stencil still work; the no-output
+          fragment leaves color attachments unchanged. */
+-      ps_func_ = device_->GetLib().getLibrary().newFunction("fs_d3d12_no_pixel_shader");
++      ps_func_ = device_->GetLib().getNoPixelShaderFunction();
+       if (!ps_func_) {
          ERR("Failed to load no-op fragment shader for D3D12 mesh pipeline");
          return E_FAIL;
        }
@@ -119,3 +290,35 @@ index c97c917..b69eb9f 100644
      }
  
      // PSO
+diff --git a/src/dxmt/dxmt_command.cpp b/src/dxmt/dxmt_command.cpp
+index 6498ae1..4051024 100644
+--- a/src/dxmt/dxmt_command.cpp
++++ b/src/dxmt/dxmt_command.cpp
+@@ -19,6 +19,7 @@ InternalCommandLibrary::InternalCommandLibrary(WMT::Device device) {
+     ERR("Failed to create internal command library: ", error.description().getUTF8String());
+     abort();
+   }
++  no_pixel_shader_ = library_.newFunction("fs_d3d12_no_pixel_shader");
+ };
+ 
+ EmulatedCommandContext::EmulatedCommandContext(WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx): ctx(ctx) {
+diff --git a/src/dxmt/dxmt_command.hpp b/src/dxmt/dxmt_command.hpp
+index c9697ae..c963168 100644
+--- a/src/dxmt/dxmt_command.hpp
++++ b/src/dxmt/dxmt_command.hpp
+@@ -47,8 +47,15 @@ public:
+     return library_;
+   }
+ 
++  /* neutron: looked up once, used by every D3D12 mesh PSO without a pixel shader */
++  WMT::Function
++  getNoPixelShaderFunction() {
++    return no_pixel_shader_;
++  }
++
+ private:
+   WMT::Reference<WMT::Library> library_;
++  WMT::Reference<WMT::Function> no_pixel_shader_;
+ };
+ 
+ class EmulatedCommandContext {
