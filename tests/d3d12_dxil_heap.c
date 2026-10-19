@@ -14,6 +14,9 @@
  *     o.Store2(id.x * 8, uint2(asuint(v.x), sb[id.x]));
  *   }
  *
+ * --oob-buffer limits the SRV to half the threads; --null-buffer binds a null SRV.
+ * Both must read zero without Metal shader validation errors.
+ *
  * dxc 1.9.2609: -T cs_6_6
  * Build: x86_64-w64-mingw32-clang -O2 -o d3d12_dxil_heap.exe d3d12_dxil_heap.c -ld3d12
  */
@@ -298,8 +301,10 @@ static ID3D12Resource *make_buffer(ID3D12Device *dev, D3D12_HEAP_TYPE type, UINT
 
 static UINT f2u(float f) { UINT u; memcpy(&u, &f, 4); return u; }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    int oob = argc > 1 && strcmp(argv[1], "--oob-buffer") == 0;
+    int null_buffer = argc > 1 && strcmp(argv[1], "--null-buffer") == 0;
     ID3D12Device *dev = NULL;
     ID3D12CommandQueue *queue = NULL;
     ID3D12CommandAllocator *alloc = NULL;
@@ -399,10 +404,10 @@ int main(void)
     ID3D12Device_CreateShaderResourceView(dev, tex, &sd, h);
     D3D12_SHADER_RESOURCE_VIEW_DESC bd = { DXGI_FORMAT_UNKNOWN, D3D12_SRV_DIMENSION_BUFFER,
                                            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING };
-    bd.Buffer.NumElements = THREADS;
+    bd.Buffer.NumElements = oob ? THREADS / 2 : THREADS;
     bd.Buffer.StructureByteStride = 4;
     h.ptr = h0.ptr + inc * 3;
-    ID3D12Device_CreateShaderResourceView(dev, sb, &bd, h);
+    ID3D12Device_CreateShaderResourceView(dev, null_buffer ? NULL : sb, &bd, h);
 
     D3D12_DESCRIPTOR_HEAP_DESC shd = { D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
     ID3D12Device_CreateDescriptorHeap(dev, &shd, &IID_ID3D12DescriptorHeap, (void **)&sheap);
@@ -438,7 +443,7 @@ int main(void)
     ID3D12Resource_Map(rb, 0, NULL, (void **)&r);
     int bad = 0;
     for (UINT i = 0; i < THREADS; i++) {
-        UINT w0 = f2u((float)(i % 4)), w1 = 1000 + i;
+        UINT w0 = f2u((float)(i % 4)), w1 = null_buffer || (oob && i >= THREADS / 2) ? 0 : 1000 + i;
         if (r[2 * i] != w0 || r[2 * i + 1] != w1) {
             if (bad < 8)
                 printf("thread %u: got 0x%08x %u, want 0x%08x %u\n", i, r[2 * i], r[2 * i + 1], w0, w1);

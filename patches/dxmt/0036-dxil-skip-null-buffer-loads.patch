@@ -1,0 +1,51 @@
+Skip null Metal buffer loads produced by DXIL bounds checks.
+An out-of-range descriptor-buffer index selects a null pointer; loading it
+is invalid Metal usage. Branch around the load and merge a zero result.
+
+diff --git a/src/airconv/dxil_converter.cpp b/src/airconv/dxil_converter.cpp
+index db4a802..5857872 100644
+--- a/src/airconv/dxil_converter.cpp
++++ b/src/airconv/dxil_converter.cpp
+@@ -1962,8 +1962,7 @@ private:
+         llvm::Value *dw[2];
+         for (unsigned k = 0; k < 2; k++) {
+           auto ptr = conv.CreateGEPInt32WithBoundCheck(*buf, B.CreateAdd(base, B.getInt32(2 * i + k)));
+-          dw[k] = buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(B.getInt32Ty(), ptr)
+-                                      : (llvm::Value *)B.CreateLoad(B.getInt32Ty(), ptr);
++          dw[k] = bounded_buffer_load(call, ptr, buf->GlobalCoherent);
+         }
+         r = B.CreateInsertValue(r, combine64(dw[0], dw[1]), {i});
+       }
+@@ -1974,14 +1973,30 @@ private:
+       if (!(mask & (1u << i)))
+         continue;
+       auto ptr = conv.CreateGEPInt32WithBoundCheck(*buf, B.CreateAdd(base, B.getInt32(i)));
+-      auto e = buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(B.getInt32Ty(), ptr)
+-                                   : (llvm::Value *)B.CreateLoad(B.getInt32Ty(), ptr);
++      auto e = bounded_buffer_load(call, ptr, buf->GlobalCoherent);
+       v = B.CreateInsertElement(v, e, (uint64_t)i);
+     }
+     result = make_resret(st, v);
+     return llvm::Error::success();
+   }
+ 
++  /* neutron: a null pointer from the bounds check is not a legal Metal load.
++   * Keep the memory operation inside the valid branch and return D3D's zero. */
++  llvm::Value *
++  bounded_buffer_load(llvm::CallInst *call, llvm::Value *ptr, bool coherent) {
++    auto before = call->getParent();
++    auto then = llvm::SplitBlockAndInsertIfThen(B.CreateIsNotNull(ptr), call, false);
++    B.SetInsertPoint(then);
++    auto value = coherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(B.getInt32Ty(), ptr)
++                          : (llvm::Value *)B.CreateLoad(B.getInt32Ty(), ptr);
++    auto merge = call->getParent();
++    auto phi = llvm::PHINode::Create(B.getInt32Ty(), 2, "bounded.load", &merge->front());
++    phi->addIncoming(B.getInt32(0), before);
++    phi->addIncoming(value, then->getParent());
++    B.SetInsertPoint(call);
++    return phi;
++  }
++
+   llvm::Error
+   buffer_store(llvm::CallInst *call) {
+     auto h = handle(call->getArgOperand(1));

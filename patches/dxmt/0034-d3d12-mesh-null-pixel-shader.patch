@@ -1,0 +1,43 @@
+Handle D3D12 geometry/tessellation pipelines without a pixel shader. Metal
+requires a fragment function when a mesh pipeline declares color attachments;
+a no-output fragment preserves depth/stencil rasterization without color writes.
+
+diff --git a/src/d3d12/d3d12_pipeline_graphics.cpp b/src/d3d12/d3d12_pipeline_graphics.cpp
+index c56f320..b5a9f80 100644
+--- a/src/d3d12/d3d12_pipeline_graphics.cpp
++++ b/src/d3d12/d3d12_pipeline_graphics.cpp
+@@ -836,6 +836,19 @@ public:
+         return E_FAIL;
+       }
+       ps_func_ = LoadFunction(ps_bitcode, ps_name.c_str());
++      /* neutron: a failed pixel shader must not become a no-op fallback. */
++      if (!ps_func_)
++        return E_FAIL;
++    } else if (kind != Kind::Ordinary) {
++      /* neutron: Metal requires a fragment function for mesh pipelines with color
++         attachments, although D3D12 permits a null PS. Keep the attachment formats
++         and rasterization enabled so depth/stencil still work; the no-output
++         fragment leaves color attachments unchanged. */
++      ps_func_ = device_->GetLib().getLibrary().newFunction("fs_d3d12_no_pixel_shader");
++      if (!ps_func_) {
++        ERR("Failed to load no-op fragment shader for D3D12 mesh pipeline");
++        return E_FAIL;
++      }
+     }
+ 
+     // PSO
+diff --git a/src/dxmt/dxmt_command.metal b/src/dxmt/dxmt_command.metal
+index 516f49e..6fac56c 100644
+--- a/src/dxmt/dxmt_command.metal
++++ b/src/dxmt/dxmt_command.metal
+@@ -25,6 +25,10 @@
+ using namespace metal;
+ using namespace dxmt;
+ 
++/* neutron: Metal mesh pipelines with color attachments require a fragment function,
++   even when D3D12 omits its pixel shader. No outputs preserves color contents. */
++[[fragment]] void fs_d3d12_no_pixel_shader() {}
++
+ [[kernel]] void clear_texture_1d_uint(
+     texture1d<uint, access::read_write> tex [[texture(0)]],
+     constant uint4& value [[buffer(1)]],

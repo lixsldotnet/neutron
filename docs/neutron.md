@@ -977,6 +977,9 @@ DXMT patches with `git apply`, all in file name order.
 | `dxmt/0010-display-layer-format` | BGR10A2 layer for 10-bit backbuffers, `NEUTRON_LAYER_FORMAT` |
 | `dxmt/0011-native-drawable-size` | Drawable in screen pixels, `NEUTRON_NATIVE_DRAWABLE` |
 | `dxmt/0033-dlss-ngx-metalfx` | DLSS on MetalFX temporal: NGX parameter vtable, render subrect 0, signature override, D3D12 NGX |
+| `dxmt/0034-d3d12-mesh-null-pixel-shader` | No-output fragment for D3D12 mesh pipelines without a pixel shader; color is preserved and depth/stencil rasterization stays enabled |
+| `dxmt/0035-d3d12-attachment-free-sample-count` | Nonzero Metal raster sample count for attachment-free pipelines whose sample count is zero |
+| `dxmt/0036-dxil-skip-null-buffer-loads` | Skip DXIL buffer loads when descriptor bounds checks select null; return zero without dereferencing it |
 
 ## Open points
 

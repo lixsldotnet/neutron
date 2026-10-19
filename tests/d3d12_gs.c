@@ -9,6 +9,7 @@
  *   lines    line list input expanded to thick quads, descriptor table SRV read in the GS
  *   layer    GS that sets SV_RenderTargetArrayIndex, as a loop (mesh pipeline) and as plain
  *            moves (pass-through, folded into the VS like DXMT's D3D11 does)
+ *   no_ps    mesh pipeline with a declared/bound color target and no pixel shader; color stays unchanged
  * Exit code 0 = all pixels match.
  * Build: x86_64-w64-mingw32-clang -O2 -o d3d12_gs.exe d3d12_gs.c -ld3d12 -ld3dcompiler
  */
@@ -256,8 +257,8 @@ static void expect(const char *name, unsigned char *pixels, UINT s, float x, flo
     }
 }
 
-static ID3D12PipelineState *make_pso(ID3D12RootSignature *root, ID3DBlob *vs, ID3DBlob *gs, ID3DBlob *ps,
-                                     D3D12_PRIMITIVE_TOPOLOGY_TYPE topo, BOOL input_layout)
+static ID3D12PipelineState *make_pso_internal(ID3D12RootSignature *root, ID3DBlob *vs, ID3DBlob *gs, ID3DBlob *ps,
+                                     D3D12_PRIMITIVE_TOPOLOGY_TYPE topo, BOOL input_layout, BOOL no_attachments)
 {
     static const D3D12_INPUT_ELEMENT_DESC layout[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
@@ -269,7 +270,7 @@ static ID3D12PipelineState *make_pso(ID3D12RootSignature *root, ID3DBlob *vs, ID
     pd.pRootSignature = root;
     pd.VS = bc(vs);
     if (gs) pd.GS = bc(gs);
-    pd.PS = bc(ps);
+    if (ps) pd.PS = bc(ps);
     if (input_layout)
     {
         pd.InputLayout.pInputElementDescs = layout;
@@ -281,15 +282,21 @@ static ID3D12PipelineState *make_pso(ID3D12RootSignature *root, ID3DBlob *vs, ID
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     pd.RasterizerState.DepthClipEnable = TRUE;
     pd.PrimitiveTopologyType = topo;
-    pd.NumRenderTargets = 1;
-    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    pd.SampleDesc.Count = 1;
+    pd.NumRenderTargets = no_attachments ? 0 : 1;
+    pd.RTVFormats[0] = no_attachments ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = no_attachments ? 0 : 1;
     if (FAILED(hr = ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&pso)))
     {
         printf("FAIL CreateGraphicsPipelineState: hr=0x%08lx\n", (unsigned long)hr);
         exit(1);
     }
     return pso;
+}
+
+static ID3D12PipelineState *make_pso(ID3D12RootSignature *root, ID3DBlob *vs, ID3DBlob *gs, ID3DBlob *ps,
+                                     D3D12_PRIMITIVE_TOPOLOGY_TYPE topo, BOOL input_layout)
+{
+    return make_pso_internal(root, vs, gs, ps, topo, input_layout, FALSE);
 }
 
 struct vertex
@@ -364,6 +371,12 @@ int main(void)
                                               D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, FALSE);
     ID3D12PipelineState *pso_layer_pt = make_pso(root, vs_layer, gs_layer_pt, ps_layer,
                                                  D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, FALSE);
+    ID3D12PipelineState *pso_no_ps = make_pso(root, vs, gs_quad, NULL,
+                                              D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT, TRUE);
+    /* Attachment-free pipelines have no attachment-derived sample count. */
+    ID3D12PipelineState *pso_no_attachments = make_pso_internal(root, vs, gs_quad, NULL,
+        D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT, TRUE, TRUE);
+    ID3D12PipelineState_Release(pso_no_attachments);
     printf("pipelines ok\n");
 
     /* vertices: 4 quadrant centers (points), then a strip quad, then two lines */
@@ -434,6 +447,22 @@ int main(void)
     expect("points", px, 0, 0.5f, -0.5f, 255, 255, 255);
     expect("points", px, 0, -0.5f, 0.85f, 0, 0, 0);
     expect("points", px, 0, 0, 0, 0, 0, 0);
+    ID3D12Resource_Unmap(t.readback, 0, NULL);
+
+    /* A missing PS must not crash Metal or write a bound color attachment.
+       Start with existing colored geometry so a dummy shader that writes zero
+       would fail the readback checks. */
+    begin_target(&t);
+    SETUP(pso_quad);
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+    ID3D12GraphicsCommandList_DrawInstanced(list, 4, 1, 0, 0);
+    ID3D12GraphicsCommandList_SetPipelineState(list, pso_no_ps);
+    ID3D12GraphicsCommandList_DrawInstanced(list, 4, 1, 0, 0);
+    px = read_target(&t);
+    expect("no_ps", px, 0, -0.5f, 0.5f, 255, 0, 0);
+    expect("no_ps", px, 0, 0.5f, 0.5f, 0, 255, 0);
+    expect("no_ps", px, 0, -0.5f, -0.5f, 0, 0, 255);
+    expect("no_ps", px, 0, 0.5f, -0.5f, 255, 255, 255);
     ID3D12Resource_Unmap(t.readback, 0, NULL);
 
     /* indexed: 16-bit {3, 0}, then 32-bit with base vertex 1 (vertices 1..3) and half color

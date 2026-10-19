@@ -64,3 +64,31 @@ The first run creates the prefix and takes longer. The tool's log is
 logged-in Mac Steam for a non-zero pipe. `d3d11_present.exe` takes
 `[bgra8|rgba8|rgba8srgb|rgb10a2|rgba16f] [seconds] [scale%]`; set
 `NEUTRON_HUD=1` to see whether macOS presents it Direct or Composited.
+
+## D3D12 pipeline and DXIL bounds regressions
+
+`d3d12_gs.c` also creates a geometry pipeline without a pixel shader, draws over
+existing colored geometry, and checks that the color remains unchanged. It
+creates an attachment-free pipeline with SampleDesc.Count = 0 to exercise the
+Metal sample-count fallback.
+
+The native Metal companion checks that a no-output fragment preserves color and
+still writes depth on a mesh pipeline:
+
+```sh
+xcrun clang++ -std=c++17 -framework Foundation -framework Metal \
+  tests/metal_mesh_no_pixel_shader.mm -o /tmp/metal-mesh-no-ps
+/tmp/metal-mesh-no-ps
+```
+
+The optional `--repro` mode omits the fragment function and intentionally
+reproduces Metal's pipeline validation failure. It can abort the process.
+
+`d3d12_dxil_heap.exe --oob-buffer` limits the structured SRV to half the
+dispatched threads; `--null-buffer` binds a null SRV. Both must return zero for
+unavailable elements without invalid-load diagnostics. Run the default case
+and both modes with `MTL_SHADER_VALIDATION=1` and
+`MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1`. Checking output alone is insufficient:
+the old converter returned the expected zeros while still loading a null GPU
+pointer. The DXIL change requires rebuilding native winemetal.so, which contains
+airconv; replacing d3d12.dll alone does not install it.
