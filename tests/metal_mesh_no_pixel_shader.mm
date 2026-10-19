@@ -35,6 +35,8 @@ int main(int argc, char **argv) {
     pd.rasterSampleCount = 1;
     pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    /* like DXMT: unwritten fragment outputs are undefined, so no color writes */
+    pd.colorAttachments[0].writeMask = MTLColorWriteMaskNone;
     if (!(argc > 1 && !strcmp(argv[1], "--repro")))
       pd.fragmentFunction = [library newFunctionWithName:@"fs_d3d12_no_pixel_shader"];
     id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithMeshDescriptor:pd

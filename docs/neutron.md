@@ -980,6 +980,7 @@ DXMT patches with `git apply`, all in file name order.
 | `dxmt/0034-d3d12-mesh-null-pixel-shader` | No-output fragment for D3D12 mesh pipelines without a pixel shader; color is preserved and depth/stencil rasterization stays enabled |
 | `dxmt/0035-d3d12-attachment-free-sample-count` | Nonzero Metal raster sample count for attachment-free pipelines whose sample count is zero |
 | `dxmt/0036-dxil-skip-null-buffer-loads` | Skip DXIL buffer loads when descriptor bounds checks select null; return zero without dereferencing it |
+| `dxmt/0037-d3d12-pr9-followups` | No color writes from mesh pipelines without a pixel shader (fragment looked up once); attachment-free pipelines use the command list's sample count (ForcedSampleCount); no load, store or atomic through the null pointer of a failed bound check (DXIL and DXBC), no branch without bounds metadata |
 
 ## Open points
 

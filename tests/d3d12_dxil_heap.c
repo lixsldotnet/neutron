@@ -305,6 +305,11 @@ int main(int argc, char **argv)
 {
     int oob = argc > 1 && strcmp(argv[1], "--oob-buffer") == 0;
     int null_buffer = argc > 1 && strcmp(argv[1], "--null-buffer") == 0;
+    if (argc > 2 || (argc == 2 && !oob && !null_buffer))
+    {
+        printf("usage: d3d12_dxil_heap.exe [--oob-buffer | --null-buffer]\n");
+        return 1;
+    }
     ID3D12Device *dev = NULL;
     ID3D12CommandQueue *queue = NULL;
     ID3D12CommandAllocator *alloc = NULL;

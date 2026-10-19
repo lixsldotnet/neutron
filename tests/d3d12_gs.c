@@ -9,7 +9,10 @@
  *   lines    line list input expanded to thick quads, descriptor table SRV read in the GS
  *   layer    GS that sets SV_RenderTargetArrayIndex, as a loop (mesh pipeline) and as plain
  *            moves (pass-through, folded into the VS like DXMT's D3D11 does)
- *   no_ps    mesh pipeline with a declared/bound color target and no pixel shader; color stays unchanged
+ *   no_ps    mesh pipeline with a declared/bound color target, additive blending and no pixel shader;
+ *            color stays unchanged, on a cleared target and over existing geometry
+ *   no_rt    mesh pipelines without attachments (SampleDesc.Count 0, and ForcedSampleCount 4) draw
+ *            without a render target and the device survives
  * Exit code 0 = all pixels match.
  * Build: x86_64-w64-mingw32-clang -O2 -o d3d12_gs.exe d3d12_gs.c -ld3d12 -ld3dcompiler
  */
@@ -258,7 +261,8 @@ static void expect(const char *name, unsigned char *pixels, UINT s, float x, flo
 }
 
 static ID3D12PipelineState *make_pso_internal(ID3D12RootSignature *root, ID3DBlob *vs, ID3DBlob *gs, ID3DBlob *ps,
-                                     D3D12_PRIMITIVE_TOPOLOGY_TYPE topo, BOOL input_layout, BOOL no_attachments)
+                                     D3D12_PRIMITIVE_TOPOLOGY_TYPE topo, BOOL input_layout, BOOL no_attachments,
+                                     UINT forced_samples, BOOL add_blend)
 {
     static const D3D12_INPUT_ELEMENT_DESC layout[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
@@ -277,6 +281,13 @@ static ID3D12PipelineState *make_pso_internal(ID3D12RootSignature *root, ID3DBlo
         pd.InputLayout.NumElements = 2;
     }
     pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    if (add_blend)
+    {
+        pd.BlendState.RenderTarget[0].BlendEnable = TRUE;
+        pd.BlendState.RenderTarget[0].SrcBlend = pd.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
+        pd.BlendState.RenderTarget[0].SrcBlendAlpha = pd.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ONE;
+        pd.BlendState.RenderTarget[0].BlendOp = pd.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    }
     pd.SampleMask = 0xffffffff;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -284,7 +295,8 @@ static ID3D12PipelineState *make_pso_internal(ID3D12RootSignature *root, ID3DBlo
     pd.PrimitiveTopologyType = topo;
     pd.NumRenderTargets = no_attachments ? 0 : 1;
     pd.RTVFormats[0] = no_attachments ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_R8G8B8A8_UNORM;
-    pd.SampleDesc.Count = no_attachments ? 0 : 1;
+    pd.SampleDesc.Count = no_attachments && !forced_samples ? 0 : 1;
+    pd.RasterizerState.ForcedSampleCount = forced_samples;
     if (FAILED(hr = ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&pso)))
     {
         printf("FAIL CreateGraphicsPipelineState: hr=0x%08lx\n", (unsigned long)hr);
@@ -296,7 +308,7 @@ static ID3D12PipelineState *make_pso_internal(ID3D12RootSignature *root, ID3DBlo
 static ID3D12PipelineState *make_pso(ID3D12RootSignature *root, ID3DBlob *vs, ID3DBlob *gs, ID3DBlob *ps,
                                      D3D12_PRIMITIVE_TOPOLOGY_TYPE topo, BOOL input_layout)
 {
-    return make_pso_internal(root, vs, gs, ps, topo, input_layout, FALSE);
+    return make_pso_internal(root, vs, gs, ps, topo, input_layout, FALSE, 0, FALSE);
 }
 
 struct vertex
@@ -371,12 +383,14 @@ int main(void)
                                               D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, FALSE);
     ID3D12PipelineState *pso_layer_pt = make_pso(root, vs_layer, gs_layer_pt, ps_layer,
                                                  D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, FALSE);
-    ID3D12PipelineState *pso_no_ps = make_pso(root, vs, gs_quad, NULL,
-                                              D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT, TRUE);
-    /* Attachment-free pipelines have no attachment-derived sample count. */
-    ID3D12PipelineState *pso_no_attachments = make_pso_internal(root, vs, gs_quad, NULL,
-        D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT, TRUE, TRUE);
-    ID3D12PipelineState_Release(pso_no_attachments);
+    /* additive blending: any color the missing PS would output shows up */
+    ID3D12PipelineState *pso_no_ps = make_pso_internal(root, vs, gs_quad, NULL,
+                                                       D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT, TRUE, FALSE, 0, TRUE);
+    /* attachment-free pipelines have no attachment-derived sample count */
+    ID3D12PipelineState *pso_no_rt = make_pso_internal(root, vs, gs_quad, NULL,
+                                                       D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT, TRUE, TRUE, 0, FALSE);
+    ID3D12PipelineState *pso_no_rt_forced = make_pso_internal(root, vs, gs_quad, NULL,
+                                                              D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT, TRUE, TRUE, 4, FALSE);
     printf("pipelines ok\n");
 
     /* vertices: 4 quadrant centers (points), then a strip quad, then two lines */
@@ -449,9 +463,19 @@ int main(void)
     expect("points", px, 0, 0, 0, 0, 0, 0);
     ID3D12Resource_Unmap(t.readback, 0, NULL);
 
-    /* A missing PS must not crash Metal or write a bound color attachment.
-       Start with existing colored geometry so a dummy shader that writes zero
-       would fail the readback checks. */
+    /* A missing PS must not crash Metal or write a bound color attachment:
+       first on a cleared target, then over existing colored geometry. */
+    begin_target(&t);
+    SETUP(pso_no_ps);
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+    ID3D12GraphicsCommandList_DrawInstanced(list, 4, 1, 0, 0);
+    px = read_target(&t);
+    expect("no_ps", px, 0, -0.5f, 0.5f, 0, 0, 0);
+    expect("no_ps", px, 0, 0.5f, 0.5f, 0, 0, 0);
+    expect("no_ps", px, 0, -0.5f, -0.5f, 0, 0, 0);
+    expect("no_ps", px, 0, 0.5f, -0.5f, 0, 0, 0);
+    ID3D12Resource_Unmap(t.readback, 0, NULL);
+
     begin_target(&t);
     SETUP(pso_quad);
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
@@ -464,6 +488,27 @@ int main(void)
     expect("no_ps", px, 0, -0.5f, -0.5f, 0, 0, 255);
     expect("no_ps", px, 0, 0.5f, -0.5f, 255, 255, 255);
     ID3D12Resource_Unmap(t.readback, 0, NULL);
+
+    /* no render target: Metal must accept pipeline and render pass sample counts */
+    {
+        D3D12_VIEWPORT vp = { 0, 0, W, H, 0, 1 };
+        D3D12_RECT sc = { 0, 0, W, H };
+        HRESULT hr;
+        ID3D12GraphicsCommandList_OMSetRenderTargets(list, 0, NULL, FALSE, NULL);
+        ID3D12GraphicsCommandList_RSSetViewports(list, 1, &vp);
+        ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &sc);
+        SETUP(pso_no_rt);
+        ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+        ID3D12GraphicsCommandList_DrawInstanced(list, 4, 1, 0, 0);
+        ID3D12GraphicsCommandList_SetPipelineState(list, pso_no_rt_forced);
+        ID3D12GraphicsCommandList_DrawInstanced(list, 4, 1, 0, 0);
+        submit_and_wait();
+        if (FAILED(hr = ID3D12Device_GetDeviceRemovedReason(dev)))
+        {
+            printf("FAIL no_rt: device removed, hr=0x%08lx\n", (unsigned long)hr);
+            failures++;
+        }
+    }
 
     /* indexed: 16-bit {3, 0}, then 32-bit with base vertex 1 (vertices 1..3) and half color
        from the GS root constants; the 32-bit draw comes second and overwrites quad 3 */
