@@ -1,0 +1,121 @@
+Follow-ups to 0034 to 0036.
+0034: a mesh pipeline without a PS keeps its color formats (they must match
+the render pass) but gets write mask 0 and no blending, so nothing undefined
+is written. 0035: attachment-free pipelines always use the command list's
+sample count, also with ForcedSampleCount and Count 1. 0036: no branch when the
+buffer has no bounds metadata, and DXIL buffer stores are guarded like loads.
+
+diff --git a/src/airconv/dxil_converter.cpp b/src/airconv/dxil_converter.cpp
+index 5857872..d1db0ad 100644
+--- a/src/airconv/dxil_converter.cpp
++++ b/src/airconv/dxil_converter.cpp
+@@ -1962,7 +1962,7 @@ private:
+         llvm::Value *dw[2];
+         for (unsigned k = 0; k < 2; k++) {
+           auto ptr = conv.CreateGEPInt32WithBoundCheck(*buf, B.CreateAdd(base, B.getInt32(2 * i + k)));
+-          dw[k] = bounded_buffer_load(call, ptr, buf->GlobalCoherent);
++          dw[k] = bounded_buffer_load(call, ptr, *buf);
+         }
+         r = B.CreateInsertValue(r, combine64(dw[0], dw[1]), {i});
+       }
+@@ -1973,7 +1973,7 @@ private:
+       if (!(mask & (1u << i)))
+         continue;
+       auto ptr = conv.CreateGEPInt32WithBoundCheck(*buf, B.CreateAdd(base, B.getInt32(i)));
+-      auto e = bounded_buffer_load(call, ptr, buf->GlobalCoherent);
++      auto e = bounded_buffer_load(call, ptr, *buf);
+       v = B.CreateInsertElement(v, e, (uint64_t)i);
+     }
+     result = make_resret(st, v);
+@@ -1983,7 +1983,12 @@ private:
+   /* neutron: a null pointer from the bounds check is not a legal Metal load.
+    * Keep the memory operation inside the valid branch and return D3D's zero. */
+   llvm::Value *
+-  bounded_buffer_load(llvm::CallInst *call, llvm::Value *ptr, bool coherent) {
++  bounded_buffer_load(llvm::CallInst *call, llvm::Value *ptr, BufferResourceHandle &buf) {
++    bool coherent = buf.GlobalCoherent;
++    /* without metadata there is no bounds check and the pointer is never null */
++    if (!buf.Metadata)
++      return coherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(B.getInt32Ty(), ptr)
++                      : (llvm::Value *)B.CreateLoad(B.getInt32Ty(), ptr);
+     auto before = call->getParent();
+     auto then = llvm::SplitBlockAndInsertIfThen(B.CreateIsNotNull(ptr), call, false);
+     B.SetInsertPoint(then);
+@@ -1997,6 +2002,20 @@ private:
+     return phi;
+   }
+ 
++  /* neutron: same as bounded_buffer_load, an out-of-bounds store is dropped. */
++  void
++  bounded_buffer_store(llvm::CallInst *call, llvm::Value *ptr, llvm::Value *value, BufferResourceHandle &buf) {
++    if (buf.Metadata) {
++      auto then = llvm::SplitBlockAndInsertIfThen(B.CreateIsNotNull(ptr), call, false);
++      B.SetInsertPoint(then);
++    }
++    if (buf.GlobalCoherent)
++      air.CreateDeviceCoherentStore(value, ptr);
++    else
++      B.CreateStore(value, ptr);
++    B.SetInsertPoint(call);
++  }
++
+   llvm::Error
+   buffer_store(llvm::CallInst *call) {
+     auto h = handle(call->getArgOperand(1));
+@@ -2020,10 +2039,7 @@ private:
+         llvm::Value *dw[2] = {B.CreateTrunc(v, B.getInt32Ty()), B.CreateTrunc(B.CreateLShr(v, 32), B.getInt32Ty())};
+         for (unsigned k = 0; k < 2; k++) {
+           auto ptr = conv.CreateGEPInt32WithBoundCheck(*buf, B.CreateAdd(base, B.getInt32(2 * i + k)));
+-          if (buf->GlobalCoherent)
+-            air.CreateDeviceCoherentStore(dw[k], ptr);
+-          else
+-            B.CreateStore(dw[k], ptr);
++          bounded_buffer_store(call, ptr, dw[k], *buf);
+         }
+       }
+       return llvm::Error::success();
+@@ -2051,11 +2067,7 @@ private:
+       if (!(mask & (1u << i)))
+         continue;
+       auto ptr = conv.CreateGEPInt32WithBoundCheck(*buf, B.CreateAdd(base, B.getInt32(i)));
+-      auto val = to_i32(call->getArgOperand(4 + i));
+-      if (buf->GlobalCoherent)
+-        air.CreateDeviceCoherentStore(val, ptr);
+-      else
+-        B.CreateStore(val, ptr);
++      bounded_buffer_store(call, ptr, to_i32(call->getArgOperand(4 + i)), *buf);
+     }
+     return llvm::Error::success();
+   }
+diff --git a/src/d3d12/d3d12_pipeline_graphics.cpp b/src/d3d12/d3d12_pipeline_graphics.cpp
+index c97c917..b69eb9f 100644
+--- a/src/d3d12/d3d12_pipeline_graphics.cpp
++++ b/src/d3d12/d3d12_pipeline_graphics.cpp
+@@ -363,10 +363,10 @@ public:
+     }
+ 
+     info.raster_sample_count = pDesc->SampleDesc.Count;
+-    /* neutron: attachment-free D3D12 pipelines may arrive with no attachment
+-       sample count. Match the command list's default raster sample count instead
+-       of passing zero to Metal. Do not change sample counts with RTVs or a DSV. */
+-    if (!info.raster_sample_count && !pDesc->NumRenderTargets && pDesc->DSVFormat == DXGI_FORMAT_UNKNOWN)
++    /* neutron: attachment-free D3D12 pipelines rasterize at the command list's
++       default sample count (ForcedSampleCount, at least 1), whatever SampleDesc says.
++       Match it, Metal needs pipeline and render pass to agree. */
++    if (!pDesc->NumRenderTargets && pDesc->DSVFormat == DXGI_FORMAT_UNKNOWN)
+       info.raster_sample_count = std::max(1u, pDesc->RasterizerState.ForcedSampleCount);
+     info.support_indirect_command_buffers = true;
+ 
+@@ -854,6 +854,12 @@ public:
+         ERR("Failed to load no-op fragment shader for D3D12 mesh pipeline");
+         return E_FAIL;
+       }
++      /* neutron: Metal leaves unwritten fragment outputs undefined; D3D12 writes no
++         color without a PS. Keep the formats so they match the render pass. */
++      for (auto &rt : mesh_info_.colors) {
++        rt.write_mask = 0;
++        rt.blending_enabled = false;
++      }
+     }
+ 
+     // PSO
